@@ -1,4 +1,4 @@
-# Daggerfall Untiy Co-op
+# Daggerfall Unity Co-op
 
 This is a heavily modified version of [DFU-Tanguy-Multiplayer](https://github.com/EmptyBottleInc/DFU-Tanguy-Multiplayer), which was based on an older, 0.14.5 version of [Daggerfall Unity](https://github.com/Interkarma/daggerfall-unity). This version has been moved to DFU 1.1.1 and heavily modifies both Tanguy's original files and actual DFU files to support newly added features.
 
