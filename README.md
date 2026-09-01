@@ -6,6 +6,7 @@ This is a heavily modified version of [DFU-Tanguy-Multiplayer](https://github.co
 
 - [Disclaimer](#disclaimer)
 - [Differences/features](#differencesfeatures)
+- [Save compatibility](#save-compatibility)
 - [Issues / limitations](#issues--limitations)
 - [Mod support](#mod-support)
 - [Technical details](#technical-details)
@@ -170,6 +171,15 @@ Although the mod is still intended to be used through Steam, I made the alternat
 However, I won't be able to provide support for KCP-related networking issues such as port forwarding, Hamachi, or similar setups. Just use it for LAN, or better yet, use the Steam networking option.
 
 ---
+
+## Save compatibility
+
+Regular DFU saves should generally work when loaded in this co-op fork.
+
+Going the other way is a bit trickier. Exterior saves made with the co-op fork should generally work in a normal/non-co-op DFU version. However, interiors and dungeons are moved underground in the co-op version, so loading a co-op save made inside an interior or dungeon in normal DFU will place the player in the void, as the normal version has no knowledge of those altered positions.
+
+See the **Issues / limitations** section below for more details about joining an MP game from inside an SP dungeon, or loading SP and MP dungeon saves.
+
 
 ## Issues / limitations
 
