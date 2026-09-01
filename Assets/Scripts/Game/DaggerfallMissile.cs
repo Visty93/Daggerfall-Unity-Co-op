@@ -1,0 +1,906 @@
+// Project:         Daggerfall Unity
+// Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
+// Web Site:        http://www.dfworkshop.net
+// License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
+// Source Code:     https://github.com/Interkarma/daggerfall-unity
+// Original Author: Gavin Clayton (interkarma@dfworkshop.net)
+// Contributors:    Allofich
+// 
+// Notes:
+//
+
+using UnityEngine;
+using System.Collections.Generic;
+using DaggerfallWorkshop.Utility;
+using DaggerfallWorkshop.Game.MagicAndEffects;
+using DaggerfallWorkshop.Game.Entity;
+
+namespace DaggerfallWorkshop.Game
+{
+    /// <summary>
+    /// Missile component for spell casters and archers.
+    /// Designed to handle missile role in abstract way for other systems.
+    /// Collects list of affected entities for involved system to process.
+    /// Supports touch, target at range, area of effect.
+    /// Has some basic lighting effects that might expand later.
+    /// Does not currently support serialization, but this will be added later.
+    /// Currently ranged missiles can only move in a straight line as per classic.
+    /// </summary>
+    [RequireComponent(typeof(Light))]
+    [RequireComponent(typeof(SphereCollider))]
+    [RequireComponent(typeof(MeshCollider))]
+    [RequireComponent(typeof(Rigidbody))]
+    [RequireComponent(typeof(DaggerfallAudioSource))]
+    public class DaggerfallMissile : MonoBehaviour
+    {
+        #region Unity Properties
+
+        public float MovementSpeed = 25.0f;                     // Speed missile moves through world
+        public float ColliderRadius = 0.45f;                    // Radius of missile contact sphere
+        public static float ArmLength = 0.9f;                   // Distance of cast origin, >= ColliderRadius
+        public float ExplosionRadius = 4.0f;                    // Radius of area of effect explosion
+        public bool EnableLight = true;                         // Show a light with this missile - player can force disable from settings
+        public bool EnableShadows = true;                       // Light will cast shadows - player can force disable from settings
+        public Color[] PulseColors;                             // Array of colours for pulse cycle, light will lerp from item-to-item and loop back to start - ignored if empty
+        public float PulseSpeed = 0f;                           // Time in seconds light will lerp between pulse colours - 0 to disable
+        public float FlickerMaxInterval = 0f;                   // Maximum interval for random flicker - 0 to disable
+        public int BillboardFramesPerSecond = 5;                // Speed of billboard animatation
+        public int ImpactBillboardFramesPerSecond = 15;         // Speed of contact billboard animation
+        public float LifespanInSeconds = 8f;                    // How long missile will persist in world before self-destructing if no target found
+        public float PostImpactLifespanInSeconds = 0.6f;        // Time in seconds missile will persist after impact
+        public float PostImpactLightMultiplier = 1f;            // Scale of light intensity and range during post-impact lifespan - use 1.0 for no change, 0.0 for lights-out
+        public SoundClips ImpactSound = SoundClips.None;        // Impact sound of missile
+
+        #endregion
+
+        #region Fields
+
+        const int coldMissileArchive = 376;
+        const int fireMissileArchive = 375;
+        const int magicMissileArchive = 379;
+        const int poisonMissileArchive = 377;
+        const int shockMissileArchive = 378;
+
+        public const float SphereCastRadius = 0.25f;
+        public const float TouchRange = 3.0f;
+
+        Vector3 direction;
+        Light myLight;
+        SphereCollider myCollider;
+        DaggerfallAudioSource audioSource;
+        Rigidbody myRigidbody;
+        Billboard myBillboard;
+        bool forceDisableSpellLighting;
+        bool noSpellsSpatialBlend = false;
+        float lifespan = 0f;
+        float postImpactLifespan = 0f;
+        TargetTypes targetType = TargetTypes.None;
+        ElementTypes elementType = ElementTypes.None;
+        DaggerfallEntityBehaviour caster = null;
+        bool missileReleased = false;
+        bool impactDetected = false;
+        bool impactAssigned = false;
+        float initialRange;
+        float initialIntensity;
+        EntityEffectBundle payload;
+        bool isArrow = false;
+        bool isArrowSummoned = false;
+        GameObject goModel = null;
+        EnemySenses enemySenses;
+
+        List<DaggerfallEntityBehaviour> targetEntities = new List<DaggerfallEntityBehaviour>();
+
+
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// Gets or sets effect bundle payload carried by this missile.
+        /// Any DaggerfallEntityBehaviour objects hit by this missile will
+        /// receive instance of bundle payload against their EntityEffectManager on contact.
+        /// </summary>
+        public EntityEffectBundle Payload
+        {
+            get { return payload; }
+            set { payload = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets target type.
+        /// Target is set automatically from payload when available.
+        /// </summary>
+        public TargetTypes TargetType
+        {
+            get { return targetType; }
+            set { targetType = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets element type.
+        /// Element is set automatically from payload when available.
+        /// </summary>
+        public ElementTypes ElementType
+        {
+            get { return elementType; }
+            set { elementType = value; }
+        }
+
+        /// <summary>
+        /// Gets or sets caster who is origin of missile.
+        /// This must be set for all missile target types.
+        /// Caster is set automatically from payload when available.
+        /// </summary>
+        public DaggerfallEntityBehaviour Caster
+        {
+            get { return caster; }
+            set { caster = value; }
+        }
+
+        public bool IsArrow
+        {
+            get { return isArrow; }
+            set { isArrow = value; }
+        }
+        public bool IsArrowSummoned
+        {
+            get { return isArrowSummoned; }
+            set { isArrowSummoned = value; }
+        }
+
+        /// <summary>
+        /// Visual-only missiles are used for network observers. They animate and impact,
+        /// but never apply payload effects and never physically push/damage the caster.
+        /// </summary>
+        public bool VisualOnly { get; set; }
+
+        /// <summary>
+        /// Local-player-only payload missiles are used on the owning client for enemy
+        /// spells aimed at that client. They can assign payloads only to the local
+        /// PlayerAdvanced entity and use trigger-only collision so they do not push
+        /// enemies/players around like a real physics projectile.
+        /// </summary>
+        public bool LocalPlayerOnlyPayload { get; set; }
+
+        /// <summary>
+        /// Gets all target entities affected by this missile.
+        /// Any effect bundle payload will be applied automatically.
+        /// Use this property and OnComplete event for custom work.
+        /// </summary>
+        public DaggerfallEntityBehaviour[] Targets
+        {
+            get { return targetEntities.ToArray(); }
+        }
+
+        public Vector3 CustomAimPosition { get; set; }
+
+        public Vector3 CustomAimDirection { get; set; }
+
+        #endregion
+
+        #region Unity
+
+        private void Awake()
+        {
+            audioSource = transform.GetComponent<DaggerfallAudioSource>();
+        }
+
+        private void Start()
+        {
+            // Setup light and shadows
+            myLight = GetComponent<Light>();
+            myLight.enabled = EnableLight;
+            forceDisableSpellLighting = !DaggerfallUnity.Settings.EnableSpellLighting;
+            if (forceDisableSpellLighting) myLight.enabled = false;
+            if (!DaggerfallUnity.Settings.EnableSpellShadows) myLight.shadows = LightShadows.None;
+            initialRange = myLight.range;
+            initialIntensity = myLight.intensity;
+
+            // Setup collider
+            myCollider = GetComponent<SphereCollider>();
+            myCollider.radius = ColliderRadius;
+
+            // Setup rigidbody
+            myRigidbody = GetComponent<Rigidbody>();
+            myRigidbody.useGravity = false;
+
+            // Use payload when available
+            if (payload != null)
+            {
+                // Set payload missile properties
+                caster = payload.CasterEntityBehaviour;
+                targetType = payload.Settings.TargetType;
+                elementType = payload.Settings.ElementType;
+
+                // Set spell billboard anims automatically from payload for mobile missiles
+                if (targetType == TargetTypes.SingleTargetAtRange ||
+                    targetType == TargetTypes.AreaAtRange)
+                {
+                    UseSpellBillboardAnims();
+                }
+            }
+            else if ((targetType == TargetTypes.SingleTargetAtRange ||
+                      targetType == TargetTypes.AreaAtRange) &&
+                     elementType != ElementTypes.None)
+            {
+                // Observer visual-only missiles are spawned without a payload, but the
+                // element and target type are assigned immediately after Instantiate().
+                // Without this branch they only show light on the floor and no spell sprite.
+                UseSpellBillboardAnims();
+            }
+
+            // Setup senses
+            if (caster && caster != GameManager.Instance.PlayerEntityBehaviour)
+            {
+                enemySenses = caster.GetComponent<EnemySenses>();
+            }
+
+            // Setup arrow
+            if (isArrow)
+            {
+                // Create and orient 3d arrow
+                goModel = GameObjectHelper.CreateDaggerfallMeshGameObject(99800, transform);
+                MeshCollider arrowCollider = goModel.GetComponent<MeshCollider>();
+                arrowCollider.sharedMesh = goModel.GetComponent<MeshFilter>().sharedMesh;
+                arrowCollider.convex = true;
+                arrowCollider.isTrigger = true;
+
+                // Offset up so it comes from same place LOS check is done from.
+                // Network observer arrows already receive an explicit eye-level custom
+                // origin, so do not add the normal player/enemy model offset a second time.
+                Vector3 adjust;
+                if (VisualOnly && CustomAimPosition != Vector3.zero)
+                {
+                    adjust = Vector3.zero;
+                }
+                else if (caster != GameManager.Instance.PlayerEntityBehaviour)
+                {
+                    CharacterController controller = caster != null ? caster.transform.GetComponent<CharacterController>() : null;
+                    adjust = caster != null ? caster.transform.forward * 0.6f : Vector3.zero;
+                    if (controller != null)
+                        adjust.y += controller.height / 3;
+                }
+                else
+                {
+                    // Adjust slightly downward to match bow animation
+                    adjust = (GameManager.Instance.MainCamera.transform.rotation * -Caster.transform.up) * 0.11f;
+                    // Offset forward to avoid collision with player
+                    adjust += GameManager.Instance.MainCamera.transform.forward * 0.6f;
+                    // Adjust to the right or left to match bow animation
+                    if (!GameManager.Instance.WeaponManager.ScreenWeapon.FlipHorizontal)
+                        adjust += GameManager.Instance.MainCamera.transform.right * 0.15f;
+                    else
+                        adjust -= GameManager.Instance.MainCamera.transform.right * 0.15f;
+                }
+
+                goModel.transform.localPosition = adjust;
+                goModel.transform.rotation = Quaternion.LookRotation(GetAimDirection());
+                goModel.layer = gameObject.layer;
+            }
+
+            // Ignore missile collision with caster (this is a different check to AOE targets).
+            // In MP there can be multiple colliders on both the caster and missile. Ignoring only
+            // GetComponent<Collider>() can leave another collider pair active, causing the spell
+            // to spawn inside the enemy, push it upward, or even hit the caster.
+            IgnoreAllCasterCollisions();
+
+            // Observer/client visual missiles must not physically push anything. Keep the sphere
+            // trigger so they can still play an impact animation, but disable solid mesh collision.
+            if (VisualOnly)
+                MakeVisualOnlyCollisionSafe();
+            else if (LocalPlayerOnlyPayload)
+                MakeLocalPlayerOnlyCollisionSafe();
+        }
+
+        private void IgnoreAllCasterCollisions()
+        {
+            if (!caster)
+                return;
+
+            Collider[] casterColliders = caster.GetComponentsInChildren<Collider>(true);
+            Collider[] missileColliders = GetComponentsInChildren<Collider>(true);
+            if (casterColliders == null || missileColliders == null)
+                return;
+
+            for (int i = 0; i < casterColliders.Length; i++)
+            {
+                Collider casterCollider = casterColliders[i];
+                if (casterCollider == null)
+                    continue;
+
+                for (int j = 0; j < missileColliders.Length; j++)
+                {
+                    Collider missileCollider = missileColliders[j];
+                    if (missileCollider == null || missileCollider == casterCollider)
+                        continue;
+
+                    try { Physics.IgnoreCollision(casterCollider, missileCollider, true); }
+                    catch { }
+                }
+            }
+        }
+
+        private void MakeVisualOnlyCollisionSafe()
+        {
+            if (myRigidbody)
+            {
+                myRigidbody.useGravity = false;
+                myRigidbody.isKinematic = true;
+            }
+
+            Collider[] colliders = GetComponentsInChildren<Collider>(true);
+            for (int i = 0; i < colliders.Length; i++)
+            {
+                Collider col = colliders[i];
+                if (col == null)
+                    continue;
+
+                SphereCollider sphere = col as SphereCollider;
+                if (sphere != null)
+                {
+                    sphere.isTrigger = true;
+                    continue;
+                }
+
+                // Mesh colliders on visual observer missiles are not needed for damage,
+                // and can physically lift mobs/players if spawned overlapping them.
+                if (col is MeshCollider)
+                    col.enabled = false;
+            }
+        }
+
+        private void MakeLocalPlayerOnlyCollisionSafe()
+        {
+            // Same physical safety as visual-only, but keep payload assignment enabled.
+            // This allows enemy spell damage/effects to land on the owning client's
+            // PlayerAdvanced while preventing the missile from pushing enemy colliders.
+            if (myRigidbody)
+            {
+                myRigidbody.useGravity = false;
+                myRigidbody.isKinematic = true;
+            }
+
+            Collider[] colliders = GetComponentsInChildren<Collider>(true);
+            for (int i = 0; i < colliders.Length; i++)
+            {
+                Collider col = colliders[i];
+                if (col == null)
+                    continue;
+
+                SphereCollider sphere = col as SphereCollider;
+                if (sphere != null)
+                {
+                    sphere.isTrigger = true;
+                    continue;
+                }
+
+                if (col is MeshCollider)
+                    col.enabled = false;
+            }
+        }
+
+        private DaggerfallEntityBehaviour GetLocalPlayerEntityBehaviour()
+        {
+            return GameManager.Instance != null ? GameManager.Instance.PlayerEntityBehaviour : null;
+        }
+
+        private DaggerfallEntityBehaviour ResolvePayloadTarget(DaggerfallEntityBehaviour candidate)
+        {
+            if (candidate == null)
+                return null;
+
+            DaggerfallEntityBehaviour localPlayer = GetLocalPlayerEntityBehaviour();
+
+            if (LocalPlayerOnlyPayload)
+            {
+                // Target-client spell visuals/payloads are allowed to affect only the real
+                // local PlayerAdvanced body. This keeps observer missiles harmless.
+                return candidate == localPlayer ? localPlayer : null;
+            }
+
+            // Normal authoritative spell missiles on the listen-host can hit the host
+            // PlayerMultiplayer shell instead of PlayerAdvanced. The shell has no
+            // EntityEffectManager, so spell payloads like close-range Silence are skipped
+            // unless we redirect that LOCAL shell to the real local PlayerAdvanced.
+            //
+            // Do not do this for arrows. Bow damage compares the raw hit entity against
+            // EnemySenses.Target, which is usually the PlayerMultiplayer shell. Replacing
+            // arrow targets with PlayerAdvanced breaks bow damage.
+            if (!isArrow && localPlayer != null)
+            {
+                global::PlayerMultiplayer multiplayer = candidate.GetComponent<global::PlayerMultiplayer>();
+                if (multiplayer == null)
+                    multiplayer = candidate.GetComponentInParent<global::PlayerMultiplayer>();
+
+                if (multiplayer != null && multiplayer.isLocalPlayer)
+                    return localPlayer;
+            }
+
+            return candidate;
+        }
+
+        private bool TryAddPayloadTarget(DaggerfallEntityBehaviour candidate)
+        {
+            // Arrows must keep the raw hit DaggerfallEntityBehaviour. Spell payload
+            // resolution may redirect local PlayerMultiplayer -> PlayerAdvanced, but bow
+            // damage needs the original shell/enemy target for the existing damage path.
+            DaggerfallEntityBehaviour payloadTarget = isArrow ? candidate : ResolvePayloadTarget(candidate);
+            if (payloadTarget == null || payloadTarget == caster || targetEntities.Contains(payloadTarget))
+                return false;
+
+            targetEntities.Add(payloadTarget);
+            return true;
+        }
+
+        private DaggerfallEntityBehaviour GetEntityBehaviourFromHit(Collision collision, Collider other)
+        {
+            if (collision != null && other == null)
+                return collision.gameObject.GetComponentInParent<DaggerfallEntityBehaviour>();
+            if (collision == null && other != null)
+                return other.gameObject.GetComponentInParent<DaggerfallEntityBehaviour>();
+            return null;
+        }
+
+        private void Update()
+        {
+            // Execute based on target type
+            if (!missileReleased)
+            {
+                switch (targetType)
+                {
+                    case TargetTypes.ByTouch:
+                        DoTouch();
+                        break;
+                    case TargetTypes.SingleTargetAtRange:
+                    case TargetTypes.AreaAtRange:
+                        DoMissile();
+                        break;
+                    case TargetTypes.AreaAroundCaster:  // Must have a caster to perform area around caster
+                        if (caster)
+                            DoAreaOfEffect(caster.transform.position, true);
+                        break;
+                    default:
+                        return;
+                }
+            }
+
+            // Handle missile lifespan pre and post-impact
+            if (!impactDetected)
+            {
+                // Transform missile along direction vector
+                transform.position += (direction * MovementSpeed) * Time.deltaTime;
+
+                // Update lifespan and self-destruct if expired (e.g. spell fired straight up and will never hit anything)
+                lifespan += Time.deltaTime;
+                if (lifespan > LifespanInSeconds)
+                    Destroy(gameObject);
+            }
+            else
+            {
+                // Notify listeners work is done and automatically assign impact
+                if (!impactAssigned)
+                {
+                    PlayImpactSound();
+                    RaiseOnCompleteEvent();
+                    if (!isArrow)
+                        AssignPayloadToTargets();
+                    impactAssigned = true;
+                }
+
+                // Track post impact lifespan and allow impact clip to finish playing.
+                // Use realtime for cosmetic/local-player-only/touch missiles so spell
+                // billboards do not stick forever while this client has scaled time paused.
+                postImpactLifespan += (VisualOnly || LocalPlayerOnlyPayload || targetType == TargetTypes.ByTouch)
+                    ? Time.unscaledDeltaTime
+                    : Time.deltaTime;
+                if (postImpactLifespan > PostImpactLifespanInSeconds)
+                {
+                    myLight.enabled = false;
+                    // If there is no impact sound, destroy as soon as the impact billboard
+                    // lifetime expires. The old condition waited forever when
+                    // ImpactSound == None, leaving touch/heal spell billboards stuck.
+                    if (audioSource == null || ImpactSound == SoundClips.None || !audioSource.IsPlaying())
+                        Destroy(gameObject);
+                }
+            }
+
+            // Update light
+            UpdateLight();
+        }
+
+        #endregion
+
+        #region Collision Handling
+
+        private void OnCollisionEnter(Collision collision)
+        {
+            DoCollision(collision, null);
+        }
+
+        private void OnTriggerEnter(Collider other)
+        {
+            DoCollision(null, other);
+        }
+
+        void DoCollision(Collision collision, Collider other)
+        {
+            // Missile collision should only happen once
+            if (impactDetected)
+                return;
+
+            // Resolve target before playing impact. LocalPlayerOnlyPayload missiles
+            // should pass through enemy / remote-player colliders and only stop for
+            // the local PlayerAdvanced or world geometry.
+            DaggerfallEntityBehaviour entityBehaviour = GetEntityBehaviourFromHit(collision, other);
+            if (LocalPlayerOnlyPayload && entityBehaviour != null && ResolvePayloadTarget(entityBehaviour) == null)
+                return;
+
+            // PlayerMultiplayer shells are multiplayer target markers, not real spell
+            // recipients. If a local player's spell hits a remote PlayerMultiplayer,
+            // forward only friendly bundles to the target owner's real PlayerAdvanced.
+            // Always suppress normal payload assignment to the fake shell, otherwise
+            // hostile/non-friendly effects could affect only the visual enemy child.
+            global::PlayerMultiplayer playerTarget = null;
+            bool hitPlayerMultiplayer = !VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
+                global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerFromHit(collision, other, out playerTarget);
+            if (hitPlayerMultiplayer)
+            {
+                Vector3 impactPosition = transform.position;
+                if (other != null)
+                    impactPosition = other.ClosestPoint(transform.position);
+                else if (collision != null && collision.contacts != null && collision.contacts.Length > 0)
+                    impactPosition = collision.contacts[0].point;
+
+                // Area-at-range forwards from DoAreaOfEffect() so the impacted player
+                // is not applied twice. Single-target ranged spells forward here.
+                if (targetType != TargetTypes.AreaAtRange)
+                    global::PlayerSpellMultiplayerBridge.TryForwardLocalFriendlyPlayerSpell(payload, playerTarget, impactPosition, "missile");
+
+                entityBehaviour = null;
+            }
+
+            // Never let a missile hit its own caster. This protects against the
+            // frame-zero overlap case where IgnoreCollision has not covered a collider pair.
+            if (entityBehaviour == caster)
+                return;
+
+            // Set my collider to trigger and rigidbody to kinematic immediately after impact
+            // This helps prevent mobiles from walking over low missiles or the missile bouncing off in some other direction.
+            if (myCollider)
+                myCollider.isTrigger = true;
+            if (myRigidbody)
+                myRigidbody.isKinematic = true;
+
+            // Play spell impact animation, this replaces spell missile animation
+            if (elementType != ElementTypes.None && targetType != TargetTypes.ByTouch)
+            {
+                UseSpellBillboardAnims(1, true);
+                myBillboard.FramesPerSecond = ImpactBillboardFramesPerSecond;
+                impactDetected = true;
+            }
+
+            // If entity was hit then add to target list
+            if (entityBehaviour)
+                TryAddPayloadTarget(entityBehaviour);
+
+            if (isArrow)
+            {
+                if (other != null)
+                    AssignBowDamageToTarget(other);
+
+                // Destroy 3d arrow
+                Destroy(goModel.gameObject);
+                impactDetected = true;
+            }
+
+            // If missile is area at range
+            if (targetType == TargetTypes.AreaAtRange)
+            {
+                DoAreaOfEffect(transform.position);
+            }
+        }
+
+        #endregion
+
+        #region Static Methods
+
+        public static DaggerfallEntityBehaviour GetEntityTargetInTouchRange(Vector3 aimPosition, Vector3 aimDirection)
+        {
+            // Fire ray along caster facing
+            // Origin point of ray is set back slightly to fix issue where strikes against target capsules touching caster capsule do not connect
+            RaycastHit hit;
+            aimPosition -= aimDirection * 0.1f;
+            Ray ray = new Ray(aimPosition, aimDirection);
+            if (Physics.SphereCast(ray, SphereCastRadius, out hit, TouchRange))
+                return hit.transform.GetComponentInParent<DaggerfallEntityBehaviour>();
+            else
+                return null;
+        }
+
+        #endregion
+
+        #region Private Methods
+
+        // Touch can hit a single target at close range
+        void DoTouch()
+        {
+            transform.position = caster.transform.position;
+
+            // Touch does not use default missile collider
+            // This prevent touch missile check colliding with self and blocking spell transfer
+            if (myCollider)
+                myCollider.enabled = false;
+
+            Vector3 touchAimPosition = GetAimPosition();
+            Vector3 touchAimDirection = GetAimDirection();
+            bool foundPlayerMultiplayerTarget = false;
+
+            global::PlayerMultiplayer playerTarget = null;
+            if (!VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
+                global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerTargetInTouchRange(touchAimPosition, touchAimDirection, out playerTarget))
+            {
+                foundPlayerMultiplayerTarget = true;
+                Vector3 impactPosition = playerTarget != null ? playerTarget.transform.position : touchAimPosition + touchAimDirection * TouchRange;
+                CharacterController controller = playerTarget != null ? playerTarget.GetComponent<CharacterController>() : null;
+                if (controller != null)
+                    impactPosition += controller.center;
+
+                global::PlayerSpellMultiplayerBridge.TryForwardLocalFriendlyPlayerSpell(payload, playerTarget, impactPosition, "touch");
+            }
+
+            // If the touch hit a PlayerMultiplayer shell, never fall through to the
+            // fake enemy child as a normal entity target. Friendly bundles are
+            // forwarded above; non-friendly bundles intentionally do nothing.
+            if (!foundPlayerMultiplayerTarget)
+            {
+                DaggerfallEntityBehaviour entityBehaviour = GetEntityTargetInTouchRange(touchAimPosition, touchAimDirection);
+                if (entityBehaviour && entityBehaviour != caster)
+                {
+                    TryAddPayloadTarget(entityBehaviour);
+                    //Debug.LogFormat("Missile hit target {0} by touch", entityBehaviour.name);
+                }
+            }
+
+            // Touch always shows impact flash then expires
+            missileReleased = true;
+            impactDetected = true;
+        }
+
+        // Missile can hit environment or target at range
+        void DoMissile()
+        {
+            direction = GetAimDirection();
+            transform.position = GetAimPosition() + direction * ArmLength;
+            missileReleased = true;
+        }
+
+        // AOE can strike any number of targets within range with an option to exclude caster
+        void DoAreaOfEffect(Vector3 position, bool ignoreCaster = false)
+        {
+            List<DaggerfallEntityBehaviour> entities = new List<DaggerfallEntityBehaviour>();
+
+            transform.position = position;
+
+            // Collect AOE targets and ignore duplicates
+            Collider[] overlaps = Physics.OverlapSphere(position, ExplosionRadius);
+            HashSet<uint> forwardedPlayerTargets = new HashSet<uint>();
+            for (int i = 0; i < overlaps.Length; i++)
+            {
+                global::PlayerMultiplayer playerTarget = null;
+                if (!VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
+                    global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerFromCollider(overlaps[i], out playerTarget) &&
+                    playerTarget != null && playerTarget.netId != 0 && !forwardedPlayerTargets.Contains(playerTarget.netId))
+                {
+                    forwardedPlayerTargets.Add(playerTarget.netId);
+                    Vector3 playerImpact = playerTarget.transform.position;
+                    CharacterController controller = playerTarget.GetComponent<CharacterController>();
+                    if (controller != null)
+                        playerImpact += controller.center;
+
+                    global::PlayerSpellMultiplayerBridge.TryForwardLocalFriendlyPlayerSpell(payload, playerTarget, playerImpact, "aoe");
+                    continue;
+                }
+
+                DaggerfallEntityBehaviour aoeEntity = overlaps[i].GetComponentInParent<DaggerfallEntityBehaviour>();
+
+                if (ignoreCaster && aoeEntity == caster)
+                    continue;
+
+                DaggerfallEntityBehaviour payloadTarget = ResolvePayloadTarget(aoeEntity);
+                if (payloadTarget && !targetEntities.Contains(payloadTarget) && !entities.Contains(payloadTarget))
+                {
+                    entities.Add(payloadTarget);
+                    //Debug.LogFormat("Missile hit target {0} by AOE", payloadTarget.name);
+                }
+            }
+
+            // Add collection to target entities
+            if (entities.Count > 0)
+                targetEntities.AddRange(entities);
+
+            impactDetected = true;
+            missileReleased = true;
+        }
+
+        // Get missile aim position from player or enemy mobile
+        Vector3 GetAimPosition()
+        {
+            // Aim position from custom source
+            if (CustomAimPosition != Vector3.zero)
+                return CustomAimPosition;
+
+            // Aim position is from eye level for player or origin for other mobile
+            // Player must aim from camera position or it feels out of alignment
+            Vector3 aimPosition = caster.transform.position;
+            if (caster == GameManager.Instance.PlayerEntityBehaviour)
+            {
+                aimPosition = GameManager.Instance.MainCamera.transform.position;
+            }
+
+            return aimPosition;
+        }
+
+        // Get missile aim direction from player or enemy mobile
+        Vector3 GetAimDirection()
+        {
+            // Aim direction from custom source
+            if (CustomAimDirection != Vector3.zero)
+                return CustomAimDirection;
+
+            // Aim direction should be from camera for player or facing for other mobile
+            Vector3 aimDirection = Vector3.zero;
+            if (caster == GameManager.Instance.PlayerEntityBehaviour)
+            {
+                aimDirection = GameManager.Instance.MainCamera.transform.forward;
+            }
+            else if (enemySenses)
+            {
+                Vector3 predictedPosition;
+                if (DaggerfallUnity.Settings.EnhancedCombatAI)
+                    predictedPosition = enemySenses.PredictNextTargetPos(MovementSpeed);
+                else
+                    predictedPosition = enemySenses.LastKnownTargetPos;
+
+                if (predictedPosition == EnemySenses.ResetPlayerPos)
+                    aimDirection = caster.transform.forward;
+                else
+                    aimDirection = (predictedPosition - caster.transform.position).normalized;
+
+                // Enemy archers must aim lower to compensate for crouched player capsule
+                if (IsArrow && enemySenses.Target?.EntityType == EntityTypes.Player && GameManager.Instance.PlayerMotor.IsCrouching)
+                    aimDirection += Vector3.down * 0.05f;
+            }
+
+            return aimDirection;
+        }
+
+        void UseSpellBillboardAnims(int record = 0, bool oneShot = false)
+        {
+            // Destroy any existing billboard game object
+            if (myBillboard)
+            {
+                myBillboard.gameObject.SetActive(false);
+                Destroy(myBillboard.gameObject);
+            }
+
+            // Add new billboard parented to this missile
+            GameObject go = GameObjectHelper.CreateDaggerfallBillboardGameObject(GetMissileTextureArchive(), record, transform);
+            go.transform.localPosition = Vector3.zero;
+            go.layer = gameObject.layer;
+            myBillboard = go.GetComponent<Billboard>();
+            myBillboard.FramesPerSecond = BillboardFramesPerSecond;
+            myBillboard.FaceY = true;
+            myBillboard.OneShot = oneShot;
+            myBillboard.GetComponent<MeshRenderer>().receiveShadows = false;
+        }
+
+        void UpdateLight()
+        {
+            // Do nothing if light disabled by missile properties or force disabled in user settings
+            if (!EnableLight || forceDisableSpellLighting)
+                return;
+
+            // Scale post-impact
+            if (impactDetected)
+            {
+                myLight.range = initialRange * PostImpactLightMultiplier;
+                myLight.intensity = initialIntensity * PostImpactLightMultiplier;
+            }
+        }
+
+        int GetMissileTextureArchive()
+        {
+            switch (elementType)
+            {
+                default:
+                case ElementTypes.Cold:
+                    return coldMissileArchive;
+                case ElementTypes.Fire:
+                    return fireMissileArchive;
+                case ElementTypes.Magic:
+                    return magicMissileArchive;
+                case ElementTypes.Poison:
+                    return poisonMissileArchive;
+                case ElementTypes.Shock:
+                    return shockMissileArchive;
+            }
+        }
+
+        void AssignPayloadToTargets()
+        {
+            if (VisualOnly)
+                return;
+
+            if (payload == null || targetEntities.Count == 0)
+                return;
+
+            foreach (DaggerfallEntityBehaviour entityBehaviour in targetEntities)
+            {
+                DaggerfallEntityBehaviour payloadTarget = ResolvePayloadTarget(entityBehaviour);
+                if (payloadTarget == null || payloadTarget == caster)
+                    continue;
+
+                // Target must have an effect manager component
+                EntityEffectManager effectManager = payloadTarget.GetComponent<EntityEffectManager>();
+                if (!effectManager)
+                    continue;
+
+                // Instantiate payload bundle on target
+                effectManager.AssignBundle(payload, AssignBundleFlags.ShowNonPlayerFailures);
+            }
+        }
+
+        void AssignBowDamageToTarget(Collider arrowHitCollider)
+        {
+            // Observer arrows are purely cosmetic. They may still collect a trigger hit
+            // so the arrow can disappear on impact, but must never enter either the enemy
+            // or player bow-damage path.
+            if (VisualOnly || !isArrow || targetEntities.Count == 0)
+            {
+                return;
+            }
+
+            if (caster != GameManager.Instance.PlayerEntityBehaviour)
+            {
+                if (targetEntities[0] == caster.GetComponent<EnemySenses>().Target)
+                {
+                    EnemyAttack attack = caster.GetComponent<EnemyAttack>();
+                    if (attack)
+                    {
+                        attack.BowDamage(goModel.transform.forward);
+                    }
+                }
+            }
+            else
+            {
+                Transform hitTransform = arrowHitCollider.gameObject.transform;
+                GameManager.Instance.WeaponManager.WeaponDamage(GameManager.Instance.WeaponManager.LastBowUsed, true, isArrowSummoned, hitTransform, hitTransform.position, goModel.transform.forward);
+            }
+        }
+
+        void PlayImpactSound()
+        {
+            if (audioSource && ImpactSound != SoundClips.None)
+            {
+                // Classic does not appear to use 3D sound for spell impact at all
+                float spatialBlend = !isArrow && noSpellsSpatialBlend ? 0f : 1f;
+                audioSource.PlayOneShot(ImpactSound, spatialBlend);
+            }
+        }
+
+        #endregion
+
+        #region Events
+
+        // OnComplete
+        public delegate void OnCompleteEventHandler();
+        public static event OnCompleteEventHandler OnComplete;
+        protected virtual void RaiseOnCompleteEvent()
+        {
+            if (OnComplete != null)
+                OnComplete();
+        }
+
+        #endregion
+    }
+}
