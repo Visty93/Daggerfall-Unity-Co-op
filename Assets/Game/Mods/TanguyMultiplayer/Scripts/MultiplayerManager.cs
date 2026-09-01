@@ -24,7 +24,7 @@ public class MultiplayerManager : MonoBehaviour
     [Tooltip("Steam remains the preferred release mode. If Steam is unavailable at startup, Direct IP is selected instead.")]
     public ConnectionMode defaultMode = ConnectionMode.Steam;
 
-    [Tooltip("Vertical screen offset used by Mirror's temporary Direct IP NetworkManagerHUD while the ESC menu is open.")]
+    [Tooltip("Vertical screen offset used by the small Direct IP Host/Client panel while the ESC menu is open.")]
     public int directHudOffsetY = 72;
 
     NetworkManager manager;
@@ -36,6 +36,11 @@ public class MultiplayerManager : MonoBehaviour
     ConnectionMode selectedMode = ConnectionMode.Steam;
     ConnectionMode activeMode = ConnectionMode.Steam;
     bool wasNetworkActive;
+
+    // Custom Direct-IP panel state. The stock Mirror NetworkManagerHUD is kept disabled
+    // because it exposes a Server Only button that this co-op mod does not support.
+    bool directHudVisible;
+    string directAddress = "localhost";
 
     public ConnectionMode SelectedMode
     {
@@ -71,10 +76,13 @@ public class MultiplayerManager : MonoBehaviour
     {
         CacheReferences();
 
-        // The built-in Mirror HUD is only a temporary Direct-IP panel and must never
-        // appear by itself during normal gameplay/startup.
+        // Never expose Mirror's stock NetworkManagerHUD. It includes a Server Only
+        // button, while this mod supports player-hosted Host/Client sessions only.
         if (directHud != null)
             directHud.enabled = false;
+
+        if (manager != null && !string.IsNullOrEmpty(manager.networkAddress))
+            directAddress = manager.networkAddress;
     }
 
     void Start()
@@ -116,13 +124,15 @@ public class MultiplayerManager : MonoBehaviour
 
         if (networkActive && !wasNetworkActive)
         {
-            // Direct-IP connections can be started from NetworkManagerHUD, so capture
-            // whichever mode was selected when Mirror becomes active.
+            // Capture whichever transport mode was selected when Mirror becomes active.
             activeMode = selectedMode;
         }
 
         if (networkActive && directHud != null && IsActuallyConnected)
             directHud.enabled = false;
+
+        if (IsActuallyConnected)
+            directHudVisible = false;
 
         wasNetworkActive = networkActive;
     }
@@ -142,9 +152,16 @@ public class MultiplayerManager : MonoBehaviour
 
         if (directHud != null)
         {
+            // Keep the component disabled even if it remains on the GameObject.
+            // The custom panel below replaces it and intentionally has no Server Only button.
+            directHud.enabled = false;
             directHud.offsetX = 0;
             directHud.offsetY = directHudOffsetY;
         }
+
+        if (manager != null && string.IsNullOrEmpty(directAddress) &&
+            !string.IsNullOrEmpty(manager.networkAddress))
+            directAddress = manager.networkAddress;
     }
 
     void FindTransports()
@@ -247,6 +264,7 @@ public class MultiplayerManager : MonoBehaviour
         Transport.activeTransport = targetTransport;
         selectedMode = mode;
 
+        directHudVisible = false;
         if (directHud != null)
             directHud.enabled = false;
 
@@ -276,27 +294,95 @@ public class MultiplayerManager : MonoBehaviour
     public void ShowDirectNetworkHud(bool show)
     {
         CacheReferences();
-        if (directHud == null)
-            return;
+
+        // The stock Mirror HUD is deliberately never enabled. It contains a Server Only
+        // button, which is not a supported play mode for this project.
+        if (directHud != null)
+            directHud.enabled = false;
 
         bool mayShow = selectedMode == ConnectionMode.DirectIP &&
             !NetworkServer.active && !NetworkClient.isConnected;
 
         if (show && mayShow)
         {
-            // Reassert KCP immediately before Mirror's OnGUI buttons can be clicked.
+            // Reassert KCP immediately before the custom Host/Client controls can be used.
             if (!PrepareDirectIPTransport())
             {
-                directHud.enabled = false;
+                directHudVisible = false;
                 return;
             }
 
-            directHud.enabled = true;
+            directHudVisible = true;
         }
         else
         {
-            directHud.enabled = false;
+            directHudVisible = false;
         }
+    }
+
+    void OnGUI()
+    {
+        if (!directHudVisible || selectedMode != ConnectionMode.DirectIP)
+            return;
+
+        if (manager == null)
+            CacheReferences();
+
+        if (manager == null)
+            return;
+
+        GUILayout.BeginArea(new Rect(10f, directHudOffsetY, 280f, 175f), GUI.skin.box);
+        GUILayout.Label("Direct IP");
+
+        // During an in-progress client connection, only expose Cancel. This preserves
+        // the useful part of NetworkManagerHUD without exposing Server Only.
+        if (NetworkClient.active && !NetworkClient.isConnected && !NetworkServer.active)
+        {
+            GUILayout.Label("Connecting to " + manager.networkAddress + "...");
+            if (GUILayout.Button("Cancel"))
+                manager.StopClient();
+
+            GUILayout.EndArea();
+            return;
+        }
+
+        // HudMultiplayer normally hides this panel once connected. Keep this guard here
+        // as well so OnGUI can never offer another connection action mid-session.
+        if (NetworkServer.active || NetworkClient.isConnected)
+        {
+            GUILayout.EndArea();
+            return;
+        }
+
+        if (GUILayout.Button("Host"))
+        {
+            if (PrepareDirectIPTransport())
+            {
+                activeMode = ConnectionMode.DirectIP;
+                manager.StartHost();
+                directHudVisible = false;
+            }
+        }
+
+        GUILayout.Label("Server Address");
+        directAddress = GUILayout.TextField(directAddress ?? string.Empty);
+
+        if (GUILayout.Button("Client"))
+        {
+            if (PrepareDirectIPTransport())
+            {
+                string address = (directAddress ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(address))
+                    address = "localhost";
+
+                directAddress = address;
+                manager.networkAddress = address;
+                activeMode = ConnectionMode.DirectIP;
+                manager.StartClient();
+            }
+        }
+
+        GUILayout.EndArea();
     }
 
     public void HostSteam()
@@ -338,6 +424,7 @@ public class MultiplayerManager : MonoBehaviour
         else if (NetworkServer.active)
             manager.StopServer();
 
+        directHudVisible = false;
         if (directHud != null)
             directHud.enabled = false;
     }
@@ -359,6 +446,7 @@ public class MultiplayerManager : MonoBehaviour
 
     void OnDestroy()
     {
+        directHudVisible = false;
         if (directHud != null)
             directHud.enabled = false;
 
