@@ -40,6 +40,17 @@ namespace DaggerfallWorkshop.Game
         const float multiplayerInteriorYOffset = -250f;
         bool currentInteriorUsesMultiplayerYOffset = false;
 
+        // Some interior-resource mods run a delayed "safe placement" teleport after
+        // OnTransitionInterior. MP building interiors are shifted far below exterior Y,
+        // so a vanilla-height closest-marker search can incorrectly choose an upper floor.
+        // Watch briefly for a teleport-like upward snap and restore the landing point that
+        // this transition already resolved using the correct MP offset. This is reactive;
+        // there is no fixed delayed teleport and normal walking is not position-locked.
+        const float multiplayerInteriorLandingGuardDuration = 8f;
+        const float multiplayerInteriorLandingGuardMinUpwardSnap = 1.5f;
+        const float multiplayerInteriorLandingGuardMinInstantDistance = 2.5f;
+        Coroutine multiplayerInteriorLandingGuardCoroutine = null;
+
         // Set during load of a save made inside an MP-offset local building interior.
         // This allows the same non-networked interior to be reconstructed at its saved
         // temporary Y offset even when loading that save later in SP.
@@ -2947,10 +2958,42 @@ checkPosition = GetInteriorDoorSearchPositionFromExteriorDoor(door, useMultiplay
 if (interior.FindClosestEnterMarker(checkPosition, out closestEnterMarkerPosition))
     checkPosition = closestEnterMarkerPosition;
 
-            // Position player in front of closest interior door
+            // Position player in front of closest interior door.
+            // Normally DFU trusts the door normal to point toward the usable interior side. A malformed
+            // or replacement interior can have that normal effectively reversed, placing the player in
+            // empty space outside the room. Keep the normal DFU side whenever it has valid interior floor;
+            // only flip to the opposite side when the normal side is unsafe and the opposite side is
+            // positively validated as standing over floor belonging to this same interior.
             if (interior.FindClosestInteriorDoor(checkPosition, out landingPosition, out foundDoorNormal))
             {
-                landingPosition += foundDoorNormal * (GameManager.Instance.PlayerController.radius + 0.4f);
+                Vector3 interiorDoorPosition = landingPosition;
+                float doorLandingOffset = GameManager.Instance.PlayerController.radius + 0.4f;
+                Vector3 normalSideLanding = interiorDoorPosition + foundDoorNormal * doorLandingOffset;
+                Vector3 oppositeSideLanding = interiorDoorPosition - foundDoorNormal * doorLandingOffset;
+
+                landingPosition = normalSideLanding;
+
+                string normalSideReason;
+                if (!IsSafeInteriorDoorLandingCandidate(interior, normalSideLanding, out normalSideReason))
+                {
+                    string oppositeSideReason;
+                    if (IsSafeInteriorDoorLandingCandidate(interior, oppositeSideLanding, out oppositeSideReason))
+                    {
+                        landingPosition = oppositeSideLanding;
+                        Debug.LogWarning(
+                            $"[InteriorDoorLandingSafety] Normal door side was unsafe, using verified-safe opposite side. " +
+                            $"interior={interior.name} door={interiorDoorPosition} normal={foundDoorNormal} " +
+                            $"normalLanding={normalSideLanding} normalReason={normalSideReason} " +
+                            $"oppositeLanding={oppositeSideLanding}.");
+                    }
+                    else
+                    {
+                        Debug.Log(
+                            $"[InteriorDoorLandingSafety] Normal door side was not positively safe, but opposite side was not safe either; " +
+                            $"keeping normal DFU landing. interior={interior.name} door={interiorDoorPosition} " +
+                            $"normalReason={normalSideReason} oppositeReason={oppositeSideReason}");
+                    }
+                }
             }
             else
             {
@@ -3000,6 +3043,16 @@ if (interior.FindClosestEnterMarker(checkPosition, out closestEnterMarkerPositio
             SetStanding();
             ClearTransitionFallingDamageWindow("building-interior-after-teleport");
 
+            // Capture the final grounded position, not the raw doorway point. SetStanding() can
+            // adjust Y. This is only a candidate authoritative position until we positively verify
+            // that the completed interior setup has solid floor beneath the player.
+            Vector3 resolvedMultiplayerInteriorLanding = transform.position;
+            DaggerfallInterior resolvedMultiplayerInterior = interior;
+            bool considerMultiplayerInteriorLandingGuard =
+                useMultiplayerInteriorYOffset &&
+                (NetworkServer.active || NetworkClient.active) &&
+                doorOwner != null;
+
             EnableInteriorParent();
 
             // Add quest resources
@@ -3009,8 +3062,33 @@ if (interior.FindClosestEnterMarker(checkPosition, out closestEnterMarkerPositio
             if (!start)
                 SaveLoadManager.RestoreCachedScene(interior.name);
 
+            // Only arm the compatibility guard when this transition has positively established
+            // a safe doorway landing. If the player has no solid floor beneath them (the kind of
+            // situation an external placement/rescue mod may legitimately be trying to fix), leave
+            // the guard disabled and allow that mod to reposition the player without interference.
+            bool guardMultiplayerInteriorLanding = false;
+            if (considerMultiplayerInteriorLandingGuard)
+            {
+                string landingSafetyReason;
+                guardMultiplayerInteriorLanding = IsSafeMultiplayerInteriorLanding(
+                    resolvedMultiplayerInterior,
+                    resolvedMultiplayerInteriorLanding,
+                    landingPosition,
+                    out landingSafetyReason);
+
+                if (!guardMultiplayerInteriorLanding)
+                    Debug.Log($"[InteriorLandingGuard] Not armed because initial MP landing was not positively validated as safe. reason={landingSafetyReason}");
+            }
+
             // Raise event
             RaiseOnTransitionInteriorEvent(door, interior);
+
+            // A resource/placement mod can start a delayed teleport from the transition event.
+            // Do not wait a hard-coded number of seconds or lock the player at the doorway; just
+            // watch for one teleport-like upward snap and restore this transition's verified-safe,
+            // MP-aware landing.
+            if (guardMultiplayerInteriorLanding)
+                StartMultiplayerInteriorLandingGuard(resolvedMultiplayerInterior, resolvedMultiplayerInteriorLanding);
 
             // Fade in from black
             if (doFade)
@@ -4752,6 +4830,263 @@ private IEnumerator FadedTransitionDungeonExterior()
             }
 
             ClearTransitionFallingDamageWindow("SetStanding-after-snap");
+        }
+
+        /// <summary>
+        /// Positively validates one side of an interior doorway without moving the player.
+        /// This is intentionally conservative and generic: a candidate is considered safe only when
+        /// a non-trigger, sufficiently horizontal collider belonging to this exact interior is directly
+        /// beneath it. This lets malformed/replacement interiors recover from a reversed door normal
+        /// without changing normal DFU door placement when the usual side is already valid.
+        /// </summary>
+        private bool IsSafeInteriorDoorLandingCandidate(
+            DaggerfallInterior targetInterior,
+            Vector3 candidatePosition,
+            out string reason)
+        {
+            reason = string.Empty;
+
+            if (targetInterior == null)
+            {
+                reason = "missing-interior";
+                return false;
+            }
+
+            if (controller == null)
+            {
+                reason = "missing-character-controller";
+                return false;
+            }
+
+            if (float.IsNaN(candidatePosition.x) || float.IsInfinity(candidatePosition.x) ||
+                float.IsNaN(candidatePosition.y) || float.IsInfinity(candidatePosition.y) ||
+                float.IsNaN(candidatePosition.z) || float.IsInfinity(candidatePosition.z))
+            {
+                reason = "invalid-candidate-position";
+                return false;
+            }
+
+            // Match the scale of SetStanding(), but ignore triggers and require the hit to come from
+            // this interior rather than exterior terrain/geometry that can overlap SP interiors in Y.
+            float rayDistance = Mathf.Max(
+                PlayerHeightChanger.controllerStandingHeight * 2f,
+                controller.height * 0.5f + 1f);
+
+            RaycastHit[] hits = Physics.RaycastAll(
+                candidatePosition + Vector3.up * 0.05f,
+                Vector3.down,
+                rayDistance,
+                Physics.DefaultRaycastLayers,
+                QueryTriggerInteraction.Ignore);
+
+            if (hits == null || hits.Length == 0)
+            {
+                reason = "no-floor-hit";
+                return false;
+            }
+
+            // RaycastAll order is not guaranteed. Choose the nearest acceptable floor belonging
+            // to this interior so unrelated exterior/world colliders cannot validate the wrong side.
+            float nearestDistance = float.MaxValue;
+            RaycastHit nearestHit = new RaycastHit();
+            bool foundInteriorFloor = false;
+
+            for (int i = 0; i < hits.Length; i++)
+            {
+                RaycastHit hit = hits[i];
+                if (hit.collider == null)
+                    continue;
+
+                Transform hitTransform = hit.collider.transform;
+                if (hitTransform == null ||
+                    (hitTransform != targetInterior.transform && !hitTransform.IsChildOf(targetInterior.transform)))
+                    continue;
+
+                float upDot = Vector3.Dot(hit.normal, Vector3.up);
+                if (upDot < 0.25f)
+                    continue;
+
+                if (hit.distance < nearestDistance)
+                {
+                    nearestDistance = hit.distance;
+                    nearestHit = hit;
+                    foundInteriorFloor = true;
+                }
+            }
+
+            if (!foundInteriorFloor)
+            {
+                reason = "no-interior-floor-below";
+                return false;
+            }
+
+            // The doorway position can be above the exact standing foot height. Keep this generous
+            // enough to match SetStanding(), while still rejecting a floor on a different storey.
+            if (nearestHit.distance > PlayerHeightChanger.controllerStandingHeight * 2f)
+            {
+                reason = $"interior-floor-too-far distance={nearestHit.distance:F3}";
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Positively validates the MP doorway landing before the delayed-teleport guard is armed.
+        /// This keeps the compatibility guard out of the way when the normal transition has not
+        /// actually produced a safe standing position and an external rescue/placement mod may be
+        /// needed to move the player somewhere valid.
+        /// </summary>
+        private bool IsSafeMultiplayerInteriorLanding(
+            DaggerfallInterior targetInterior,
+            Vector3 authoritativeLandingPosition,
+            Vector3 expectedDoorLandingPosition,
+            out string reason)
+        {
+            reason = string.Empty;
+
+            if (targetInterior == null || interior != targetInterior)
+            {
+                reason = "interior-changed";
+                return false;
+            }
+
+            if (controller == null)
+            {
+                reason = "missing-character-controller";
+                return false;
+            }
+
+            Vector3 currentPosition = transform.position;
+            if (float.IsNaN(currentPosition.x) || float.IsInfinity(currentPosition.x) ||
+                float.IsNaN(currentPosition.y) || float.IsInfinity(currentPosition.y) ||
+                float.IsNaN(currentPosition.z) || float.IsInfinity(currentPosition.z))
+            {
+                reason = "invalid-player-position";
+                return false;
+            }
+
+            // Internal setup after SetStanding() should not have moved the player away from the
+            // resolved doorway landing before external transition subscribers even run.
+            float setupDriftLimit = Mathf.Max(1f, controller.radius * 2f);
+            if ((currentPosition - authoritativeLandingPosition).sqrMagnitude > setupDriftLimit * setupDriftLimit)
+            {
+                reason = $"setup-drift current={currentPosition} resolved={authoritativeLandingPosition}";
+                return false;
+            }
+
+            // SetStanding() can legitimately adjust Y, but X/Z should still correspond to the
+            // doorway landing chosen by the MP-offset-aware transition.
+            Vector2 currentXZ = new Vector2(currentPosition.x, currentPosition.z);
+            Vector2 expectedDoorXZ = new Vector2(expectedDoorLandingPosition.x, expectedDoorLandingPosition.z);
+            float doorwayHorizontalLimit = Mathf.Max(1.25f, controller.radius * 2.5f);
+            if ((currentXZ - expectedDoorXZ).sqrMagnitude > doorwayHorizontalLimit * doorwayHorizontalLimit)
+            {
+                reason = $"not-at-resolved-door current={currentPosition} doorLanding={expectedDoorLandingPosition}";
+                return false;
+            }
+
+            // The guard is only allowed to override a later teleport when the original landing has
+            // a real, non-trigger, sufficiently horizontal surface immediately beneath the player's
+            // feet. This is the key distinction between the Rosy conflict and a legitimate void rescue.
+            float rayDistance = controller.height * 0.5f + 1f;
+            RaycastHit hit;
+            Ray ray = new Ray(currentPosition + Vector3.up * 0.05f, Vector3.down);
+            if (!Physics.Raycast(
+                ray,
+                out hit,
+                rayDistance,
+                Physics.DefaultRaycastLayers,
+                QueryTriggerInteraction.Ignore))
+            {
+                reason = "no-solid-floor-below";
+                return false;
+            }
+
+            float feetY = currentPosition.y - controller.height * 0.5f;
+            float floorGap = feetY - hit.point.y;
+            if (floorGap < -0.1f || floorGap > 0.75f)
+            {
+                reason = $"floor-not-immediately-below gap={floorGap:F3} hit={hit.point}";
+                return false;
+            }
+
+            float upDot = Vector3.Dot(hit.normal, Vector3.up);
+            if (upDot < 0.25f)
+            {
+                reason = $"surface-too-vertical normal={hit.normal}";
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Briefly protects the just-resolved MP building landing from delayed mod teleports
+        /// that search interior markers from unshifted exterior height. Only a sudden upward
+        /// displacement is corrected; ordinary movement away from the doorway is untouched.
+        /// </summary>
+        private void StartMultiplayerInteriorLandingGuard(DaggerfallInterior targetInterior, Vector3 authoritativeLandingPosition)
+        {
+            if (multiplayerInteriorLandingGuardCoroutine != null)
+            {
+                StopCoroutine(multiplayerInteriorLandingGuardCoroutine);
+                multiplayerInteriorLandingGuardCoroutine = null;
+            }
+
+            multiplayerInteriorLandingGuardCoroutine = StartCoroutine(
+                CoGuardMultiplayerInteriorLanding(targetInterior, authoritativeLandingPosition));
+        }
+
+        private IEnumerator CoGuardMultiplayerInteriorLanding(DaggerfallInterior targetInterior, Vector3 authoritativeLandingPosition)
+        {
+            float expiresAt = Time.realtimeSinceStartup + multiplayerInteriorLandingGuardDuration;
+            Vector3 previousPosition = authoritativeLandingPosition;
+
+            while (Time.realtimeSinceStartup < expiresAt)
+            {
+                // Stop as soon as this is no longer the same live MP-offset building transition.
+                if ((!NetworkServer.active && !NetworkClient.active) ||
+                    !currentInteriorUsesMultiplayerYOffset ||
+                    !IsPlayerInsideBuilding ||
+                    targetInterior == null ||
+                    interior != targetInterior)
+                {
+                    break;
+                }
+
+                Vector3 currentPosition = transform.position;
+                Vector3 instantDelta = currentPosition - previousPosition;
+                Vector3 landingDelta = currentPosition - authoritativeLandingPosition;
+
+                // Detect the reported failure mode: a single-frame teleport to an upper floor.
+                // Requiring both an upward jump and a sizeable instantaneous displacement keeps
+                // ordinary walking, jumping, stairs, and ladders from being pulled back.
+                bool jumpedUpFromPreviousFrame = instantDelta.y >= multiplayerInteriorLandingGuardMinUpwardSnap;
+                bool isStillAboveResolvedLanding = landingDelta.y >= multiplayerInteriorLandingGuardMinUpwardSnap;
+                bool movedTeleportDistance = instantDelta.sqrMagnitude >=
+                    multiplayerInteriorLandingGuardMinInstantDistance * multiplayerInteriorLandingGuardMinInstantDistance;
+
+                if (jumpedUpFromPreviousFrame && isStillAboveResolvedLanding && movedTeleportDistance)
+                {
+                    Debug.LogWarning(
+                        $"[InteriorLandingGuard] Correcting delayed upward interior teleport. " +
+                        $"interior={targetInterior.name} resolved={authoritativeLandingPosition} " +
+                        $"previous={previousPosition} displaced={currentPosition} instantDelta={instantDelta}.");
+
+                    ClearTransitionFallingDamage("building-interior-landing-guard-before-restore");
+                    transform.position = authoritativeLandingPosition;
+                    SetStanding();
+                    ClearTransitionFallingDamageWindow("building-interior-landing-guard-after-restore");
+                    ForceSendMultiplayerCoordinatesNow("building-interior-landing-guard-restored");
+                    break;
+                }
+
+                previousPosition = currentPosition;
+                yield return null;
+            }
+
+            multiplayerInteriorLandingGuardCoroutine = null;
         }
 
         private bool ReferenceComponents()
