@@ -206,13 +206,52 @@ If another player has already generated that dungeon, it won't respawn any new e
 
 ## Mod support
 
-Not really tested.
+I tested a few mods. Surprisingly, most interior/dungeon-related stuff actually worked out of the box with little to no issues. These should give some rough idea about mod compatibility.
 
+**Warm Ashes - Wilderness Encounters:**  
+Gave me a few quests/events. They were in sync, and one event even spawned a thief in a city, which was also synced. The slightly weird part is that when someone travels, it can trigger enemy spawns even for the other players, because it seems to run these events as quests, which get auto-synced. But all in all, it seems to be working fine.
+
+**Dungeons of Daggerfall Vanilla Redux:**  
+Just a brief test with 2 random dungeons, but they worked.
+
+**Daggerfall Enemy Expansion:**  
+Encountered a Land Dreugh and a Will-o'-Wisp in a dungeon. Worked.
+
+**Iliac Puddle No More:**  
+Broken, and doesn't seem like an easy fix. For now, it is not working.
+
+**Come Sail Away:**  
+Tested this mod with a simple boat. You see the other player walking on the water, so it is not really working. At least it doesn't break the game; it is mostly immersion-breaking.
+
+**DREAM:**  
+Works.
+
+**Vanilla Enhanced:**  
+Had to add a helper script to make it work. It should work fine starting from version 1.01.
+
+Multiplayer compatibility is included for player visuals and synchronized wandering-NPC clothing. Vanilla Enhanced itself is not included; credit to carademono and the Vanilla Enhanced contributors.
+
+**World of Daggerfall and Beautiful Cities / Villages, with all their requirements:**  
+Had some small issues with interiors. Some of the interiors moved the player to the upper floor/attic instead of the normal entrance. Other than that, they worked well.
+
+After some testing, I found out that one of the mods uses some kind of teleport inside interiors that conflicted with my "find closest door from the entrance door -250m" logic.
+
+I worked around it with a fix that basically blocks any large player-position change near the entrance door if the player has solid ground to land on. If not, it should let the mystery teleport from the mods do its thing.
+
+The interior player-placement fix is included starting from version 1.01.
+
+**Transparent Window:**  
 I wanted to make the "Transparent Window" mod work with the new interior positions, so I made a script that checks whether the mod is installed and, if it is, creates a fake exterior world around the new interior positions.
 
 However, it is only a fake exterior, so no NPCs or enemies are actually visible through the window.
 
 Also, that mod caused issues for me in a few instances, such as falling through the exterior world after the player was teleported. So overall, I do not recommend using it.
+
+---
+
+Obviously, I can't test every single mod, and it is not realistic to make a compatibility fix for every single one of them.
+
+As much as I would like to make the water-related mods work, I can't promise anything. The base idea was to make vanilla Daggerfall work as a drop-in/drop-out co-op. Anything else is just an extra.
 
 ---
 
