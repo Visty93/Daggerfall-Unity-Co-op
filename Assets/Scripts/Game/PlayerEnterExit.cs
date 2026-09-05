@@ -40,15 +40,17 @@ namespace DaggerfallWorkshop.Game
         const float multiplayerInteriorYOffset = -250f;
         bool currentInteriorUsesMultiplayerYOffset = false;
 
-        // Some interior-resource mods run a delayed "safe placement" teleport after
-        // OnTransitionInterior. MP building interiors are shifted far below exterior Y,
-        // so a vanilla-height closest-marker search can incorrectly choose an upper floor.
-        // Watch briefly for a teleport-like upward snap and restore the landing point that
-        // this transition already resolved using the correct MP offset. This is reactive;
-        // there is no fixed delayed teleport and normal walking is not position-locked.
+        // Some interior-related mods can perform delayed placement after OnTransitionInterior.
+        // MP building interiors are shifted far below exterior Y, so a placement search that uses
+        // exterior-height coordinates can incorrectly choose an upper floor. Briefly protect a
+        // positively validated entry landing, but relinquish that protection as soon as the player
+        // materially moves away from the entrance. This keeps the guard transition-specific and
+        // prevents normal interior traversal such as stairs or ladders from being treated as a bad snap.
         const float multiplayerInteriorLandingGuardDuration = 8f;
         const float multiplayerInteriorLandingGuardMinUpwardSnap = 1.5f;
         const float multiplayerInteriorLandingGuardMinInstantDistance = 2.5f;
+        const float multiplayerInteriorLandingGuardMaxEntryHorizontalDistance = 0.75f;
+        const float multiplayerInteriorLandingGuardMaxEntryVerticalDistance = 0.75f;
         Coroutine multiplayerInteriorLandingGuardCoroutine = null;
 
         // Set during load of a save made inside an MP-offset local building interior.
@@ -4988,7 +4990,7 @@ private IEnumerator FadedTransitionDungeonExterior()
 
             // The guard is only allowed to override a later teleport when the original landing has
             // a real, non-trigger, sufficiently horizontal surface immediately beneath the player's
-            // feet. This is the key distinction between the Rosy conflict and a legitimate void rescue.
+            // feet. This is the key distinction between an unnecessary placement override and a legitimate void rescue.
             float rayDistance = controller.height * 0.5f + 1f;
             RaycastHit hit;
             Ray ray = new Ray(currentPosition + Vector3.up * 0.05f, Vector3.down);
@@ -5022,9 +5024,10 @@ private IEnumerator FadedTransitionDungeonExterior()
         }
 
         /// <summary>
-        /// Briefly protects the just-resolved MP building landing from delayed mod teleports
-        /// that search interior markers from unshifted exterior height. Only a sudden upward
-        /// displacement is corrected; ordinary movement away from the doorway is untouched.
+        /// Briefly protects the just-resolved MP building entry from a delayed, implausible upward
+        /// placement change. The guard only has authority while the player remains effectively at
+        /// the entrance; once the player materially moves away, normal interior traversal owns the
+        /// player position and the guard permanently ends for that transition.
         /// </summary>
         private void StartMultiplayerInteriorLandingGuard(DaggerfallInterior targetInterior, Vector3 authoritativeLandingPosition)
         {
@@ -5055,13 +5058,24 @@ private IEnumerator FadedTransitionDungeonExterior()
                     break;
                 }
 
+                // This is an entry-transition guard, not a general teleport blocker. If the player
+                // had already moved materially away from the resolved entrance on the previous frame,
+                // relinquish ownership permanently before evaluating any later movement. Using the
+                // previous frame is important: the unexpected snap itself must not count as the player
+                // intentionally leaving the entrance area.
+                if (!IsPositionWithinMultiplayerInteriorEntryGuard(previousPosition, authoritativeLandingPosition))
+                {
+                    Debug.Log($"[InteriorLandingGuard] Ended because player moved away from entry. interior={targetInterior.name} previous={previousPosition} entry={authoritativeLandingPosition}");
+                    break;
+                }
+
                 Vector3 currentPosition = transform.position;
                 Vector3 instantDelta = currentPosition - previousPosition;
                 Vector3 landingDelta = currentPosition - authoritativeLandingPosition;
 
-                // Detect the reported failure mode: a single-frame teleport to an upper floor.
-                // Requiring both an upward jump and a sizeable instantaneous displacement keeps
-                // ordinary walking, jumping, stairs, and ladders from being pulled back.
+                // Detect only an implausible single-frame upward displacement while the player was
+                // still at the entrance on the previous frame. Ordinary traversal that first moves
+                // away from the entry area causes this guard to end instead of pulling the player back.
                 bool jumpedUpFromPreviousFrame = instantDelta.y >= multiplayerInteriorLandingGuardMinUpwardSnap;
                 bool isStillAboveResolvedLanding = landingDelta.y >= multiplayerInteriorLandingGuardMinUpwardSnap;
                 bool movedTeleportDistance = instantDelta.sqrMagnitude >=
@@ -5070,15 +5084,27 @@ private IEnumerator FadedTransitionDungeonExterior()
                 if (jumpedUpFromPreviousFrame && isStillAboveResolvedLanding && movedTeleportDistance)
                 {
                     Debug.LogWarning(
-                        $"[InteriorLandingGuard] Correcting delayed upward interior teleport. " +
-                        $"interior={targetInterior.name} resolved={authoritativeLandingPosition} " +
+                        $"[InteriorLandingGuard] Correcting delayed upward interior placement. " +
+                        $"interior={targetInterior.name} entry={authoritativeLandingPosition} " +
                         $"previous={previousPosition} displaced={currentPosition} instantDelta={instantDelta}.");
 
+                    // Restore the last pre-snap position rather than forcing the exact original doorway
+                    // point. This preserves any small legitimate movement that occurred while the player
+                    // was still inside the guarded entry area.
                     ClearTransitionFallingDamage("building-interior-landing-guard-before-restore");
-                    transform.position = authoritativeLandingPosition;
+                    transform.position = previousPosition;
                     SetStanding();
                     ClearTransitionFallingDamageWindow("building-interior-landing-guard-after-restore");
                     ForceSendMultiplayerCoordinatesNow("building-interior-landing-guard-restored");
+                    break;
+                }
+
+                // If ordinary movement has now carried the player away from the entry area, end the
+                // guard immediately. Do this only after the unexpected-snap test above so the snap itself
+                // cannot cancel its own correction.
+                if (!IsPositionWithinMultiplayerInteriorEntryGuard(currentPosition, authoritativeLandingPosition))
+                {
+                    Debug.Log($"[InteriorLandingGuard] Ended because player left entry area. interior={targetInterior.name} current={currentPosition} entry={authoritativeLandingPosition}");
                     break;
                 }
 
@@ -5087,6 +5113,23 @@ private IEnumerator FadedTransitionDungeonExterior()
             }
 
             multiplayerInteriorLandingGuardCoroutine = null;
+        }
+
+        private bool IsPositionWithinMultiplayerInteriorEntryGuard(Vector3 position, Vector3 authoritativeLandingPosition)
+        {
+            Vector3 delta = position - authoritativeLandingPosition;
+            float horizontalDistanceSqr = delta.x * delta.x + delta.z * delta.z;
+            float horizontalLimit = Mathf.Max(
+                multiplayerInteriorLandingGuardMaxEntryHorizontalDistance,
+                controller != null ? controller.radius * 1.5f : multiplayerInteriorLandingGuardMaxEntryHorizontalDistance);
+
+            if (horizontalDistanceSqr > horizontalLimit * horizontalLimit)
+                return false;
+
+            if (Mathf.Abs(delta.y) > multiplayerInteriorLandingGuardMaxEntryVerticalDistance)
+                return false;
+
+            return true;
         }
 
         private bool ReferenceComponents()
