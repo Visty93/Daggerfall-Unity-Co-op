@@ -1104,6 +1104,7 @@ private IEnumerator DeferredClientGeneration()
         LayoutDungeon(summary.LocationData, false);
         isSet = true;
         ScheduleInitialSavedActionStateApply("deferred-client-generation");
+        RaiseOnSetDungeonEvent();
     }
     else
     {

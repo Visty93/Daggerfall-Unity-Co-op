@@ -1,5 +1,5 @@
 ﻿// Multiplayer compatibility for Vanilla Enhanced by carademono and contributors.
-// Implemented against the publicly available Vanilla Enhanced source code.
+// Core compatibility was implemented against the formerly public Vanilla Enhanced source code.
 // Vanilla Enhanced is not included and no Vanilla Enhanced assets are redistributed.
 // https://www.nexusmods.com/daggerfallunity/mods/273
 
@@ -30,10 +30,19 @@ using DaggerfallWorkshop.Game;
 /// animation state, freeze state, and SetEnemy() setup synchronously to DaggerfallEnemy.MobileUnit.
 /// The VE replacement remains the object that actually renders and animates.
 ///
-/// Villager Variety civilian clothing is also made deterministic only for civilians already
-/// tracked by MobileNpcSync; its extra local random clothing roll is not added to the network.
-/// Ordinary single-player actors, unsynchronized civilians, enemy authority, movement,
-/// networking, collision, and gameplay state are not modified.
+/// Networked EnemyMotor instances are also kept bound to DaggerfallEnemy.MobileUnit when a
+/// visual replacement occurs, so their existing Idle/Move/Hurt decisions reach the visible unit.
+/// For custom static NPCs in network dungeons, this helper reconstructs the original RDB flat
+/// centre Y directly from the authored block record. DFU's generic custom-flat importer shifts
+/// dungeon replacements down by half of the original texture height. For the reported sunk
+/// Animated People case, restore a downward mismatch to the authored RDB Y. This is a targeted
+/// compatibility correction; the third-party initialization cause is not yet verified.
+/// V6 defers the first correction across a frame boundary so normal Start() can run first. No floor
+/// raycast, renderer-bound estimate, or hardcoded height is used.
+/// Villager Variety civilian clothing is made deterministic only for civilians already tracked by
+/// MobileNpcSync; its extra local random clothing roll is not added to the network. Ordinary
+/// single-player actors, unsynchronized civilians, enemy authority, movement, networking,
+/// collision, and gameplay state are not modified.
 /// </summary>
 [DefaultExecutionOrder(-10000)]
 public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
@@ -42,6 +51,11 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
 
     const string RemoteNpcNamePrefix = "MobileNPC_RemoteSoftSync";
     const float RemoteNpcScanInterval = 0.25f;
+    const float NetworkedEnemyScanInterval = 0.10f;
+    const float DungeonStaticNpcScanInterval = 0.10f;
+    const float DungeonStaticNpcMinDownwardShift = 0.20f;
+    const float DungeonStaticNpcMaxDownwardShift = 3.00f;
+    const float DungeonStaticNpcRdbXZTolerance = 0.05f;
 
     static VanillaEnhancedMultiplayerCompat instance;
     static readonly HashSet<int> diagnosedPlayers = new HashSet<int>();
@@ -53,6 +67,28 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
     // cosmetic correction rather than doing texture work every 0.25 seconds.
     static readonly Dictionary<int, int> deterministicNpcAppearanceSignatures =
         new Dictionary<int, int>();
+
+
+    sealed class DungeonStaticNpcRdbPlacement
+    {
+        public StaticNPC npc;
+        public DaggerfallDungeon dungeon;
+        public float authoredLocalY;
+        public string blockName;
+        public int archive;
+        public int record;
+        public Transform parent;
+        public bool correctionLogged;
+        public int firstObservedFrame;
+        public bool afterStartLogged;
+    }
+
+    static readonly Dictionary<int, DungeonStaticNpcRdbPlacement> dungeonStaticNpcRdbPlacements =
+        new Dictionary<int, DungeonStaticNpcRdbPlacement>();
+
+    // Log once per observed state and live object, including failed resolution. This makes
+    // a silent guard failure distinguishable from a child mesh/pivot problem in Player.log.
+    static readonly Dictionary<StaticNPC, string> dungeonStaticNpcDiagnostics = new Dictionary<StaticNPC, string>();
 
     const BindingFlags StaticPrivate = BindingFlags.Static | BindingFlags.NonPublic;
     const BindingFlags InstanceAny =
@@ -72,10 +108,21 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
     static FieldInfo remoteRecordLocationKeyField;
     static FieldInfo remoteRecordOwnerPlayerIdField;
 
+    // EnemyMotor caches its MobileUnit once during Start(). Visual replacement mods can later
+    // make DaggerfallEnemy.MobileUnit point at a different, custom MobileUnit while EnemyMotor
+    // keeps driving the old billboard. Keep the private cache aligned with DFU's current
+    // canonical MobileUnit, but only for actually networked enemy objects while MP is active.
+    static bool enemyMotorReflectionInitialized;
+    static bool enemyMotorReflectionAvailable;
+    static bool enemyMotorReflectionWarningLogged;
+    static FieldInfo enemyMotorMobileField;
+
     bool activationLogged;
     bool playerDiscoveryLogged;
     bool villagerClothingSyncLogged;
     float nextRemoteNpcScanRealtime;
+    float nextNetworkedEnemyScanRealtime;
+    float nextDungeonStaticNpcScanRealtime;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void Install()
@@ -110,12 +157,19 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
             activationLogged = true;
             Debug.Log(
                 LogPrefix +
-                "Active in multiplayer. Scanning PlayerMultiplayer visuals for a custom MobileUnit replacement.");
+                "Active in multiplayer (NPC height v6). Scanning PlayerMultiplayer visuals for a custom MobileUnit replacement.");
         }
 
         ReconcileMultiplayerPlayerVisuals(ref playerDiscoveryLogged);
 
         float now = Time.realtimeSinceStartup;
+
+        if (now >= nextNetworkedEnemyScanRealtime)
+        {
+            nextNetworkedEnemyScanRealtime = now + NetworkedEnemyScanInterval;
+            ReconcileNetworkedEnemyMotorVisuals();
+        }
+
         if (now >= nextRemoteNpcScanRealtime)
         {
             nextRemoteNpcScanRealtime = now + RemoteNpcScanInterval;
@@ -131,6 +185,15 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
             return;
 
         ReconcileMultiplayerPlayerVisuals(ref playerDiscoveryLogged);
+
+        // Observe NPCs after ordinary Update work. The per-object frame gate below also
+        // prevents a newly instantiated NPC from being moved before its first Start().
+        float now = Time.realtimeSinceStartup;
+        if (now >= nextDungeonStaticNpcScanRealtime)
+        {
+            nextDungeonStaticNpcScanRealtime = now + DungeonStaticNpcScanInterval;
+            ReconcileDungeonStaticNpcRdbPositions();
+        }
     }
 
     static bool IsMultiplayerActive()
@@ -394,6 +457,444 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
         mesh.triangles = indices;
         mesh.normals = normals;
         return mesh;
+    }
+
+    /// <summary>
+    /// EnemyMotor caches GetComponentInChildren&lt;MobileUnit&gt;() during Start(). If Vanilla Enhanced
+    /// replaces that visual afterwards, DaggerfallEnemy.MobileUnit becomes the new source of truth
+    /// but EnemyMotor can continue sending Idle/Move/Hurt/etc. to the old invisible billboard.
+    ///
+    /// Do not change movement, authority, hostility, AI, or animation decisions here. This only
+    /// redirects EnemyMotor's existing animation calls to the same MobileUnit DFU currently owns.
+    /// The NetworkIdentity requirement keeps ordinary single-player enemies completely untouched.
+    /// </summary>
+    static void ReconcileNetworkedEnemyMotorVisuals()
+    {
+        if (!EnsureEnemyMotorReflection())
+            return;
+
+        EnemyMotor[] motors = GameObject.FindObjectsOfType<EnemyMotor>();
+        if (motors == null || motors.Length == 0)
+            return;
+
+        for (int i = 0; i < motors.Length; i++)
+        {
+            EnemyMotor motor = motors[i];
+            if (!motor)
+                continue;
+
+            // PlayerMultiplayer has its own SpriteMultiplayer/proxy bridge above. Never treat a
+            // player visual as an ordinary networked enemy even if a future prefab gains EnemyMotor.
+            if (motor.GetComponentInParent<PlayerMultiplayer>() != null)
+                continue;
+
+            NetworkIdentity identity = motor.GetComponent<NetworkIdentity>();
+            if (!identity)
+                identity = motor.GetComponentInParent<NetworkIdentity>();
+
+            // EnemyMotor exists in the shared DFU code path, so MP being active by itself is not
+            // enough to identify a multiplayer enemy. Only touch objects that Mirror actually owns.
+            if (!identity || identity.netId == 0)
+                continue;
+
+            DaggerfallEnemy daggerfallEnemy = motor.GetComponent<DaggerfallEnemy>();
+            if (!daggerfallEnemy)
+                daggerfallEnemy = motor.GetComponentInChildren<DaggerfallEnemy>();
+            if (!daggerfallEnemy || !daggerfallEnemy.MobileUnit)
+                continue;
+
+            MobileUnit canonical = daggerfallEnemy.MobileUnit;
+            MobileUnit cached = enemyMotorMobileField.GetValue(motor) as MobileUnit;
+
+            if (cached == canonical)
+                continue;
+
+            // A null cache can occur during spawn ordering. Setting it to DFU's current canonical
+            // unit is the same reference EnemyMotor would want once initialization is complete.
+            enemyMotorMobileField.SetValue(motor, canonical);
+
+            Debug.Log(
+                LogPrefix + "Rebound networked EnemyMotor visual on '" + motor.gameObject.name +
+                "': " + (cached ? cached.GetType().FullName : "null") + " -> " +
+                canonical.GetType().FullName + ".");
+        }
+    }
+
+    static bool EnsureEnemyMotorReflection()
+    {
+        if (enemyMotorReflectionInitialized)
+            return enemyMotorReflectionAvailable;
+
+        enemyMotorReflectionInitialized = true;
+        enemyMotorMobileField = typeof(EnemyMotor).GetField("mobile", InstanceAny);
+        enemyMotorReflectionAvailable =
+            enemyMotorMobileField != null &&
+            typeof(MobileUnit).IsAssignableFrom(enemyMotorMobileField.FieldType);
+
+        if (!enemyMotorReflectionAvailable && !enemyMotorReflectionWarningLogged)
+        {
+            enemyMotorReflectionWarningLogged = true;
+            Debug.LogWarning(
+                LogPrefix +
+                "Could not access EnemyMotor.mobile. VE enemy idle/move compatibility is disabled, " +
+                "but the player and civilian compatibility paths remain active.");
+        }
+
+        return enemyMotorReflectionAvailable;
+    }
+
+
+    /// <summary>
+    /// Correct only authored RDB StaticNPC replacement objects inside actually networked dungeons.
+    ///
+    /// DFU RDBLayout passes the original flat centre position to MeshReplacement. The generic
+    /// MeshReplacement.AlignToBase() path then subtracts half of the source texture height for
+    /// dungeon replacements before assigning localPosition. That is correct for a replacement whose
+    /// root is at its base. The reported bug is consistent with a centre-origin animated-person
+    /// replacement remaining at that shifted position; diagnostics below test this on each peer.
+    ///
+    /// Do not infer the intended Y from the floor, renderer bounds, or the current transform. Resolve
+    /// the exact RDB object that created this StaticNPC using its layout hash, archive/record, block,
+    /// and X/Z position, then restore only a substantial downward mismatch to the authored centre Y.
+    /// </summary>
+    static void ReconcileDungeonStaticNpcRdbPositions()
+    {
+        CleanupDungeonStaticNpcRdbPlacements();
+
+        DaggerfallDungeon[] dungeons = GameObject.FindObjectsOfType<DaggerfallDungeon>();
+        if (dungeons == null || dungeons.Length == 0)
+            return;
+
+        for (int d = 0; d < dungeons.Length; d++)
+        {
+            DaggerfallDungeon dungeon = dungeons[d];
+            if (!dungeon)
+                continue;
+
+            NetworkIdentity dungeonIdentity = dungeon.GetComponent<NetworkIdentity>();
+            if (!dungeonIdentity || dungeonIdentity.netId == 0)
+                continue;
+
+            StaticNPC[] npcs = dungeon.GetComponentsInChildren<StaticNPC>(true);
+            if (npcs == null || npcs.Length == 0)
+                continue;
+
+            for (int i = 0; i < npcs.Length; i++)
+            {
+                StaticNPC npc = npcs[i];
+                if (!npc || !npc.gameObject.activeInHierarchy)
+                    continue;
+
+                // RDBLayout-authored dungeon people only. Quest-injected NPCs are Context.Custom.
+                if (npc.Data.context != StaticNPC.Context.Dungeon)
+                {
+                    LogDungeonNpcStatus(npc, "skipped-context-" + npc.Data.context, null);
+                    continue;
+                }
+
+                string customVisualType;
+                if (!HasCustomDungeonStaticNpcVisual(npc, out customVisualType))
+                {
+                    LogDungeonNpcStatus(npc, "skipped-no-AnimatedPeople-component", null);
+                    continue;
+                }
+
+                int key = npc.GetInstanceID();
+                DungeonStaticNpcRdbPlacement placement;
+                if (!dungeonStaticNpcRdbPlacements.TryGetValue(key, out placement) || placement == null ||
+                    placement.npc != npc || placement.parent != npc.transform.parent)
+                {
+                    string reason;
+                    if (!TryResolveDungeonStaticNpcRdbPlacement(npc, dungeon, out placement, out reason))
+                    {
+                        LogDungeonNpcStatus(npc, reason, null);
+                        continue;
+                    }
+
+                    dungeonStaticNpcRdbPlacements[key] = placement;
+                    placement.firstObservedFrame = Time.frameCount;
+                    LogDungeonNpcStatus(npc, "RDB-discovered-before-height-check", placement);
+                    continue;
+                }
+
+                // Dynamic objects can be discovered before Unity calls their Start(). V5
+                // immediately restored the importer offset, which could allow subsequent
+                // mod initialization to add its own lift on top. Observe at least one frame
+                // boundary before intervening; do not use a guessed delay in seconds.
+                if (Time.frameCount <= placement.firstObservedFrame)
+                    continue;
+
+                if (!placement.afterStartLogged)
+                {
+                    placement.afterStartLogged = true;
+                    LogDungeonNpcStatus(npc, "RDB-after-start-height-check", placement);
+                }
+
+                float currentLocalY = npc.transform.localPosition.y;
+                float downwardShift = placement.authoredLocalY - currentLocalY;
+
+                // This compatibility path is only for the observed sunk replacement case.
+                // Never pull an NPC down and never react to tiny animation/pivot noise.
+                if (downwardShift < DungeonStaticNpcMinDownwardShift ||
+                    downwardShift > DungeonStaticNpcMaxDownwardShift)
+                {
+                    if (!placement.correctionLogged)
+                        LogDungeonNpcStatus(npc, "RDB-no-downward-correction", placement);
+                    continue;
+                }
+
+                Vector3 local = npc.transform.localPosition;
+                local.y = placement.authoredLocalY;
+                npc.transform.localPosition = local;
+
+                if (placement.correctionLogged)
+                    continue;
+                placement.correctionLogged = true;
+                Debug.Log(
+                    LogPrefix + "Restored custom dungeon StaticNPC '" + npc.gameObject.name +
+                    "' to exact RDB flat Y. shift=" + downwardShift.ToString("0.000") +
+                    "m, localY=" + currentLocalY.ToString("0.000") + "->" +
+                    placement.authoredLocalY.ToString("0.000") +
+                    ", flat=" + placement.archive + "." + placement.record +
+                    ", block='" + placement.blockName + "'" +
+                    ", visual=" + customVisualType +
+                    ", dungeon='" + dungeon.gameObject.name +
+                    "' netId=" + dungeonIdentity.netId + ".");
+            }
+        }
+    }
+
+    static bool TryResolveDungeonStaticNpcRdbPlacement(
+        StaticNPC npc,
+        DaggerfallDungeon dungeon,
+        out DungeonStaticNpcRdbPlacement placement,
+        out string reason)
+    {
+        placement = null;
+        reason = "RDB-missing-npc-or-dungeon";
+        if (!npc || !dungeon)
+            return false;
+
+        DaggerfallRDBBlock rdbBlock = npc.GetComponentInParent<DaggerfallRDBBlock>();
+        if (!rdbBlock)
+        {
+            reason = "RDB-no-parent-block";
+            return false;
+        }
+
+        string blockName;
+        if (!TryGetRdbBlockName(rdbBlock.gameObject.name, out blockName))
+        {
+            reason = "RDB-unrecognised-block-name: " + rdbBlock.gameObject.name;
+            return false;
+        }
+
+        DaggerfallConnect.DFBlock blockData;
+        try
+        {
+            blockData = DaggerfallUnity.Instance.ContentReader.BlockFileReader.GetBlock(blockName);
+        }
+        catch (Exception ex)
+        {
+            reason = "RDB-read-failed: " + blockName + " " + ex.Message;
+            return false;
+        }
+
+        int wantedHash = npc.Data.hash;
+        int wantedArchive = npc.Data.billboardArchiveIndex;
+        int wantedRecord = npc.Data.billboardRecordIndex;
+        float scale = DaggerfallWorkshop.MeshReader.GlobalScale;
+        // RDB coordinates belong to the block's Flats node. Convert through that frame
+        // rather than assuming the NPC has never been reparented under a mod wrapper.
+        Transform flats = rdbBlock.transform.Find("Flats");
+        if (!flats || (npc.transform != flats && !npc.transform.IsChildOf(flats)))
+        {
+            reason = "RDB-no-Flats-ancestor";
+            return false;
+        }
+        Vector3 currentLocal = flats.InverseTransformPoint(npc.transform.position);
+
+        bool found = false;
+        float bestXZError = float.MaxValue;
+        float bestY = 0f;
+
+        DaggerfallConnect.DFBlock.RdbObjectRoot[] groups = blockData.RdbBlock.ObjectRootList;
+        if (groups == null)
+        {
+            reason = "RDB-empty-block: " + blockName;
+            return false;
+        }
+
+        for (int g = 0; g < groups.Length; g++)
+        {
+            DaggerfallConnect.DFBlock.RdbObject[] objects = groups[g].RdbObjects;
+            if (objects == null)
+                continue;
+
+            for (int o = 0; o < objects.Length; o++)
+            {
+                DaggerfallConnect.DFBlock.RdbObject obj = objects[o];
+                if (obj.Type != DaggerfallConnect.DFBlock.RdbResourceTypes.Flat)
+                    continue;
+
+                if (obj.Resources.FlatResource.TextureArchive != wantedArchive ||
+                    obj.Resources.FlatResource.TextureRecord != wantedRecord)
+                    continue;
+
+                int hash = StaticNPC.GetPositionHash(obj.XPos, obj.YPos, obj.ZPos);
+                if (hash != wantedHash)
+                    continue;
+
+                float expectedX = obj.XPos * scale;
+                float expectedZ = obj.ZPos * scale;
+                float xzError = Mathf.Abs(currentLocal.x - expectedX) + Mathf.Abs(currentLocal.z - expectedZ);
+
+                if (xzError < bestXZError)
+                {
+                    bestXZError = xzError;
+                    bestY = -obj.YPos * scale;
+                    found = true;
+                }
+            }
+        }
+
+        if (!found || bestXZError > DungeonStaticNpcRdbXZTolerance)
+        {
+            reason = found ? "RDB-XZ-mismatch" : "RDB-no-matching-flat";
+            return false;
+        }
+
+        Vector3 authoredWorld = flats.TransformPoint(new Vector3(currentLocal.x, bestY, currentLocal.z));
+        Vector3 authoredLocal = npc.transform.parent
+            ? npc.transform.parent.InverseTransformPoint(authoredWorld) : authoredWorld;
+        // Only a Y correction is supported. Do not move an actor in a rotated frame.
+        if (Mathf.Abs(authoredLocal.x - npc.transform.localPosition.x) +
+            Mathf.Abs(authoredLocal.z - npc.transform.localPosition.z) > DungeonStaticNpcRdbXZTolerance)
+        {
+            reason = "RDB-parent-frame-not-vertical";
+            return false;
+        }
+
+        placement = new DungeonStaticNpcRdbPlacement();
+        placement.npc = npc;
+        placement.dungeon = dungeon;
+        placement.authoredLocalY = authoredLocal.y;
+        placement.parent = npc.transform.parent;
+        placement.blockName = blockName;
+        placement.archive = wantedArchive;
+        placement.record = wantedRecord;
+        reason = "RDB-matched";
+        return true;
+    }
+
+    static bool TryGetRdbBlockName(string gameObjectName, out string blockName)
+    {
+        blockName = null;
+        if (string.IsNullOrEmpty(gameObjectName))
+            return false;
+
+        const string prefix = "DaggerfallBlock [";
+        if (!gameObjectName.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+
+        int closing = gameObjectName.IndexOf(']', prefix.Length);
+        int length = closing - prefix.Length;
+        if (length <= 0)
+            return false;
+
+        blockName = gameObjectName.Substring(prefix.Length, length);
+        return blockName.EndsWith(".RDB", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static void CleanupDungeonStaticNpcRdbPlacements()
+    {
+        List<StaticNPC> deadDiagnostics = null;
+        foreach (KeyValuePair<StaticNPC, string> pair in dungeonStaticNpcDiagnostics)
+        {
+            if (pair.Key)
+                continue;
+            if (deadDiagnostics == null)
+                deadDiagnostics = new List<StaticNPC>();
+            deadDiagnostics.Add(pair.Key);
+        }
+        if (deadDiagnostics != null)
+            foreach (StaticNPC npc in deadDiagnostics)
+                dungeonStaticNpcDiagnostics.Remove(npc);
+
+        List<int> dead = null;
+        foreach (KeyValuePair<int, DungeonStaticNpcRdbPlacement> pair in dungeonStaticNpcRdbPlacements)
+        {
+            DungeonStaticNpcRdbPlacement placement = pair.Value;
+            if (placement != null && placement.npc && placement.dungeon)
+                continue;
+
+            if (dead == null)
+                dead = new List<int>();
+            dead.Add(pair.Key);
+        }
+
+        if (dead == null)
+            return;
+
+        for (int i = 0; i < dead.Count; i++)
+        {
+            dungeonStaticNpcRdbPlacements.Remove(dead[i]);
+        }
+    }
+
+    static void LogDungeonNpcStatus(StaticNPC npc, string status, DungeonStaticNpcRdbPlacement placement)
+    {
+        string previous;
+        if (dungeonStaticNpcDiagnostics.TryGetValue(npc, out previous) && previous == status)
+            return;
+        dungeonStaticNpcDiagnostics[npc] = status;
+
+        string components = "";
+        foreach (MonoBehaviour behaviour in npc.GetComponentsInChildren<MonoBehaviour>(true))
+            if (behaviour)
+                components += behaviour.GetType().FullName + ";";
+
+        string meshes = "";
+        foreach (MeshFilter filter in npc.GetComponentsInChildren<MeshFilter>(true))
+            if (filter.sharedMesh)
+                meshes += filter.name + "(local=" + filter.transform.localPosition.ToString("F3") +
+                    ", meshCentre=" + filter.sharedMesh.bounds.center.ToString("F3") +
+                    ", meshSize=" + filter.sharedMesh.bounds.size.ToString("F3") + ");";
+
+        Debug.Log(LogPrefix + "[NPC-height-v6] " + status + " '" + npc.name +
+            "' context=" + npc.Data.context +
+            ", flat=" + npc.Data.billboardArchiveIndex + "." + npc.Data.billboardRecordIndex +
+            ", hash=" + npc.Data.hash + ", local=" + npc.transform.localPosition.ToString("F3") +
+            ", world=" + npc.transform.position.ToString("F3") +
+            (placement != null ? ", authoredLocalY=" + placement.authoredLocalY.ToString("F3") : "") +
+            ", components=" + components + ", meshes=" + meshes);
+    }
+
+    static bool HasCustomDungeonStaticNpcVisual(StaticNPC npc, out string customVisualType)
+    {
+        customVisualType = null;
+        if (!npc)
+            return false;
+
+        // A replacement suffix alone also identifies unrelated 3D NPC mods, whose base
+        // pivot is intentional. Only apply the centre-height repair to Animated People.
+        MonoBehaviour[] behaviours = npc.GetComponentsInChildren<MonoBehaviour>(true);
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour behaviour = behaviours[i];
+            if (!behaviour || behaviour == npc)
+                continue;
+
+            string fullName = behaviour.GetType().FullName ?? behaviour.GetType().Name;
+            if (fullName.IndexOf("AnimatedPeople", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                fullName.IndexOf("AnimatedPerson", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                customVisualType = fullName;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

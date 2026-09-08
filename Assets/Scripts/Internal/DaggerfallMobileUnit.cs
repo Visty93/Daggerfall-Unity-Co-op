@@ -339,13 +339,38 @@ namespace DaggerfallWorkshop
             // Change enemy to this orientation
             if (orientation != lastOrientation)
             {
-                // Different orientations may not have the same amount of frames
-                // For example, archive 288 (Ancient Lich) has 4 frames in six orientations (front, back, front diagonals, sides), but 8 frames for the two back diagonals
-                // If you change orientation from a back diagonal during frame 4, 5, 6, or 7, you overflow the other anims, where only 0 to 3 are valid
-                if (lastOrientation >= 0)
+                // A custom/modded mobile can expose an incomplete orientation table, and
+                // lastOrientation can also be stale briefly after a state/setup rebuild.
+                // Validate both indexes here because this method used to index StateAnims
+                // before OrientEnemy() could perform its own bounds check.
+                if (summary.StateAnims == null || summary.StateAnims.Length == 0)
+                    return;
+
+                if (orientation < 0 || orientation >= summary.StateAnims.Length)
+                    return;
+
+                int newFrameCount = summary.StateAnims[orientation].NumFrames;
+
+                // Different orientations may not have the same amount of frames.
+                // Preserve DFU's proportional frame mapping when the previous orientation
+                // is still valid for the current animation table.
+                if (lastOrientation >= 0 && lastOrientation < summary.StateAnims.Length)
                 {
-                    currentFrame = currentFrame * summary.StateAnims[orientation].NumFrames / summary.StateAnims[lastOrientation].NumFrames;
+                    int oldFrameCount = summary.StateAnims[lastOrientation].NumFrames;
+                    if (oldFrameCount > 0 && newFrameCount > 0)
+                        currentFrame = currentFrame * newFrameCount / oldFrameCount;
                 }
+                else if (lastOrientation >= summary.StateAnims.Length)
+                {
+                    // Previous orientation belonged to an older/different animation table.
+                    // Start this orientation from a safe frame instead of indexing stale data.
+                    currentFrame = 0;
+                }
+
+                // If no proportional remap was possible, still make sure the current frame
+                // is valid for the new orientation.
+                if (newFrameCount > 0 && currentFrame >= newFrameCount)
+                    currentFrame = 0;
 
                 OrientEnemy(orientation);
             }
@@ -525,6 +550,21 @@ namespace DaggerfallWorkshop
             {
                 if (!freezeAnims && summary.IsSetup && summary.StateAnims != null && summary.StateAnims.Length > 0)
                 {
+                    // A state/setup change can temporarily leave lastOrientation invalid for
+                    // the newly-created StateAnims array. Re-resolve it before any array access.
+                    if (lastOrientation < 0 || lastOrientation >= summary.StateAnims.Length)
+                    {
+                        UpdateOrientation();
+
+                        // If the current custom animation table still cannot represent the
+                        // camera-facing orientation, skip this animation tick safely.
+                        if (lastOrientation < 0 || lastOrientation >= summary.StateAnims.Length)
+                        {
+                            yield return new WaitForSeconds(1f / fps);
+                            continue;
+                        }
+                    }
+
                     // Update enemy and fps
                     OrientEnemy(lastOrientation);
                     fps = summary.StateAnims[lastOrientation].FramePerSecond / FrameSpeedDivisor;

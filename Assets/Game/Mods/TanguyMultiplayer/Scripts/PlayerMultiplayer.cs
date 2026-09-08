@@ -2436,7 +2436,7 @@ public void CmdCreateFoesWithPositions(
             if (setupEnemy != null)
             {
                 MobileGender gender = (UnityEngine.Random.value < 0.55f) ? MobileGender.Male : MobileGender.Female;
-                setupEnemy.ApplyEnemySettings(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer, MobileTeams.CityWatch, spawnScalingLevel);
+                setupEnemy.ApplyEnemySettingsWithScalingLevel(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer, spawnScalingLevel);
 
                 // CreateFoe / send-foe waves are explicitly requested with their reaction.
                 // Force the live motor flag before NetworkServer.Spawn(), because EnemyMotor.Start()
@@ -2754,7 +2754,7 @@ private void ApplyEnemySettingsPayload(
 
         enemy.SetPendingAuthoritativeSpawnHealth(authoritativeCurrent);
         enemy.CaptureOwnerHostilityBeforeInitialSettings();
-        enemy.ApplyEnemySettings(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer, team);
+        enemy.ApplyEnemySettings(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer);
 
         if (enemy.TryGetComponent(out DaggerfallEntityBehaviour entityBehaviourAfter) &&
             entityBehaviourAfter.Entity is EnemyEntity enemyEntityAfter)

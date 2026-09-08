@@ -2723,7 +2723,7 @@ public static Transform FindDoorOwnerInScene(StaticDoor door)
         /// </summary>
         /// <param name="doorOwner">Parent transform owning door array..</param>
         /// <param name="door">Exterior door player clicked on.</param>
-        public void TransitionInterior(Transform doorOwner, StaticDoor door, bool doFade = false, bool start = true, uint requestingNetId = 0)
+        public void TransitionInterior(Transform doorOwner, StaticDoor door, bool doFade = false, bool start = true)
 
         {
 			Debug.Log($"[TransitionInterior] NetServer={NetworkServer.active}, NetClient={NetworkClient.active}");
@@ -5021,6 +5021,24 @@ private IEnumerator FadedTransitionDungeonExterior()
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Ends this entry's guard after MP respawn has intentionally moved to a tavern Rest marker.
+        /// Call synchronously after successful placement, before yielding to another frame.
+        /// </summary>
+        public void CompleteMultiplayerInteriorEntryGuardForRespawn(DaggerfallInterior expectedInterior)
+        {
+            if ((!NetworkServer.active && !NetworkClient.active) ||
+                !IsPlayerInsideBuilding || expectedInterior == null || interior != expectedInterior)
+                return;
+
+            if (multiplayerInteriorLandingGuardCoroutine != null)
+            {
+                StopCoroutine(multiplayerInteriorLandingGuardCoroutine);
+                multiplayerInteriorLandingGuardCoroutine = null;
+                Debug.Log("[InteriorLandingGuard] Entry guard completed for intentional tavern respawn placement.");
+            }
         }
 
         /// <summary>

@@ -2561,7 +2561,7 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
         if (setupEnemy != null)
         {
             MobileGender gender = (UnityEngine.Random.Range(0f, 1f) < 0.55f) ? MobileGender.Male : MobileGender.Female;
-            setupEnemy.ApplyEnemySettings(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer, MobileTeams.CityWatch, spawnScalingLevel);
+            setupEnemy.ApplyEnemySettingsWithScalingLevel(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer, spawnScalingLevel);
 
             MobileUnit mobileUnit = setupEnemy.GetMobileBillboardChild();
             if (mobileUnit.Enemy.Behaviour != MobileBehaviour.Flying)

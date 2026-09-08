@@ -20,8 +20,6 @@ namespace DaggerfallWorkshop.Game
         [SyncVar] public MobileGender EnemyGender = MobileGender.Unspecified;
         [SyncVar] public bool AlliedToPlayer = false;
         [SyncVar] public byte ClassicSpawnDistanceType = 0;
-				[SyncVar]
-public MobileTeams Team;
 
 // Live hostility sync + inspector/debug visibility
 [SyncVar(hook = nameof(OnSyncedHostilityChanged))]
@@ -597,9 +595,8 @@ public override void OnStartServer()
         EnemyType = (MobileTypes)mobileEnemy.ID;
         EnemyGender = mobileEnemy.Gender;
         EnemyReaction = mobileEnemy.Reactions;
-        Team = mobileEnemy.Team;
 
-        Debug.Log($"[SetupDemoEnemy] (Server) Published enemy SyncVars: Type={EnemyType}, Gender={EnemyGender}, Reaction={EnemyReaction}, Team={Team}, ID={mobileEnemy.ID}");
+        Debug.Log($"[SetupDemoEnemy] (Server) Published enemy SyncVars: Type={EnemyType}, Gender={EnemyGender}, Reaction={EnemyReaction}, ID={mobileEnemy.ID}");
     }
 
     // Safety net for any server spawn path that did not manually capture HP before NetworkServer.Spawn().
@@ -673,13 +670,13 @@ private IEnumerator ApplySpawnSyncVarsAsVisualFallback()
             if (SyncedSpawnHealth > 0)
                 SetPendingAuthoritativeSpawnHealth(SyncedSpawnHealth);
 
-            ApplyEnemySettings(EnemyType, EnemyReaction, EnemyGender, ClassicSpawnDistanceType, AlliedToPlayer, Team);
+            ApplyEnemySettings(EnemyType, EnemyReaction, EnemyGender, ClassicSpawnDistanceType, AlliedToPlayer);
             clientVisualSettingsApplied = true;
 
             if (SyncedSpawnHealth > 0)
                 ApplySyncedSpawnHealthAsMax(SyncedSpawnHealth, "spawn-syncvar-visual-fallback");
 
-            Debug.Log($"[SetupDemoEnemy][LateJoinVisualFallback] Applied spawn SyncVars locally: enemy='{gameObject.name}' type={EnemyType} reaction={EnemyReaction} gender={EnemyGender} team={Team}");
+            Debug.Log($"[SetupDemoEnemy][LateJoinVisualFallback] Applied spawn SyncVars locally: enemy='{gameObject.name}' type={EnemyType} reaction={EnemyReaction} gender={EnemyGender}");
             yield break;
         }
 
@@ -781,12 +778,6 @@ private IEnumerator WaitForEnemyEntity()
 
     Debug.LogError("[SetupDemoEnemy] (Client) Failed to retrieve EnemyEntity after multiple attempts!");
 }
-
-private IEnumerator ApplySettingsWithDelayTeam(SetupDemoEnemy setupEnemy, MobileTeams team)
-{
-    yield break;
-}
-
 
 /*	
 private void MoveToDungeon()
@@ -1074,23 +1065,34 @@ private IEnumerator WaitForDungeon()
         /// Change enemy settings and configure in a single call.
         /// </summary>
         /// <param name="enemyType">Enemy type.</param>
-public void ApplyEnemySettings(MobileTypes enemyType, MobileReactions enemyReaction, MobileGender gender, byte classicSpawnDistanceType = 0, bool alliedToPlayer = false, MobileTeams team = MobileTeams.CityWatch, int spawnScalingLevel = 0)
+public void ApplyEnemySettings(MobileTypes enemyType, MobileReactions enemyReaction, MobileGender gender, byte classicSpawnDistanceType = 0, bool alliedToPlayer = false)
 {
-    if (spawnScalingLevel > 0)
-        SpawnScalingLevel = Mathf.Clamp(spawnScalingLevel, 1, 100);
-
     EnemyType = enemyType;
     EnemyReaction = enemyReaction;
     EnemyGender = gender;
     ClassicSpawnDistanceType = classicSpawnDistanceType;
     AlliedToPlayer = alliedToPlayer;
 
-    // ✅ Apply the Team properly
-    Team = team;
-
-    Debug.Log($"[ApplyEnemySettings] Applied settings: Type={enemyType}, Reaction={enemyReaction}, Gender={gender}, AlliedToPlayer={alliedToPlayer}, Team={team}, SpawnScalingLevel={SpawnScalingLevel}");
+    Debug.Log($"[ApplyEnemySettings] Applied settings: Type={enemyType}, Reaction={enemyReaction}, Gender={gender}, AlliedToPlayer={alliedToPlayer}, SpawnScalingLevel={SpawnScalingLevel}");
 
     ApplyEnemySettings(gender);
+}
+
+// Multiplayer-only extension used by host-authored quest/dungeon foe spawning.
+// Keep this separate from the public DFU ApplyEnemySettings() signature so compiled
+// DFU mods can continue to call the original five-argument method.
+public void ApplyEnemySettingsWithScalingLevel(
+    MobileTypes enemyType,
+    MobileReactions enemyReaction,
+    MobileGender gender,
+    byte classicSpawnDistanceType,
+    bool alliedToPlayer,
+    int spawnScalingLevel)
+{
+    if (spawnScalingLevel > 0)
+        SpawnScalingLevel = Mathf.Clamp(spawnScalingLevel, 1, 100);
+
+    ApplyEnemySettings(enemyType, enemyReaction, gender, classicSpawnDistanceType, alliedToPlayer);
 }
 
         /// <summary>

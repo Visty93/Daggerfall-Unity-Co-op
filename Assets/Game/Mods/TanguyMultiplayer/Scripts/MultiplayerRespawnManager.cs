@@ -23,6 +23,9 @@ namespace DaggerfallWorkshop.Game
     /// </summary>
     public class MultiplayerRespawnManager : MonoBehaviour
     {
+        // Fighters Guild faction observed in the live building data (distinct from Fighter Trainers).
+        private const int FightersGuildFactionId = 41;
+
         public enum RespawnHealthMode
         {
             OneHP,
@@ -250,62 +253,41 @@ namespace DaggerfallWorkshop.Game
                     yield return WaitForTransitionSettle();
             }
 
-            if (!moved && diedInsideInterior && hasDeathLocation && IsTownOrCity(deathLocation))
+            if (!moved && !diedInsideDungeon && hasDeathLocation)
             {
-                // Interior death in a town/city: leave the death building first, then try to enter
-                // a temple/cathedral. If no temple exists, try a tavern. If neither exists, use
-                // the town's normal fast-travel/start marker.
-                TryEnsureExterior("interior-town-respawn");
-                yield return WaitForTransitionSettle();
-                CacheReferences();
-
-                moved = TryEnterPreferredTownRespawnBuilding(out string buildingLabel);
+                // Inspect the location's buildings regardless of its map classification.
+                // Small tavern sites qualify too; palace dungeon data must not override
+                // a usable town building. Death inside an actual dungeon is handled above.
+                string buildingLabel = string.Empty;
+                bool leavingBuilding = playerEnterExit != null && playerEnterExit.IsPlayerInsideBuilding;
+                bool exteriorReady = TryEnsureExterior("town-respawn");
+                if (exteriorReady && leavingBuilding)
+                {
+                    // Interior exit schedules deferred object destruction. Let that frame
+                    // finish before the next interior is created and its scene cache restored.
+                    // Street deaths need no extra frame; this is not a timed settle delay.
+                    yield return null;
+                    CacheReferences();
+                }
+                moved = exteriorReady && TryEnterPreferredTownRespawnBuilding(deathLocation, out buildingLabel);
                 if (moved)
                 {
                     Debug.Log("[MPRespawn] Respawned inside town " + buildingLabel + ". reason=" + reason);
                     yield return WaitForTransitionSettle();
                     if (IsTavernRespawnLabel(buildingLabel))
-                        yield return MoveRespawnedTavernPlayerToRestMarkerRoutine("interior-town-tavern");
-                }
-                else
-                {
-                    RespawnMoveResult fastTravelResult = new RespawnMoveResult();
-                    yield return RespawnAtLocationFastTravelRoutine(deathLocation, "town-no-temple-or-tavern", fastTravelResult);
-                    moved = fastTravelResult.Moved;
-                    if (moved)
-                        yield return WaitForTransitionSettle();
+                        yield return MoveRespawnedTavernPlayerToRestMarkerRoutine("town-tavern");
                 }
             }
 
-            if (!moved && !diedInsideInterior && hasDeathLocation && LocationHasDungeon(deathLocation))
+            if (!moved && !diedInsideInterior && hasDeathLocation &&
+                !IsTownOrCity(deathLocation) && LocationHasDungeon(deathLocation))
             {
-                // Exterior death near a dungeon location: prefer the location fast-travel/start-marker point, not the physical dungeon door.
+                // Only non-town dungeon locations use this exterior rule.
                 RespawnMoveResult fastTravelResult = new RespawnMoveResult();
                 yield return RespawnAtLocationFastTravelRoutine(deathLocation, "exterior-dungeon-location-fast-travel", fastTravelResult);
                 moved = fastTravelResult.Moved;
                 if (moved)
                     yield return WaitForTransitionSettle();
-            }
-
-            if (!moved && !diedInsideInterior && hasDeathLocation && IsTownOrCity(deathLocation))
-            {
-                // City/town exterior death: same safe-town rule as interiors.
-                moved = TryEnterPreferredTownRespawnBuilding(out string buildingLabel);
-                if (moved)
-                {
-                    Debug.Log("[MPRespawn] Respawned inside town " + buildingLabel + " from exterior. reason=" + reason);
-                    yield return WaitForTransitionSettle();
-                    if (IsTavernRespawnLabel(buildingLabel))
-                        yield return MoveRespawnedTavernPlayerToRestMarkerRoutine("exterior-town-tavern");
-                }
-                else
-                {
-                    RespawnMoveResult fastTravelResult = new RespawnMoveResult();
-                    yield return RespawnAtLocationFastTravelRoutine(deathLocation, "town-exterior-fast-travel", fastTravelResult);
-                    moved = fastTravelResult.Moved;
-                    if (moved)
-                        yield return WaitForTransitionSettle();
-                }
             }
 
             if (!moved && hasDeathLocation)
@@ -513,6 +495,11 @@ namespace DaggerfallWorkshop.Game
                 result.Moved = false;
 
             if (!location.Loaded)
+                yield break;
+
+            // Generic fallback can be reached from an interior or a failed building entry.
+            // StreamingWorld teleport alone does not switch the active scene to exterior.
+            if (!TryEnsureExterior(reason + "-leave-building"))
                 yield break;
 
             DFPosition mapPixel;
@@ -833,7 +820,14 @@ namespace DaggerfallWorkshop.Game
 
             try
             {
-                playerEnterExit.TransitionExterior(true);
+                // Complete the scene switch now; a faded coroutine could still be pending
+                // when respawn enters its destination building.
+                playerEnterExit.TransitionExterior(false);
+                if (playerEnterExit.IsPlayerInside)
+                {
+                    Debug.LogWarning("[MPRespawn] Exterior transition did not complete. reason=" + reason);
+                    return false;
+                }
                 Debug.Log("[MPRespawn] Transitioned to exterior. reason=" + reason);
                 return true;
             }
@@ -844,7 +838,7 @@ namespace DaggerfallWorkshop.Game
             }
         }
 
-        private bool TryEnterPreferredTownRespawnBuilding(out string buildingLabel)
+        private bool TryEnterPreferredTownRespawnBuilding(DFLocation expectedLocation, out string buildingLabel)
         {
             buildingLabel = string.Empty;
             CacheReferences();
@@ -855,27 +849,60 @@ namespace DaggerfallWorkshop.Game
             if (playerEnterExit.IsPlayerInside)
                 return false;
 
-            BuildingDirectory buildingDirectory = streamingWorld.GetCurrentBuildingDirectory();
-            if (buildingDirectory == null || streamingWorld.currentPlayerLocationObject == null)
+            // Building keys are unique only within one location. Obtain the directory
+            // from the same object whose doors will be searched, then verify its map ID.
+            BuildingDirectory buildingDirectory = streamingWorld.currentPlayerLocationObject != null
+                ? streamingWorld.currentPlayerLocationObject.GetComponent<BuildingDirectory>()
+                : null;
+            if (buildingDirectory == null || !buildingDirectory.LocationData.Loaded ||
+                buildingDirectory.MapID != expectedLocation.MapTableData.MapId ||
+                !playerGPS.CurrentLocation.Loaded ||
+                playerGPS.CurrentLocation.MapTableData.MapId != buildingDirectory.MapID)
+            {
+                Debug.LogWarning("[MPRespawn] Cannot select building: missing or mismatched location directory. expected=" +
+                    expectedLocation.Name + " type=" + expectedLocation.MapTableData.LocationType);
                 return false;
+            }
+
+            bool isVampire = IsRespawningPlayerVampire();
+            Debug.Log("[MPRespawn] Selecting building. location=" + expectedLocation.Name +
+                " type=" + expectedLocation.MapTableData.LocationType + " vampire=" + isVampire +
+                " temples=" + buildingDirectory.GetBuildingsOfType(DFLocation.BuildingTypes.Temple).Count +
+                " taverns=" + buildingDirectory.GetBuildingsOfType(DFLocation.BuildingTypes.Tavern).Count);
 
             DaggerfallStaticDoors selectedCollection;
             StaticDoor selectedDoor;
             BuildingSummary selectedSummary;
 
-            if (TryFindBuildingDoor(buildingDirectory, DFLocation.BuildingTypes.Temple, out selectedCollection, out selectedDoor, out selectedSummary))
+            if (!isVampire && TryFindBuildingDoor(buildingDirectory, DFLocation.BuildingTypes.Temple, out selectedCollection, out selectedDoor, out selectedSummary))
             {
-                buildingLabel = "temple/cathedral";
-                return TryTransitionIntoBuilding(selectedCollection, selectedDoor, selectedSummary, buildingLabel);
+                if (TryTransitionIntoBuilding(selectedCollection, selectedDoor, selectedSummary, "temple/cathedral"))
+                {
+                    buildingLabel = "temple/cathedral";
+                    return true;
+                }
+                if (!TryEnsureExterior("failed-temple-entry"))
+                    return false;
             }
 
             if (TryFindBuildingDoor(buildingDirectory, DFLocation.BuildingTypes.Tavern, out selectedCollection, out selectedDoor, out selectedSummary))
             {
-                buildingLabel = "tavern";
-                return TryTransitionIntoBuilding(selectedCollection, selectedDoor, selectedSummary, buildingLabel);
+                if (TryTransitionIntoBuilding(selectedCollection, selectedDoor, selectedSummary, "tavern"))
+                {
+                    buildingLabel = "tavern";
+                    return true;
+                }
             }
 
+            Debug.LogWarning("[MPRespawn] No temple or tavern could be entered at " + playerGPS.CurrentLocation.Name + "; using exterior fallback.");
             return false;
+        }
+
+        private bool IsRespawningPlayerVampire()
+        {
+            EntityEffectManager effects = GameManager.Instance != null
+                ? GameManager.Instance.PlayerEffectManager : null;
+            return effects != null && effects.HasVampirism();
         }
 
         private bool IsTavernRespawnLabel(string buildingLabel)
@@ -901,7 +928,8 @@ namespace DaggerfallWorkshop.Game
                     playerEnterExit.Interior != null &&
                     (playerEnterExit.IsPlayerInsideTavern || playerEnterExit.BuildingType == DFLocation.BuildingTypes.Tavern))
                 {
-                    Vector3[] restMarkers = playerEnterExit.Interior.FindMarkers(DaggerfallInterior.InteriorMarkerTypes.Rest);
+                    DaggerfallInterior tavernInterior = playerEnterExit.Interior;
+                    Vector3[] restMarkers = tavernInterior.FindMarkers(DaggerfallInterior.InteriorMarkerTypes.Rest);
                     if (restMarkers != null && restMarkers.Length > 0)
                     {
                         int markerIndex = UnityEngine.Random.Range(0, restMarkers.Length);
@@ -909,6 +937,9 @@ namespace DaggerfallWorkshop.Game
 
                         if (TryMovePlayerTransform(bedPosition, "tavern-rest-marker-" + reason + " index=" + markerIndex))
                         {
+                            // This is an intentional move, not a mod's unwanted upward snap.
+                            // End the entry guard in the same frame, after movement succeeds.
+                            playerEnterExit.CompleteMultiplayerInteriorEntryGuardForRespawn(tavernInterior);
                             try
                             {
                                 PlayerMotor motor = GameManager.Instance != null ? GameManager.Instance.PlayerMotor : null;
@@ -949,10 +980,10 @@ namespace DaggerfallWorkshop.Game
             selectedDoor = default(StaticDoor);
             selectedSummary = default(BuildingSummary);
 
-            if (streamingWorld == null || streamingWorld.currentPlayerLocationObject == null)
+            if (buildingDirectory == null)
                 return false;
 
-            DaggerfallStaticDoors[] doorCollections = streamingWorld.currentPlayerLocationObject.GetComponentsInChildren<DaggerfallStaticDoors>(true);
+            DaggerfallStaticDoors[] doorCollections = buildingDirectory.GetComponentsInChildren<DaggerfallStaticDoors>(true);
             if (doorCollections == null || doorCollections.Length == 0)
                 return false;
 
@@ -962,7 +993,8 @@ namespace DaggerfallWorkshop.Game
             for (int c = 0; c < doorCollections.Length; c++)
             {
                 DaggerfallStaticDoors collection = doorCollections[c];
-                if (collection == null || collection.Doors == null)
+                if (collection == null || collection.Doors == null ||
+                    collection.GetComponentInParent<BuildingDirectory>() != buildingDirectory)
                     continue;
 
                 for (int i = 0; i < collection.Doors.Length; i++)
@@ -976,6 +1008,12 @@ namespace DaggerfallWorkshop.Game
                         continue;
 
                     if (summary.BuildingType != wantedType)
+                        continue;
+
+                    // Guildhalls can be classified as Temple. Exclude both guild and trainer
+                    // factions for every player before choosing the nearest eligible door.
+                    if (summary.FactionId == FightersGuildFactionId ||
+                        summary.FactionId == (int)FactionFile.FactionIDs.Fighter_Trainers)
                         continue;
 
                     Vector3 doorPosition = collection.GetDoorPosition(i);
@@ -996,7 +1034,8 @@ namespace DaggerfallWorkshop.Game
         private bool TryTransitionIntoBuilding(DaggerfallStaticDoors collection, StaticDoor door, BuildingSummary summary, string label)
         {
             CacheReferences();
-            if (collection == null || playerEnterExit == null || playerGPS == null)
+            if (collection == null || playerEnterExit == null || playerGPS == null ||
+                streamingWorld == null || playerEnterExit.IsPlayerInside)
                 return false;
 
             try
@@ -1011,8 +1050,35 @@ namespace DaggerfallWorkshop.Game
                 playerEnterExit.IsPlayerInsideTavern = summary.BuildingType == DFLocation.BuildingTypes.Tavern;
                 playerEnterExit.IsPlayerInsideResidence = false;
 
+                // BuildingTransitionExteriorLogic queues an original-height door placement.
+                // This entry supplies its own MP-aware landing, so cancel that pending move
+                // before the interior hides the exterior world again.
+                streamingWorld.SetAutoReposition(StreamingWorld.RepositionMethods.None, Vector3.zero);
                 playerEnterExit.TransitionInterior(collection.transform, door, true, false);
-                Debug.Log("[MPRespawn] Transitioned into " + label + " buildingKey=" + door.buildingKey);
+                DaggerfallInterior enteredInterior = playerEnterExit.Interior;
+                if (!playerEnterExit.IsPlayerInsideBuilding || enteredInterior == null ||
+                    enteredInterior.EntryDoor.buildingKey != door.buildingKey)
+                {
+                    Debug.LogWarning("[MPRespawn] Building transition did not enter the requested interior. label=" + label + " buildingKey=" + door.buildingKey);
+                    return false;
+                }
+                // A matching key alone does not prove the intended building was loaded.
+                // Do not accept a guildhall or other mismatched interior as a temple/tavern.
+                bool fightersGuildInterior =
+                    enteredInterior.BuildingData.FactionId == FightersGuildFactionId ||
+                    enteredInterior.BuildingData.FactionId == (int)FactionFile.FactionIDs.Fighter_Trainers;
+                bool holyInterior = enteredInterior.BuildingData.BuildingType == DFLocation.BuildingTypes.Temple ||
+                    fightersGuildInterior;
+                if (enteredInterior.BuildingData.BuildingType != summary.BuildingType ||
+                    fightersGuildInterior || (IsRespawningPlayerVampire() && holyInterior))
+                {
+                    Debug.LogWarning("[MPRespawn] Rejected respawn interior. expected=" + summary.BuildingType +
+                        " actual=" + enteredInterior.BuildingData.BuildingType +
+                        " faction=" + enteredInterior.BuildingData.FactionId + " buildingKey=" + door.buildingKey);
+                    return false;
+                }
+                Debug.Log("[MPRespawn] Validated entry into " + label + " buildingKey=" + door.buildingKey +
+                    " faction=" + enteredInterior.BuildingData.FactionId);
                 return true;
             }
             catch (Exception ex)

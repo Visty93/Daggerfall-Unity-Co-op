@@ -1673,6 +1673,10 @@ private void Srv_OnQuestStarted(Quest q)
 
 if (!isServer) return;
         MarkQuestLocalStarted(q.UID);
+        // Capture the actual reached parent branch before acknowledgement marks other
+        // possible StartQuest actions complete. Imported starts keep their existing path.
+        if (_srvSuppressStartDepth == 0)
+            BeginHostScenePersonHandoff(q);
         AcknowledgeNetworkQuestStartInLocalParents(q, "server-quest-start");
         if (_srvSuppressStartDepth > 0) return; // reconstructing from client packet
         Srv_PruneToActive();
@@ -2157,6 +2161,10 @@ if (!isServer) return;
             null,
             "server-local-end");
 
+        // Match local-client and remote-completion cleanup. Ending a quest need not
+        // execute HideNpc first, and surviving scene people can still accept clicks.
+        // Only this ended UID's Person/Item objects are disabled; no foes or child flags.
+        DisableActiveQuestResourceObjectsForEndedQuest(q.UID);
         RemoveNonPermanentQuestInventoryItems(q);
 
         uint endSourceNetId = 0;
@@ -3095,6 +3103,113 @@ if (!isServer) return;
         }
 
         return string.Empty;
+    }
+
+    private void BeginHostScenePersonHandoff(Quest child)
+    {
+        if (!isServer || child == null || QuestMachine.Instance == null)
+            return;
+
+        string childName = NormalizeQuestTemplateName(child.QuestName);
+        HashSet<ulong> parentUids = new HashSet<ulong>();
+        foreach (ulong uid in QuestMachine.Instance.GetAllQuests() ?? new ulong[0])
+        {
+            Quest parent = QuestMachine.Instance.GetQuest(uid);
+            if (parent == null || parent == child || IsQuestSharingBlacklisted(parent))
+                continue;
+            foreach (DaggerfallWorkshop.Game.Questing.Task task in GetQuestTasksForActionScan(parent))
+            {
+                if (task == null || !task.IsTriggered || task.Actions == null)
+                    continue;
+                foreach (IQuestAction action in task.Actions)
+                {
+                    string target;
+                    if (action != null && action.IsComplete &&
+                        TryGetStartQuestTargetName(action, out target) &&
+                        string.Equals(target, childName, StringComparison.OrdinalIgnoreCase))
+                        parentUids.Add(uid);
+                }
+            }
+        }
+        if (parentUids.Count == 0)
+            return;
+
+        List<PendingScenePersonHandoff> snapshots = new List<PendingScenePersonHandoff>();
+        foreach (QuestResourceBehaviour qrb in Resources.FindObjectsOfTypeAll<QuestResourceBehaviour>())
+        {
+            if (!qrb || !parentUids.Contains(qrb.QuestUID) ||
+                !qrb.gameObject.activeInHierarchy || !qrb.gameObject.scene.IsValid() ||
+                !qrb.gameObject.scene.isLoaded)
+                continue;
+            Person person = qrb.TargetResource as Person;
+            if (person == null && qrb.TargetSymbol != null)
+            {
+                Quest parent = QuestMachine.Instance.GetQuest(qrb.QuestUID);
+                if (parent != null) person = parent.GetPerson(qrb.TargetSymbol);
+            }
+            string identity = GetQuestPersonSceneIdentity(person);
+            if (string.IsNullOrEmpty(identity))
+                continue;
+            snapshots.Add(new PendingScenePersonHandoff
+            {
+                identity = identity,
+                sceneHandle = qrb.gameObject.scene.handle,
+                position = qrb.transform.position,
+            });
+        }
+        if (snapshots.Count > 0)
+            StartCoroutine(CoSuppressHostScenePersonHandoff(child, snapshots));
+    }
+
+    private IEnumerator CoSuppressHostScenePersonHandoff(
+        Quest child, List<PendingScenePersonHandoff> snapshots)
+    {
+        // OnQuestStarted precedes the remainder of StartQuest() setup. Let that call
+        // and the new components' Start() finish; no timed polling or quest replay.
+        yield return null;
+        if (!isServer || IsQuestNetSyncPausedForLoad() || QuestMachine.Instance == null ||
+            QuestMachine.Instance.GetQuest(child.UID) != child)
+            yield break;
+
+        int hidden = 0;
+        foreach (QuestResourceBehaviour qrb in Resources.FindObjectsOfTypeAll<QuestResourceBehaviour>())
+        {
+            if (!qrb || qrb.QuestUID != child.UID || !qrb.gameObject.activeInHierarchy ||
+                !qrb.gameObject.scene.IsValid() || !qrb.gameObject.scene.isLoaded)
+                continue;
+            Person person = qrb.TargetSymbol != null ? child.GetPerson(qrb.TargetSymbol) : null;
+            string identity = GetQuestPersonSceneIdentity(person);
+            if (string.IsNullOrEmpty(identity))
+                continue;
+            foreach (PendingScenePersonHandoff snapshot in snapshots)
+            {
+                // Restrict host suppression to a parent's actual former position.
+                // Another placement in the same palace/dungeon must remain available.
+                if (snapshot.sceneHandle != qrb.gameObject.scene.handle ||
+                    !string.Equals(snapshot.identity, identity, StringComparison.OrdinalIgnoreCase) ||
+                    (snapshot.position - qrb.transform.position).sqrMagnitude > 2.25f)
+                    continue;
+                _suppressedScenePersonHandoffBehaviours.Add(qrb);
+                qrb.gameObject.SetActive(false);
+                hidden++;
+                break;
+            }
+        }
+        if (hidden > 0)
+            Debug.Log($"[QuestNetSync][SceneResourceHandoff] Suppressed {hidden} host child scene duplicate(s) uid={child.UID}");
+    }
+
+    private void LateUpdate()
+    {
+        if (!isLocalPlayer || !isServer || IsQuestNetSyncPausedForLoad())
+            return;
+        // QuestResource.Tick() can re-enable a child flat whose logical Person remains
+        // visible. Keep only the already identified scene duplicates suppressed.
+        // New objects created after re-entry are not members of this set.
+        _suppressedScenePersonHandoffBehaviours.RemoveWhere(qrb => qrb == null);
+        foreach (QuestResourceBehaviour qrb in _suppressedScenePersonHandoffBehaviours)
+            if (qrb.gameObject.activeSelf)
+                qrb.gameObject.SetActive(false);
     }
 
     private static int RegisterPendingScenePersonHandoffs(
@@ -8828,6 +8943,8 @@ if (!isServer) return;
             q.StartTask(new Symbol(taskSymbol));
             ReassertClientQuestChainAuthorityAfterTaskState(q, "remote-pcat");
 
+            ApplyRemotePcAtNpcVisibility(q, taskSymbol);
+
             // If this PcAt task is the final reward/end task, replay GivePc immediately
             // instead of requiring the other player to physically enter the same house.
             ForceReplayRewardTasksIfNeeded(q, new string[] { taskSymbol }, true);
@@ -8838,6 +8955,52 @@ if (!isServer) return;
         finally
         {
             _suppressPcAtReportDepth--;
+        }
+    }
+
+    // PcAt can clear the remote target on the next tick when this player is
+    // elsewhere. Apply its immediate NPC visibility effects before that happens,
+    // so the server cannot keep publishing the pre-arrival Person state.
+    private static void ApplyRemotePcAtNpcVisibility(Quest q, string taskSymbol)
+    {
+        if (q == null || q.QuestComplete || q.QuestTombstoned ||
+            string.IsNullOrEmpty(taskSymbol) ||
+            !GetLocalPcAtTargetTasks(q).Contains(taskSymbol))
+            return;
+
+        DaggerfallWorkshop.Game.Questing.Task task = q.GetTask(new Symbol(taskSymbol));
+        if (task == null || task.IsDropped || !task.IsTriggered ||
+            task.HasTriggerConditions || task.Actions == null)
+            return;
+
+        foreach (IQuestAction action in task.Actions)
+        {
+            if (action == null || action.IsComplete)
+                continue;
+
+            string actionType = action.GetType().Name;
+            if (actionType == "PickOneOf")
+            {
+                // This action starts another task without blocking this one.
+                // Its selection/progress remains on the existing sync path.
+                continue;
+            }
+
+            if (actionType != "HideNpc" && actionType != "RestoreNpc")
+            {
+                // Do not jump over an unfinished dialogue, quest-chain start,
+                // task clear, or other action whose ordering we cannot guarantee.
+                return;
+            }
+
+            // Run the actual action: preserve its resource lookup and completion
+            // semantics. No sticky hidden flag; later RestoreNpc still works.
+            action.Update(task);
+            if (!action.IsComplete || q.QuestBreak)
+                return;
+
+            if (Debug.isDebugBuild)
+                Debug.Log($"[QuestNetSync][PcAtNpcVisibility] Applied {actionType} uid={q.UID} task='{taskSymbol}' source='{action.DebugSource}'");
         }
     }
 
