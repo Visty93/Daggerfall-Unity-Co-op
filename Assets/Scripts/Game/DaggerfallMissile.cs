@@ -403,9 +403,8 @@ namespace DaggerfallWorkshop.Game
             // EntityEffectManager, so spell payloads like close-range Silence are skipped
             // unless we redirect that LOCAL shell to the real local PlayerAdvanced.
             //
-            // Do not do this for arrows. Bow damage compares the raw hit entity against
-            // EnemySenses.Target, which is usually the PlayerMultiplayer shell. Replacing
-            // arrow targets with PlayerAdvanced breaks bow damage.
+            // Keep raw arrow hits; the bow-damage check recognizes the matching local
+            // PlayerAdvanced/PlayerMultiplayer pair without changing spell payloads.
             if (!isArrow && localPlayer != null)
             {
                 global::PlayerMultiplayer multiplayer = candidate.GetComponent<global::PlayerMultiplayer>();
@@ -421,9 +420,8 @@ namespace DaggerfallWorkshop.Game
 
         private bool TryAddPayloadTarget(DaggerfallEntityBehaviour candidate)
         {
-            // Arrows must keep the raw hit DaggerfallEntityBehaviour. Spell payload
-            // resolution may redirect local PlayerMultiplayer -> PlayerAdvanced, but bow
-            // damage needs the original shell/enemy target for the existing damage path.
+            // Keep arrow hit entities separate from spell payload resolution. The
+            // final bow check handles the local SP/MP identity pair explicitly.
             DaggerfallEntityBehaviour payloadTarget = isArrow ? candidate : ResolvePayloadTarget(candidate);
             if (payloadTarget == null || payloadTarget == caster || targetEntities.Contains(payloadTarget))
                 return false;
@@ -850,6 +848,34 @@ namespace DaggerfallWorkshop.Game
             }
         }
 
+        // The local physical body and its MP shell are one player. Default-raycast
+        // compatibility lets projectiles hit PlayerAdvanced while enemy targeting
+        // remains on the shell. Preserve BowDamage's existing network damage route.
+        private bool IsSameEnemyArrowTarget(DaggerfallEntityBehaviour hit, DaggerfallEntityBehaviour expected)
+        {
+            if (hit == null || expected == null)
+                return false;
+            if (hit == expected)
+                return true;
+            if (!Mirror.NetworkClient.active && !Mirror.NetworkServer.active)
+                return false;
+
+            DaggerfallEntityBehaviour localBody = GetLocalPlayerEntityBehaviour();
+            if (localBody == null)
+                return false;
+
+            DaggerfallEntityBehaviour other;
+            if (hit == localBody)
+                other = expected;
+            else if (expected == localBody)
+                other = hit;
+            else
+                return false;
+
+            global::PlayerMultiplayer player = other.GetComponent<global::PlayerMultiplayer>();
+            return player != null && player.isLocalPlayer;
+        }
+
         void AssignBowDamageToTarget(Collider arrowHitCollider)
         {
             // Observer arrows are purely cosmetic. They may still collect a trigger hit
@@ -862,7 +888,8 @@ namespace DaggerfallWorkshop.Game
 
             if (caster != GameManager.Instance.PlayerEntityBehaviour)
             {
-                if (targetEntities[0] == caster.GetComponent<EnemySenses>().Target)
+                EnemySenses senses = caster != null ? caster.GetComponent<EnemySenses>() : null;
+                if (senses != null && IsSameEnemyArrowTarget(targetEntities[0], senses.Target))
                 {
                     EnemyAttack attack = caster.GetComponent<EnemyAttack>();
                     if (attack)

@@ -2018,7 +2018,7 @@ void RpcPlayBowAttackAnimation()
             if (Physics.SphereCast(transform.position, controller.radius / 2, sphereCastDir, out hit, dist, ignoreMaskForShooting))
             {
                 DaggerfallEntityBehaviour hitTarget = hit.transform.GetComponent<DaggerfallEntityBehaviour>();
-                if (hitTarget == senses.Target)
+                if (hitTarget == senses.Target || (IsNetworkActive() && IsSameSpellTarget(hitTarget, senses.Target)))
                 {
                     return true;
                 }
@@ -2054,7 +2054,11 @@ void RpcPlayBowAttackAnimation()
                 {
                     DaggerfallEntityBehaviour localPlayer = GameManager.Instance != null ? GameManager.Instance.PlayerEntityBehaviour : null;
                     if (localPlayer != null && (hitTarget == localPlayer || expectedTarget == localPlayer))
-                        return true;
+                    {
+                        DaggerfallEntityBehaviour other = hitTarget == localPlayer ? expectedTarget : hitTarget;
+                        global::PlayerMultiplayer multiplayer = other.GetComponent<global::PlayerMultiplayer>();
+                        return multiplayer != null && multiplayer.isLocalPlayer;
+                    }
                 }
             }
             catch { }
@@ -2763,7 +2767,7 @@ public bool EffectsAlreadyOnTarget(EntityEffectBundle spell)
 
                 if (entityBehaviour2)
                 {
-                    if (entityBehaviour2 == senses.Target)
+                    if (entityBehaviour2 == senses.Target || (IsNetworkActive() && IsSameSpellTarget(entityBehaviour2, senses.Target)))
                         ObstacleDetected = false;
                 }
                 else if (door)
@@ -3418,3 +3422,4 @@ if (senses.Target != null)
         #endregion
     }
 }
+

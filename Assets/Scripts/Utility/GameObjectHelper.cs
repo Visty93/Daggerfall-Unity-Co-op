@@ -2343,6 +2343,19 @@ private static IEnumerator MoveQuestEnemyToRoot(DaggerfallEnemy enemy, SiteTypes
         /// </summary>
         /// <param name="reaction">Foe is hostile by default but can optionally set to passive.</param>
         /// <returns>GameObject[] array of 1-N foes. Array can be null or empty if create fails.</returns>
+// Preserve the original six-parameter signature for compiled DFU mods.
+// Keep defaults on the existing overload so shorter and named-argument calls remain valid.
+public static GameObject[] CreateFoeGameObjects(
+    Vector3 position,
+    MobileTypes foeType,
+    int spawnCount,
+    MobileReactions reaction,
+    Foe foeResource,
+    bool alliedToPlayer)
+{
+    return CreateFoeGameObjects(position, foeType, spawnCount, reaction, foeResource, alliedToPlayer, 0);
+}
+
 public static GameObject[] CreateFoeGameObjects(
     Vector3 position,
     MobileTypes foeType,
@@ -2767,6 +2780,16 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
         /// This prevents SP dungeon/city enemies from surviving after host/client start and mixing with networked enemies.
         /// Does not touch spawned network enemies with a valid netId.
         /// </summary>
+        // Extensions may retain an existing actor across network startup.
+        public static event System.Func<GameObject, bool> PreserveActorAtMultiplayerStart;
+        private static bool ShouldPreserveActorAtMultiplayerStart(GameObject actor)
+        {
+            if (PreserveActorAtMultiplayerStart == null) return false;
+            foreach (System.Func<GameObject, bool> handler in PreserveActorAtMultiplayerStart.GetInvocationList())
+                if (handler(actor)) return true;
+            return false;
+        }
+
         public static int DestroyNonNetworkedEnemiesForMultiplayerStart()
         {
             int destroyed = 0;
@@ -2778,6 +2801,9 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
 
                 NetworkIdentity identity = enemy.GetComponent<NetworkIdentity>();
                 if (identity != null && identity.netId != 0)
+                    continue;
+
+                if (ShouldPreserveActorAtMultiplayerStart(enemy.gameObject))
                     continue;
 
                 UnityEngine.Object.Destroy(enemy.gameObject);

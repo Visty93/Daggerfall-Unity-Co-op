@@ -53,6 +53,129 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     [Tooltip("Grace period (seconds) before enemy can be destroyed.")]
     public float destroyGracePeriod = 10f;
 
+    // Generic extension points: callers own local membership policy.
+    public static event System.Action<DynamicEnemyAuthority> LocalActorUpdate;
+    public bool HasLocalOwnershipClaim { get; set; }
+    [SyncVar] private uint persistentOwnerPlayerNetId;
+    public uint PersistentOwnerPlayerNetId => persistentOwnerPlayerNetId;
+    private NetworkConnectionToClient persistentOwnerConnection;
+
+    [Command(requiresAuthority = true)]
+    public void CmdReleasePersistentOwnerAtPose(Vector3 position, Quaternion rotation, bool dungeon, bool interior,
+        int baseX, int baseZ, int offsetX, int offsetZ, NetworkConnectionToClient sender = null)
+    {
+        if (sender == null || sender.identity == null || persistentOwnerConnection != sender ||
+            persistentOwnerPlayerNetId != sender.identity.netId) return;
+        if (float.IsNaN(position.x) || float.IsNaN(position.y) || float.IsNaN(position.z) ||
+            float.IsInfinity(position.x) || float.IsInfinity(position.y) || float.IsInfinity(position.z)) return;
+        EnemyWorldPosition ewp = GetComponent<EnemyWorldPosition>();
+        if (ewp == null) return;
+
+        // One server command commits pose/context BEFORE dropping the binding.
+        transform.SetParent(null, true);
+        transform.SetPositionAndRotation(position, rotation);
+        if (!ewp.ApplyBoundActorContext(dungeon, interior, baseX, baseZ, offsetX, offsetZ, sender)) return;
+        ResetNetworkTransformBuffers();
+        RpcSnapAll(position, rotation);
+        uint previousOwner = persistentOwnerPlayerNetId;
+        persistentOwnerPlayerNetId = 0;
+        persistentOwnerConnection = null;
+        Debug.Log($"[MPBoundActorRelease] enemy='{name}' net={netId} previousOwner={previousOwner} root pose={position} world={ewp.worldX}/{ewp.worldZ}; proximity authority resumed.", this);
+        UpdateAuthority();
+    }
+
+    [Command(requiresAuthority = false)]
+    public void CmdSetPersistentOwner(bool member, NetworkConnectionToClient sender = null)
+    {
+        SetPersistentOwner(member, sender);
+    }
+
+    [Server]
+    public void SetPersistentOwner(bool member, NetworkConnectionToClient sender)
+    {
+        if (sender == null || !sender.isReady || sender.identity == null ||
+            sender.identity.GetComponent<PlayerMultiplayer>() == null)
+            return;
+
+        if (netIdentity == null)
+            netIdentity = GetComponent<NetworkIdentity>();
+        if (netIdentity == null)
+            return;
+
+        if (!member)
+        {
+            // A non-owner's hierarchy must never release somebody else's bound actor.
+            if (persistentOwnerConnection != sender || persistentOwnerPlayerNetId != sender.identity.netId)
+                return;
+
+            uint previousOwner = persistentOwnerPlayerNetId;
+            persistentOwnerPlayerNetId = 0;
+            persistentOwnerConnection = null;
+            Debug.Log($"[MPBoundActorAuthority][Released] enemy='{name}' net={netId} player={previousOwner}; proximity authority resumed.", this);
+            UpdateAuthority();
+            return;
+        }
+
+        DaggerfallEntityBehaviour entity = GetComponent<DaggerfallEntityBehaviour>();
+        if (entity == null || !(entity.Entity is EnemyEntity))
+            return;
+
+        // Parent trees are local and cannot be verified on the server. Treat this as
+        // a co-op client's membership report; first claim wins until that owner releases.
+        if (persistentOwnerPlayerNetId != 0 &&
+            (persistentOwnerConnection != sender || persistentOwnerPlayerNetId != sender.identity.netId))
+        {
+            Debug.LogWarning($"[MPBoundActorAuthority][Rejected] enemy='{name}' net={netId} requestedPlayer={sender.identity.netId} boundPlayer={persistentOwnerPlayerNetId}", this);
+            return;
+        }
+
+        bool newBinding = persistentOwnerPlayerNetId == 0;
+        persistentOwnerConnection = sender;
+        persistentOwnerPlayerNetId = sender.identity.netId;
+        MaintainPersistentAuthority();
+        if (newBinding)
+            Debug.Log($"[MPBoundActorAuthority][Bound] enemy='{name}' net={netId} player={persistentOwnerPlayerNetId} connection={sender.connectionId}", this);
+    }
+
+    // Called before proximity, deactivation, and distance-destruction checks, even
+    // while EnemyWorldPosition is initializing. No stale transition distance can
+    // transfer a bound actor back to the host.
+    private bool MaintainPersistentAuthority()
+    {
+        if (persistentOwnerPlayerNetId == 0)
+            return false;
+
+        NetworkConnectionToClient registeredConnection;
+        if (persistentOwnerConnection == null || persistentOwnerConnection.identity == null ||
+            persistentOwnerConnection.identity.netId != persistentOwnerPlayerNetId ||
+            !NetworkServer.connections.TryGetValue(persistentOwnerConnection.connectionId, out registeredConnection) ||
+            registeredConnection != persistentOwnerConnection)
+        {
+            Debug.Log($"[MPBoundActorAuthority][OwnerGone] Destroying bound actor '{name}' net={netId} player={persistentOwnerPlayerNetId}", this);
+            NetworkServer.Destroy(gameObject);
+            return true;
+        }
+
+        CancelDestroyCountdown();
+        SetAuthorityDeactivated(false);
+
+        // Not-ready is not a dismissal or disconnect. Wait for that same owner.
+        if (!persistentOwnerConnection.isReady)
+            return true;
+
+        if (netIdentity.connectionToClient != persistentOwnerConnection)
+        {
+            if (netIdentity.connectionToClient != null)
+                netIdentity.RemoveClientAuthority();
+            netIdentity.AssignClientAuthority(persistentOwnerConnection);
+            currentOwner = persistentOwnerConnection;
+            ApplyAuthorityMotionGate();
+            ResetNetworkTransformBuffers();
+        }
+        ShowVisuals(); // still respects each observer's local culling
+        return true;
+    }
+
     [Header("Unit Conversion")]
     [Tooltip("Unity meters per 1 Daggerfall unit. Default assumes 40 DF units = 1 Unity meter.")]
     public float unityPerDF = 1f / 40f; // 0.025
@@ -156,8 +279,44 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         return Mathf.Max(authorityCheckInterval, MinEffectiveAuthorityCheckInterval);
     }
 
+    private bool retainedRuntimeStarted;
+    private Coroutine retainedAuthorityRoutine;
+    public void ResumeRetainedActorNetworking()
+    {
+        if (retainedAuthorityRoutine != null) StopCoroutine(retainedAuthorityRoutine);
+        retainedAuthorityRoutine = null;
+        retainedRuntimeStarted = false;
+        Start();
+    }
+
+    public void ResetRetainedActorToLocal()
+    {
+        StopAllCoroutines();
+        if (_ntResetCo != null)
+        {
+            var pendingTransform = GetComponent<NetworkTransform>();
+            if (pendingTransform != null) pendingTransform.enabled = true;
+        }
+        _ntResetCo = null;
+        destroyCoroutine = null;
+        warmupPumpCo = null;
+        retainedAuthorityRoutine = null;
+        _createFoeAuthorityResnapCo = null;
+        _serverCreateFoeSpawnSettleCo = null;
+        persistentOwnerPlayerNetId = 0;
+        persistentOwnerConnection = null;
+        currentOwner = null;
+        HasLocalOwnershipClaim = false;
+        authorityDeactivated = false;
+        localPerPlayerCulled = false;
+        SetLocalPlayerCollisionIgnored(false);
+        RefreshVisualAndAudioState();
+    }
+
     void Start()
     {
+        if (retainedRuntimeStarted) return;
+        retainedRuntimeStarted = true;
         netIdentity = GetComponent<NetworkIdentity>();
         enemyTransform = transform;
         visual = transform.Find("MobileUnitBillboard")?.gameObject;
@@ -178,11 +337,12 @@ public class DynamicEnemyAuthority : NetworkBehaviour
             Destroy(dim);
 
         if (NetworkServer.active)
-            StartCoroutine(AuthorityCheckRoutine());
+            retainedAuthorityRoutine = StartCoroutine(AuthorityCheckRoutine());
     }
 
     void LateUpdate()
     {
+        LocalActorUpdate?.Invoke(this);
         NormalizeExteriorTerrainFrameNearLocalPlayer();
         HoldRemotePassiveFixedSpawnOnServer();
         UpdateLocalPerPlayerCulling();
@@ -242,9 +402,77 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         return false;
     }
 
+    private bool TryAlignRemoteOwnedEnemyCombatFrame()
+    {
+        if (!isServer || netIdentity == null || netIdentity.connectionToClient == null ||
+            netIdentity.connectionToClient == NetworkServer.localConnection)
+            return false;
+
+        // This branch completely owns correction for remote-owned enemies. If their
+        // context is not exterior, do not fall through to an exterior wrap on the host.
+        if (worldPosition == null || worldPosition.isInteriorSpawn || worldPosition.isDungeonSpawn ||
+            transform.position.y < -100f || IsUnderStreamingTarget())
+            return true;
+        if (GameManager.Instance == null || GameManager.Instance.PlayerEnterExit == null ||
+            GameManager.Instance.PlayerEnterExit.IsPlayerInside)
+            return true;
+
+        // Player-target combat uses that player's frame; infighting/following falls
+        // back to the simulation owner's frame. No dependency on the distant host's
+        // nearest-frame choice for the enemy itself.
+        PlayerMultiplayer reference = null;
+        EnemySenses senses = GetComponent<EnemySenses>();
+        if (senses != null && senses.Target != null)
+            reference = senses.Target.GetComponentInParent<PlayerMultiplayer>();
+        PositionMultiplayer referencePosition = reference != null ? reference.GetComponent<PositionMultiplayer>() : null;
+        if (!IsNearbyExteriorCombatReference(referencePosition))
+        {
+            NetworkIdentity ownerIdentity = netIdentity.connectionToClient.identity;
+            reference = ownerIdentity != null ? ownerIdentity.GetComponent<PlayerMultiplayer>() : null;
+            referencePosition = reference != null ? reference.GetComponent<PositionMultiplayer>() : null;
+        }
+        if (!IsNearbyExteriorCombatReference(referencePosition))
+            return true;
+
+        // Ensure the reference has already wrapped this frame, regardless of LateUpdate order.
+        if (!reference.isLocalPlayer && !referencePosition.EnsureBoundedExteriorFrameForCombat())
+            return true;
+
+        float expectedDx = (float)(((double)worldPosition.worldX - referencePosition.x) * unityPerDF);
+        float expectedDz = (float)(((double)worldPosition.worldZ - referencePosition.z) * unityPerDF);
+        Vector3 position = transform.position;
+        Vector3 referencePose = reference.transform.position;
+        float shiftX = Mathf.Round((referencePose.x + expectedDx - position.x) / TerrainFrameUnitySize) * TerrainFrameUnitySize;
+        float shiftZ = Mathf.Round((referencePose.z + expectedDz - position.z) / TerrainFrameUnitySize) * TerrainFrameUnitySize;
+        if (Mathf.Abs(shiftX) < 1f && Mathf.Abs(shiftZ) < 1f)
+            return true;
+        transform.position = new Vector3(position.x + shiftX, position.y, position.z + shiftZ);
+        worldPosition.NoteExternalSeamFrameCorrection();
+        return true;
+    }
+
+    private bool IsNearbyExteriorCombatReference(PositionMultiplayer reference)
+    {
+        if (reference == null || (worldPosition.worldX == 0 && worldPosition.worldZ == 0) ||
+            (reference.x == 0 && reference.z == 0) || reference.transform.position.y < -100f ||
+            reference.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.BuildingInterior ||
+            reference.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.DungeonInterior)
+            return false;
+        double dx = ((double)worldPosition.worldX - reference.x) * unityPerDF;
+        double dz = ((double)worldPosition.worldZ - reference.z) * unityPerDF;
+        // This is a bounded local offset, NEVER full-world displacement from the host.
+        // Do not modulo this test: genuinely distant players are not valid references.
+        return dx * dx + dz * dz <= TerrainFrameHalfUnitySize * TerrainFrameHalfUnitySize;
+    }
+
     private void NormalizeExteriorTerrainFrameNearLocalPlayer()
     {
         if (!NetworkClient.active)
+            return;
+
+        // Client-owned enemies and their player reference must use one bounded
+        // combat frame on the host, even while the host is far away.
+        if (TryAlignRemoteOwnedEnemyCombatFrame())
             return;
 
         if (IsActualNetworkDungeonEnemyForLocalRules() || IsUnderStreamingTarget())
@@ -293,6 +521,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     private void HoldRemotePassiveFixedSpawnOnServer()
     {
+        if (persistentOwnerPlayerNetId != 0)
+            return;
+
         // Server/host-side only. The CreateFoe marker itself means "run the finite
         // floor-settle/resnap", not "hold every passive enemy forever". Only an
         // explicitly restrained single-marker quest foe may use this ongoing hold.
@@ -446,7 +677,13 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     void UpdateAuthority()
     {
-        if (!NetworkServer.active || !netIdentity || worldPosition == null || !worldPosition.isActiveAndEnabled || !worldPosition.initialized)
+        if (!NetworkServer.active || !netIdentity)
+            return;
+
+        if (MaintainPersistentAuthority())
+            return;
+
+        if (worldPosition == null || !worldPosition.isActiveAndEnabled || !worldPosition.initialized)
             return;
 
         bool inGrace = (Time.time - spawnTime < destroyGracePeriod);
@@ -1042,6 +1279,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     void TryStartDestroyCountdown()
     {
+        if (persistentOwnerPlayerNetId != 0)
+            return;
+
         if (destroyCoroutine == null)
         {
             destroyCoroutine = StartCoroutine(DestroyAfterDelay());
@@ -1061,7 +1301,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     {
         yield return new WaitForSeconds(destroyGracePeriod);
 
-        if (!IsAnyPlayerStillOutOfRange()) // double check before destroy
+        if (persistentOwnerPlayerNetId == 0 && !IsAnyPlayerStillOutOfRange()) // double check before destroy
         {
             Debug.Log($"[DynamicEnemyAuthority] Still no players near. Destroying enemy '{name}' (NetID: {netIdentity.netId})");
             NetworkServer.Destroy(gameObject);
@@ -1101,6 +1341,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     private bool ShouldRunCreateFoeAuthorityResnap()
     {
+        if (persistentOwnerPlayerNetId != 0 || HasLocalOwnershipClaim)
+            return false;
+
         if (_didCreateFoeAuthorityResnap || !hasAuthority)
             return false;
 

@@ -107,6 +107,84 @@ public class EnemyWorldPosition : NetworkBehaviour
         return hostConnection == null || ni.connectionToClient != hostConnection;
     }
 
+    private DynamicEnemyAuthority boundActorAuthority;
+    private uint BoundActorOwner()
+    {
+        if (boundActorAuthority == null)
+            boundActorAuthority = GetComponent<DynamicEnemyAuthority>();
+        return boundActorAuthority != null ? boundActorAuthority.PersistentOwnerPlayerNetId : 0;
+    }
+
+    public bool TryCaptureLocalActorContext(out bool dungeon, out bool interior, out int baseX,
+        out int baseZ, out int offsetX, out int offsetZ)
+    {
+        dungeon = interior = false;
+        baseX = baseZ = offsetX = offsetZ = 0;
+        GameManager gm = GameManager.Instance;
+        if (gm == null || gm.PlayerEnterExit == null || gm.PlayerObject == null || gm.PlayerGPS == null)
+            return false;
+        dungeon = gm.PlayerEnterExit.IsPlayerInsideDungeon;
+        interior = dungeon || gm.PlayerEnterExit.IsPlayerInsideBuilding;
+        baseX = gm.PlayerGPS.WorldX;
+        baseZ = gm.PlayerGPS.WorldZ;
+        if (dungeon)
+        {
+            var currentDungeon = gm.PlayerEnterExit.Dungeon;
+            if (currentDungeon == null || !currentDungeon.HasDungeonWorldAnchor) return false;
+            baseX = currentDungeon.DungeonAnchorWorldX;
+            baseZ = currentDungeon.DungeonAnchorWorldZ;
+        }
+        Vector3 offset = transform.position - gm.PlayerObject.transform.position;
+        if (!interior)
+        {
+            offset.x -= Mathf.Round(offset.x / TerrainFrameUnitySize) * TerrainFrameUnitySize;
+            offset.z -= Mathf.Round(offset.z / TerrainFrameUnitySize) * TerrainFrameUnitySize;
+        }
+        offsetX = dungeon ? 0 : Mathf.RoundToInt(offset.x * UnityToWorldUnit);
+        offsetZ = dungeon ? 0 : Mathf.RoundToInt(offset.z * UnityToWorldUnit);
+        return true;
+    }
+
+    [Command(requiresAuthority = true)]
+    public void CmdPublishBoundActorContext(bool dungeon, bool interior, int baseX, int baseZ,
+        int offsetX, int offsetZ, NetworkConnectionToClient sender = null)
+    {
+        ApplyBoundActorContext(dungeon, interior, baseX, baseZ, offsetX, offsetZ, sender);
+    }
+
+    [Server]
+    public bool ApplyBoundActorContext(bool dungeon, bool interior, int baseX, int baseZ,
+        int offsetX, int offsetZ, NetworkConnectionToClient sender)
+    {
+        uint owner = BoundActorOwner();
+        if (owner == 0 || sender == null || sender.identity == null ||
+            sender.identity.netId != owner || sender.identity.GetComponent<PlayerMultiplayer>() == null)
+            return false;
+
+        interior = interior || dungeon;
+        bool changed = isDungeonSpawn != dungeon || isInteriorSpawn != interior || requesterNetId != owner ||
+            (dungeon && (!hasDungeonWorldAnchor || dungeonAnchorWorldX != baseX || dungeonAnchorWorldZ != baseZ));
+        isDungeonSpawn = dungeon;
+        isInteriorSpawn = interior;
+        requesterNetId = owner;
+        hasDungeonWorldAnchor = dungeon;
+        dungeonAnchorLocked = dungeon;
+        dungeonAnchorWorldX = dungeon ? baseX : 0;
+        dungeonAnchorWorldZ = dungeon ? baseZ : 0;
+        playerWorldX = baseX;
+        playerWorldZ = baseZ;
+        worldX = baseX + (dungeon ? 0 : offsetX);
+        worldZ = baseZ + (dungeon ? 0 : offsetZ);
+        worldBakedFromRequester = true;
+        mapPixel = MapsFile.WorldCoordToMapPixel(worldX, worldZ);
+        lastUnityPos = transform.position;
+        playerUnityPosition = sender.identity.transform.position;
+        spawnEnemyUnityPosition = transform.position;
+        if (changed)
+            Debug.Log($"[MPBoundActorContext] enemy='{name}' net={netId} owner={owner} dungeon={dungeon} interior={interior} world={worldX}/{worldZ}", this);
+        return true;
+    }
+
     void Update()
     {
         PublishAuthorityWorldPositionIfNeeded();
@@ -119,7 +197,7 @@ public class EnemyWorldPosition : NetworkBehaviour
         if (!NetworkClient.active || isServer || !hasAuthority)
             return;
 
-        if (isInteriorSpawn || isDungeonSpawn)
+        if (BoundActorOwner() != 0 || isInteriorSpawn || isDungeonSpawn)
             return;
 
         if (Time.unscaledTime < nextOwnerWorldPublishTime)
@@ -149,7 +227,7 @@ public class EnemyWorldPosition : NetworkBehaviour
     [Command(requiresAuthority = true)]
     private void CmdPublishAuthorityWorldPosition(int baseWorldX, int baseWorldZ, int offsetX, int offsetZ)
     {
-        if (isInteriorSpawn || isDungeonSpawn)
+        if (BoundActorOwner() != 0 || isInteriorSpawn || isDungeonSpawn)
             return;
 
         playerWorldX = baseWorldX;
@@ -273,10 +351,29 @@ public class EnemyWorldPosition : NetworkBehaviour
         }
     }
 
+    private bool retainedRuntimeStarted;
+    public void ResumeRetainedActorNetworking()
+    {
+        StopAllCoroutines();
+        retainedRuntimeStarted = false;
+        initialized = false;
+        Start();
+    }
+
+    public void ResetRetainedActorToLocal()
+    {
+        StopAllCoroutines();
+        initialized = false;
+        lastUnityPos = transform.position;
+    }
+
     void Start()
     {
+        if (retainedRuntimeStarted) return;
         if (!isServer)
             return;
+
+        retainedRuntimeStarted = true;
 
         // Safety: some spawn paths set SetupDemoEnemy.isDungeonEnemy but do not call
         // SetDungeonSpawnContext(). Promote those to dungeon-anchor DF X/Z math.
@@ -546,12 +643,9 @@ public class EnemyWorldPosition : NetworkBehaviour
     {
         lastUnityPos = transform.position;
 
-        // On the server/host, immediately repair logical DF coordinates after a
-        // scene-root terrain-frame wrap. But do not rebake remote-client-owned
-        // exterior enemies from the server observer transform; the owner publishes
-        // those logical DF coordinates directly.
-        if (isServer && initialized && !IsRemoteClientOwnedOnServer())
-            ReBakeFromRequesterOrClosest();
+        // Whole-frame correction is not physical movement. Do not feed it back
+        // into DF world coordinates. The owner/server movement paths still publish
+        // actual movement and teleport rebakes as before.
     }
 
     System.Collections.IEnumerator UpdateRoutine()
@@ -562,6 +656,14 @@ public class EnemyWorldPosition : NetworkBehaviour
 
             if (!initialized)
                 continue;
+
+            // Bound actors publish all location modes from their owner's frame.
+            // Do not add server-side interpolated Unity deltas to those coordinates.
+            if (BoundActorOwner() != 0)
+            {
+                lastUnityPos = transform.position;
+                continue;
+            }
 
             // For remote-client-owned exterior enemies, the server transform is an
             // observer/interpolation artifact around terrain seams. The owner publishes
@@ -606,6 +708,11 @@ public class EnemyWorldPosition : NetworkBehaviour
     [Server]
     private void ReBakeFromRequesterOrClosest()
     {
+        if (BoundActorOwner() != 0)
+        {
+            lastUnityPos = transform.position;
+            return;
+        }
         if (IsRemoteClientOwnedOnServer() && !isInteriorSpawn && !isDungeonSpawn)
         {
             lastUnityPos = transform.position;

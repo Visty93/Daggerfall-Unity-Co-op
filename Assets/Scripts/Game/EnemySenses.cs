@@ -1649,13 +1649,32 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
             }
         }
 
+        // A local MP shell and PlayerAdvanced represent the same player on this peer.
+        // Resolve only for collision queries; keep network targeting/authority unchanged.
+        private DaggerfallEntityBehaviour GetLocalVisibilityBody(DaggerfallEntityBehaviour candidate)
+        {
+            if (candidate == null || !IsMultiplayerActive() || GameManager.Instance == null)
+                return candidate;
+
+            PlayerMultiplayer multiplayer = candidate.GetComponent<PlayerMultiplayer>();
+            if (multiplayer == null || !multiplayer.isLocalPlayer)
+                return candidate;
+
+            DaggerfallEntityBehaviour localBody = GameManager.Instance.PlayerEntityBehaviour;
+            CharacterController localController = localBody != null ? localBody.GetComponent<CharacterController>() : null;
+            return localController != null && localController.enabled && localBody.gameObject.activeInHierarchy
+                ? localBody : candidate;
+        }
+
         bool CanSeeTarget(DaggerfallEntityBehaviour target)
         {
             bool seen = false;
             actionDoor = null;
 
-            if (IsUntargetableMultiplayerBehaviour(target))
+            if (target == null || IsUntargetableMultiplayerBehaviour(target))
                 return false;
+
+            DaggerfallEntityBehaviour visibilityBody = GetLocalVisibilityBody(target);
 
             if (distanceToTarget < SightRadius + mobile.Enemy.SightModifier)
             {
@@ -1672,8 +1691,8 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
                     eyePos.y += controller.height / 3;
 
                     // Set destination to the target's approximate eye position
-                    controller = target.transform.GetComponent<CharacterController>();
-                    Vector3 targetEyePos = target.transform.position + controller.center;
+                    controller = visibilityBody.transform.GetComponent<CharacterController>();
+                    Vector3 targetEyePos = visibilityBody.transform.position + controller.center;
                     targetEyePos.y += controller.height / 3;
 
                     // Check if can see.
@@ -1685,7 +1704,7 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
                     {
                         // Check if hit was target
                         DaggerfallEntityBehaviour entity = hit.transform.gameObject.GetComponent<DaggerfallEntityBehaviour>();
-                        if (entity == target)
+                        if (entity == target || entity == visibilityBody)
                             seen = true;
 
                         // Check if hit was an action door
@@ -1728,3 +1747,4 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
         #endregion
     }
 }
+

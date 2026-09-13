@@ -179,8 +179,17 @@ public class PositionMultiplayer : NetworkBehaviour
 
     private void WrapRemotePlayerIntoLocalTerrainFrame()
     {
+        EnsureBoundedExteriorFrameForCombat();
+    }
+
+    // Called before an observing host aligns an enemy with this player's frame.
+    // Returns false for interior/dungeon handoffs; never moves the real local player.
+    public bool EnsureBoundedExteriorFrameForCombat()
+    {
+        if (isLocalPlayer)
+            return false;
         if (!NetworkClient.active)
-            return;
+            return false;
 
         // This must also run on the host/server. The host's local scene uses the host
         // terrain frame, while a remote client's NetworkTransform position is expressed
@@ -196,7 +205,7 @@ public class PositionMultiplayer : NetworkBehaviour
         if (GameManager.Instance == null ||
             GameManager.Instance.PlayerObject == null ||
             GameManager.Instance.PlayerGPS == null)
-            return;
+            return false;
 
         // This is an exterior-only seam fix. Never wrap remote proxies while either
         // side is in an interior/dungeon coordinate space. Network dungeons can share
@@ -204,18 +213,18 @@ public class PositionMultiplayer : NetworkBehaviour
         // Y slots and lifecycle logic depend on the raw dungeon-local network position.
         PlayerEnterExit localEnterExit = GameManager.Instance.PlayerEnterExit;
         if (localEnterExit != null && localEnterExit.IsPlayerInside)
-            return;
+            return false;
 
         if (PartyCurrentLocationState == PartyLocationState.BuildingInterior ||
             PartyCurrentLocationState == PartyLocationState.DungeonInterior)
-            return;
+            return false;
 
         // During dungeon-entry handoff the party-location SyncVar can lag behind the
         // NetworkTransform by a frame or two. Treat the large negative MP dungeon Y
         // slots as non-exterior too, so a stationary client near dungeon walls is not
         // rewrapped into an exterior terrain frame and considered gone from the dungeon.
         if (transform.position.y < -100f)
-            return;
+            return false;
 
         Vector3 localPlayerPos = GameManager.Instance.PlayerObject.transform.position;
         Vector3 pos = transform.position;
@@ -230,9 +239,10 @@ public class PositionMultiplayer : NetworkBehaviour
 
         if (Mathf.Abs(correctionX) <= SeamCorrectionEpsilon &&
             Mathf.Abs(correctionZ) <= SeamCorrectionEpsilon)
-            return;
+            return true;
 
         transform.position = new Vector3(pos.x + correctionX, pos.y, pos.z + correctionZ);
+        return true;
     }
 
     private float WrapDeltaToNearestTerrainFrame(float delta)

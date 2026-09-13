@@ -16,6 +16,85 @@ namespace Mirror
     [HelpURL("https://mirror-networking.gitbook.io/docs/components/network-manager")]
     public class NetworkManager : MonoBehaviour
     {
+        // Optional session/object extensions. All game-specific policy stays in subscribers.
+        public static event Action ClientExtensionsReady;
+        public static event Action ServerExtensionsReady;
+        public static event Action SessionStopping;
+        public static event Action SessionStopped;
+        public static event Action<NetworkConnection> ServerBeforeReady;
+        public static event Func<SpawnMessage, NetworkIdentity> ResolveClientSpawn;
+        public static event Action<NetworkIdentity> ClientSpawnApplied;
+
+        static void OnExtendedClientSpawn(SpawnMessage message)
+        {
+            // Preserve Mirror's separate host spawn path: the server object already exists.
+            if (NetworkServer.localClientActive)
+            {
+                NetworkClient.OnHostClientSpawn(message);
+                return;
+            }
+            NetworkIdentity identity = null;
+            if (ResolveClientSpawn != null)
+            {
+                foreach (Func<SpawnMessage, NetworkIdentity> resolver in ResolveClientSpawn.GetInvocationList())
+                {
+                    identity = resolver(message);
+                    if (identity != null) break;
+                }
+            }
+            if (identity == null)
+                NetworkClient.OnSpawn(message);
+            else
+                NetworkClient.ApplySpawnPayload(identity, message);
+
+            if (NetworkClient.spawned.TryGetValue(message.netId, out identity) && identity != null)
+                ClientSpawnApplied?.Invoke(identity);
+        }
+
+        /// <summary>Remove a retained local object from networking before session cleanup.</summary>
+        public static void DetachRetainedObject(NetworkIdentity identity)
+        {
+            if (identity == null || identity.netId == 0) return;
+            if (identity.isServer)
+            {
+                // Existing Mirror API runs stop callbacks and resets without destroying the object.
+                NetworkServer.UnSpawn(identity.gameObject);
+            }
+            else
+            {
+                uint previousNetId = identity.netId;
+                identity.OnStopClient();
+                NetworkClient.spawned.Remove(previousNetId);
+                identity.Reset();
+            }
+        }
+
+        /// <summary>Spawn, finish retained-state initialization, then publish to existing observers.</summary>
+        public static void SpawnPreparedObject(GameObject actor, NetworkConnectionToClient owner,
+            Action<NetworkIdentity> prepare, Action<NetworkIdentity, NetworkConnection> beforeSend)
+        {
+            NetworkIdentity identity = actor != null ? actor.GetComponent<NetworkIdentity>() : null;
+            if (!NetworkServer.active || identity == null || identity.netId != 0 || identity.serverOnly)
+                throw new InvalidOperationException("Prepared spawn requires a new network-visible server actor.");
+
+            // Let Mirror perform its normal identity/owner/observer registration, but defer
+            // its spawn messages until the caller has restored state after OnStartServer.
+            identity.serverOnly = true;
+            try
+            {
+                NetworkServer.Spawn(actor, owner);
+                if (identity.netId == 0) throw new InvalidOperationException("Mirror did not spawn the actor.");
+                prepare?.Invoke(identity);
+            }
+            finally { identity.serverOnly = false; }
+
+            foreach (NetworkConnection observer in identity.observers.Values.ToArray())
+            {
+                beforeSend?.Invoke(identity, observer);
+                NetworkServer.SendSpawnMessage(identity, observer);
+            }
+        }
+
         /// <summary>Enable to keep NetworkManager alive when changing scenes.</summary>
         // This should be set if your game has a single NetworkManager that exists for the lifetime of the process. If there is a NetworkManager in each scene, then this should not be set.</para>
         [Header("Configuration")]
@@ -510,6 +589,7 @@ namespace Mirror
         /// <summary>This stops both the client and the server that the manager is using.</summary>
         public void StopHost()
         {
+            if (NetworkClient.active || NetworkServer.active) SessionStopping?.Invoke();
             OnStopHost();
 
             // calling OnTransportDisconnected was needed to fix
@@ -530,6 +610,7 @@ namespace Mirror
             if (!NetworkServer.active)
                 return;
 
+            SessionStopping?.Invoke();
             if (authenticator != null)
             {
                 authenticator.OnServerAuthenticated.RemoveListener(OnServerAuthenticated);
@@ -554,6 +635,7 @@ namespace Mirror
             // set offline mode BEFORE changing scene so that FinishStartScene
             // doesn't think we need initialize anything.
             mode = NetworkManagerMode.Offline;
+            SessionStopped?.Invoke();
 
             if (!string.IsNullOrWhiteSpace(offlineScene))
             {
@@ -570,6 +652,8 @@ namespace Mirror
         {
             if (mode == NetworkManagerMode.Offline)
                 return;
+
+            SessionStopping?.Invoke();
 
             if (authenticator != null)
             {
@@ -600,6 +684,7 @@ namespace Mirror
             // shutdown client
             NetworkClient.Disconnect();
             NetworkClient.Shutdown();
+            SessionStopped?.Invoke();
 
             // If this is the host player, StopServer will already be changing scenes.
             // Check loadingSceneAsync to ensure we don't double-invoke the scene change.
@@ -694,6 +779,7 @@ namespace Mirror
 
             // Network Server initially registers its own handler for this, so we replace it here.
             NetworkServer.ReplaceHandler<ReadyMessage>(OnServerReadyMessageInternal);
+            ServerExtensionsReady?.Invoke();
         }
 
         void RegisterClientMessages()
@@ -709,6 +795,8 @@ namespace Mirror
 
             foreach (GameObject prefab in spawnPrefabs.Where(t => t != null))
                 NetworkClient.RegisterPrefab(prefab);
+
+            ClientExtensionsReady?.Invoke();
         }
 
         // This is the only way to clear the singleton, so another instance can be created.
@@ -1129,6 +1217,7 @@ namespace Mirror
         void OnServerReadyMessageInternal(NetworkConnection conn, ReadyMessage msg)
         {
             //Debug.Log("NetworkManager.OnServerReadyMessageInternal");
+            ServerBeforeReady?.Invoke(conn);
             OnServerReady(conn);
         }
 
@@ -1154,11 +1243,15 @@ namespace Mirror
                 return;
             }
 
+            ServerBeforeReady?.Invoke(conn);
             OnServerAddPlayer(conn);
         }
 
         void OnClientConnectInternal()
         {
+            // Connect() installs Mirror's system handlers after RegisterClientMessages().
+            // Install our forwarding handler here, before authentication can mark us ready.
+            NetworkClient.ReplaceHandler<SpawnMessage>(OnExtendedClientSpawn);
             //Debug.Log("NetworkManager.OnClientConnectInternal");
 
             if (authenticator != null)

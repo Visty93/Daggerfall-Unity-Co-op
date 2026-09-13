@@ -1,11 +1,11 @@
-﻿using System.Collections;
+using System.Collections;
 using UnityEngine;
 using Mirror;
 using DaggerfallWorkshop.Game;
 
 /// <summary>
 /// Combined root collision + visual-child stabilizer for PlayerMultiplayer.
-/// 
+///  
 /// Put this file in Assets as:
 ///     PlayerMultiplayerCollisionProxy.cs
 /// 
@@ -28,6 +28,13 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
 
     [Tooltip("Only ignore PlayerAdvanced against its own local PlayerMultiplayer proxy. Remote proxies remain solid.")]
     public bool ignoreOnlyOwnLocalProxy = true;
+
+    [Tooltip("Let default raycasts reach PlayerAdvanced through its own overlapping MP shell. Keeps the root controller enabled; remote shells keep their original layer.")]
+    public bool hideOwnProxyFromDefaultRaycasts = true;
+
+    const int IgnoreRaycastLayerIndex = 2;
+    int layerBeforeRaycastCompatibility;
+    bool ownsRaycastLayer;
 
     [Header("Visual child stabilizer")]
     [Tooltip("Optional. Leave empty to auto-find the Enemy/Thief visual child that has the extra child CharacterController.")]
@@ -86,8 +93,15 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
         ApplyVisualLock(true);
     }
 
+    void OnDisable()
+    {
+        RestoreRaycastLayer();
+    }
+
     void Update()
     {
+        // Ownership can become available after Start. Do not wait for the refresh timer.
+        ApplyLocalRaycastCompatibility();
         if (Time.time >= nextCollisionRefreshTime)
         {
             nextCollisionRefreshTime = Time.time + refreshInterval;
@@ -118,6 +132,8 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
         if (proxyController == null)
             return;
 
+        ApplyLocalRaycastCompatibility();
+
         // Do not leave this disabled. Enemies target/check height against this root controller.
         if (keepRootControllerEnabled && !proxyController.enabled)
             proxyController.enabled = true;
@@ -143,6 +159,55 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
         // This keeps remote players physically blocking each other without colliding with yourself.
         if (ignoreOnlyOwnLocalProxy)
             Physics.IgnoreCollision(localPlayerController, proxyController, isOwnLocalProxy);
+    }
+
+    void ApplyLocalRaycastCompatibility()
+    {
+        if (networkIdentity == null)
+            networkIdentity = GetComponent<NetworkIdentity>();
+
+        bool useLocalBody = hideOwnProxyFromDefaultRaycasts &&
+            (NetworkClient.active || NetworkServer.active) &&
+            networkIdentity != null && networkIdentity.isLocalPlayer;
+
+        // Only hide the duplicate when the real local collision body is available.
+        if (useLocalBody)
+        {
+            if (localPlayerController == null && GameManager.Instance != null &&
+                GameManager.Instance.PlayerObject != null)
+                localPlayerController = GameManager.Instance.PlayerObject.GetComponent<CharacterController>();
+
+            useLocalBody = localPlayerController != null &&
+                localPlayerController != proxyController && localPlayerController.enabled &&
+                localPlayerController.gameObject.activeInHierarchy &&
+                (Physics.DefaultRaycastLayers & (1 << localPlayerController.gameObject.layer)) != 0;
+        }
+
+        if (!useLocalBody)
+        {
+            RestoreRaycastLayer();
+            return;
+        }
+
+        if (!ownsRaycastLayer)
+        {
+            layerBeforeRaycastCompatibility = gameObject.layer;
+            ownsRaycastLayer = true;
+            Debug.Log($"[MPLocalRaycastCompat] net={networkIdentity.netId} local MP root uses Ignore Raycast; CharacterController remains enabled. Local raycast body='{localPlayerController.name}'.", this);
+        }
+
+        // Root only. Never change remote players, PlayerAdvanced, or child layers.
+        gameObject.layer = IgnoreRaycastLayerIndex;
+    }
+
+    void RestoreRaycastLayer()
+    {
+        if (!ownsRaycastLayer)
+            return;
+
+        if (gameObject.layer == IgnoreRaycastLayerIndex)
+            gameObject.layer = layerBeforeRaycastCompatibility;
+        ownsRaycastLayer = false;
     }
 
     void FindVisualRootIfNeeded()
@@ -324,3 +389,4 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
         ApplyVisualLock(true);
     }
 }
+
