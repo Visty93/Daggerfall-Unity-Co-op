@@ -47,7 +47,7 @@ namespace DaggerfallWorkshop.Utility
 
         // Multiplayer dungeon enemy import level override.
         // RDBLayout's classic random enemy selection still reads GameManager.Instance.PlayerEntity.Level
-        // directly while building its 256-entry dungeon enemy tables. Passing monsterPower is not enough
+        // directly while building its 256-entry dungeon enemy tables. Passing monsterPower is not enough 
         // for the classic path. For a client-requested dungeon, temporarily make that read return the
         // requester level while RDBLayout.AddRandomEnemies/AddFixedEnemies instantiate enemies, then restore
         // the host player's real level immediately afterwards.
@@ -2417,7 +2417,7 @@ public static GameObject[] CreateFoeGameObjects(
             }
             else
             {
-                // --- Client path: compute positions locally and send to host ---
+                // --- Client path: send caller-selected positions to host ---
                 ulong questUID = 0UL;
                 string foeSymbolName = string.Empty;
 
@@ -2433,24 +2433,11 @@ public static GameObject[] CreateFoeGameObjects(
                 bool isDungeonFromClient =
                     GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true;
 
-                // A single-spawn caller has already chosen its exact world position.
-                // This is used by FoeSpawner after TryFindSpawnPoint() and by the
-                // console mobile-spawn command for its point in front of the local player.
-                // Do not replace that position with the generic random wave picker.
-                // Multi-enemy waves still use the existing client-side placement logic.
-                Vector3[] preferredPositions;
-                if (totalSpawns == 1)
-                {
-                    preferredPositions = new Vector3[] { position };
-                    Debug.Log($"[CreateFoeGameObjects] Pure client: preserving exact single-spawn position {position}.");
-                }
-                else
-                {
-                    preferredPositions = ComputeClientWavePositions(
-                        totalSpawns,
-                        isInteriorFromClient
-                    ).ToArray();
-                }
+                // The caller has already selected the spawn location for this group.
+                // Preserve it for every enemy, just as the host and single-player paths do.
+                Vector3[] preferredPositions = new Vector3[totalSpawns];
+                for (int i = 0; i < totalSpawns; i++)
+                    preferredPositions[i] = position;
 
                 Debug.Log("[CreateFoeGameObjects] Client: requesting CmdCreateFoes (with quest context + positions).");
                 multiplayer.CmdCreateFoes(
@@ -2466,7 +2453,9 @@ public static GameObject[] CreateFoeGameObjects(
                     isDungeonFromClient,
                     spawnScalingLevel
                 );
-                return null; // clients never spawn directly
+                // Optional compatibility return objects for client-side callers.
+                return MultiplayerFoeSpawnCompatibility.GetClientReturnObjects(
+                    totalSpawns, position, foeType, isDungeonFromClient, foeResource);
             }
         }
         else

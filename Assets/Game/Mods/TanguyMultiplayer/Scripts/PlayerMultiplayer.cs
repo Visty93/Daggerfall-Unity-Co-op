@@ -1867,19 +1867,21 @@ public void CmdCreateFoes(
         }
     }
 
-    // Spawn normally (your method will NetworkServer.Spawn each)
-    GameObject[] spawned = GameObjectHelper.CreateFoeGameObjectsInternal(
-        position, foeType, spawnCount, reaction, foeResource, alliedToPlayer, spawnScalingLevel);
-
-    // Immediately move each enemy to the client-computed world positions (no server physics required)
-    int c = Mathf.Min(spawned.Length, positions != null ? positions.Length : 0);
-    for (int i = 0; i < spawned.Length; i++)
+    // Create each enemy at its final requested position. The internal helper grounds
+    // non-flying enemies there before NetworkServer.Spawn; do not overwrite that
+    // grounded pose afterward with the original, unaligned request coordinates.
+    for (int i = 0; i < spawnCount; i++)
     {
-        GameObject enemy = spawned[i];
-        if (!enemy) continue;
+        Vector3 requestedPosition = positions != null && i < positions.Length
+            ? positions[i]
+            : position;
+        GameObject[] spawned = GameObjectHelper.CreateFoeGameObjectsInternal(
+            requestedPosition, foeType, 1, reaction, foeResource, alliedToPlayer, spawnScalingLevel);
+        if (spawned == null || spawned.Length == 0)
+            continue;
 
-        if (i < c)
-            enemy.transform.position = positions[i]; // hard snap to client-picked spot
+        GameObject enemy = spawned[0];
+        if (!enemy) continue;
 
         // Mark only enemies whose actual requester was inside a dungeon.
         // Do not infer this from a generic Dungeon object existing in the scene.
@@ -1897,7 +1899,7 @@ public void CmdCreateFoes(
             else
                 ewp.SetSpawnContext(isInteriorFromClient, this.netId);
 
-            ewp.intendedSpawnPos = (i < c) ? positions[i] : enemy.transform.position;
+            ewp.intendedSpawnPos = enemy.transform.position;
             ewp.isCreateFoeWaveSpawn = true;
         }
 
