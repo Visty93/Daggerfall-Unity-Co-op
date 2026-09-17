@@ -145,7 +145,36 @@ namespace DaggerfallWorkshop.Game
         #region Auto Properties
 
         public bool IsLevitating { get; set; }      // Is this enemy levitating
-        public bool IsHostile { get; set; }         // Is this enemy hostile to the player
+        // Set only by MP spawn settling before it resumes this motor.
+        // This is a flag, not a snapshot: later combat changes remain authoritative.
+        private bool preserveCurrentHostilityOnStart;
+        public void PreserveCurrentHostilityOnStart()
+        {
+            preserveCurrentHostilityOnStart = true;
+        }
+
+        private bool isHostile;
+        public bool IsHostile
+        {
+            get { return isHostile; }
+            set
+            {
+                if (isHostile == value) return;
+                bool previous = isHostile;
+                isHostile = value;
+                // Temporary diagnostic: record the actual writer, not just the later
+                // SetupDemoEnemy polling result. Include stacks in player builds too.
+                if (NetworkServer.active || NetworkClient.active)
+                {
+                    var identity = GetComponent<NetworkIdentity>();
+                    if (identity != null && identity.netId != 0)
+                    {
+                        var setup = GetComponent<SetupDemoEnemy>();
+                        Debug.Log($"[HostilityTrace] netId={identity.netId} enemy='{name}' old={previous} new={value} server={isServer} authority={hasAuthority} synced={(setup != null ? setup.SyncedMotorIsHostile.ToString() : "none")} frame={Time.frameCount}\n{System.Environment.StackTrace}");
+                    }
+                }
+            }
+        }
         public float KnockbackSpeed { get; set; }   // While non-zero, this enemy will be knocked back at this speed
         public Vector3 KnockbackDirection { get; set; } // Direction to travel while being knocked back
         public bool Bashing { get; private set; }   // Is this enemy bashing a door
@@ -342,7 +371,8 @@ namespace DaggerfallWorkshop.Game
 
             if (mobile != null)
             {
-                IsHostile = mobile.Enemy.Reactions == MobileReactions.Hostile;
+                if (!IsNetworkActive() || !preserveCurrentHostilityOnStart)
+                    IsHostile = mobile.Enemy.Reactions == MobileReactions.Hostile;
                 flies = CanFly();
                 swims = mobile.Enemy.Behaviour == MobileBehaviour.Aquatic;
             }
@@ -628,6 +658,10 @@ public IEnumerator EnsureEnemyEntityIsSet()
         /// <param name="attacker">Attacker to become hostile towards</param>
         public void MakeEnemyHostileToAttacker(DaggerfallEntityBehaviour attacker)
         {
+            // Optional spawner allegiance must follow actual MP player attacks too.
+            // Ordinary enemies (SpawnTeamOverride == -1) keep the existing path.
+            var spawnSetup = GetComponent<SetupDemoEnemy>();
+            if (spawnSetup != null) spawnSetup.HandleSpawnAllyProvocation(attacker);
             if (!senses)
                 senses = GetComponent<EnemySenses>();
             if (!entityBehaviour)
@@ -3422,4 +3456,5 @@ if (senses.Target != null)
         #endregion
     }
 }
+
 

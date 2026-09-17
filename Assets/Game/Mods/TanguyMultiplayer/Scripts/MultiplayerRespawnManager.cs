@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Reflection;
 using UnityEngine;
@@ -49,7 +49,7 @@ namespace DaggerfallWorkshop.Game
         public bool AllowManualRespawnInput = true;
 
         [Tooltip("If manual input is enabled, ignore clicks before this many seconds have passed.")]
-        public float ManualRespawnMinDelaySeconds = 2f;
+        public float ManualRespawnMinDelaySeconds = 10f;
 
         [Tooltip("Health percentage restored when another player revives this downed player before auto-respawn.")]
         public int ReviveHealthPercent = 30;
@@ -174,7 +174,7 @@ namespace DaggerfallWorkshop.Game
             }
 
             int maxHealth = Mathf.Max(1, playerEntity.MaxHealth);
-            int percent = Mathf.Clamp(reviveHealthPercent, 1, 100);
+            int percent = Mathf.Clamp(reviveHealthPercent, 10, 50);
             int restoreHealth = Mathf.Clamp(Mathf.CeilToInt(maxHealth * (percent / 100f)), 1, maxHealth);
 
             playerEntity.SetHealth(restoreHealth, true);
@@ -246,7 +246,23 @@ namespace DaggerfallWorkshop.Game
 
             if (diedInsideDungeon)
             {
-                moved = TryRespawnInsideCurrentDungeon();
+                // Special/off-map dungeons have no usable exterior: retain their live start marker.
+                bool usableExterior = false;
+                if (hasDeathLocation)
+                {
+                    DFPosition pixel = MapsFile.LongitudeLatitudeToMapPixel(
+                        (int)deathLocation.MapTableData.Longitude, deathLocation.MapTableData.Latitude);
+                    usableExterior = pixel.X >= TerrainHelper.minMapPixelX && pixel.X <= TerrainHelper.maxMapPixelX &&
+                        pixel.Y >= TerrainHelper.minMapPixelY && pixel.Y <= TerrainHelper.maxMapPixelY;
+                }
+                if (OptionsMultiplayer.respawnOutsideDungeon && usableExterior)
+                {
+                    RespawnMoveResult result = new RespawnMoveResult();
+                    yield return RespawnAtLocationFastTravelRoutine(deathLocation, "dungeon-respawn-outside", result);
+                    moved = result.Moved;
+                }
+                else
+                    moved = TryRespawnInsideCurrentDungeon();
                 if (!moved)
                     moved = TryRespawnOutsideCurrentDungeonFallback(hasDeathLocation ? deathLocation : default(DFLocation));
                 if (moved)
@@ -380,18 +396,8 @@ namespace DaggerfallWorkshop.Game
             if (playerEntity != null)
                 maxHealth = Mathf.Max(1, playerEntity.MaxHealth);
 
-            switch (HealthMode)
-            {
-                case RespawnHealthMode.OneHP:
-                    return 1;
-                case RespawnHealthMode.TenPercent:
-                    return Mathf.Clamp(Mathf.CeilToInt(maxHealth * 0.10f), 1, maxHealth);
-                case RespawnHealthMode.HalfHealth:
-                    return Mathf.Clamp(Mathf.CeilToInt(maxHealth * 0.50f), 1, maxHealth);
-                case RespawnHealthMode.FullHealth:
-                default:
-                    return maxHealth;
-            }
+            return Mathf.Clamp(Mathf.CeilToInt(maxHealth *
+                (Mathf.Clamp(OptionsMultiplayer.respawnHealthPercent, 10, 50) / 100f)), 1, maxHealth);
         }
 
         private bool TryRespawnInsideCurrentDungeon()
@@ -560,7 +566,9 @@ namespace DaggerfallWorkshop.Game
 
             if (placed)
             {
-                Debug.Log("[MPRespawn] Completed validated location fast-travel respawn. reason=" + reason);
+                Debug.Log("[MPRespawn] Completed validated location fast-travel respawn. reason=" + reason +
+                    " mapPixel=" + mapPixel.X + "/" + mapPixel.Y +
+                    " final=" + playerTransform.position + " insideDungeon=" + playerEnterExit.IsPlayerInsideDungeon);
                 if (result != null)
                     result.Moved = true;
             }
@@ -822,8 +830,13 @@ namespace DaggerfallWorkshop.Game
             {
                 // Complete the scene switch now; a faded coroutine could still be pending
                 // when respawn enters its destination building.
-                playerEnterExit.TransitionExterior(false);
-                if (playerEnterExit.IsPlayerInside)
+                // TransitionExterior only exits buildings: it returns without doing anything
+                // in a dungeon. Use the dungeon-specific path before any exterior placement.
+                if (playerEnterExit.IsPlayerInsideDungeon)
+                    playerEnterExit.TransitionDungeonExterior(false);
+                else
+                    playerEnterExit.TransitionExterior(false);
+                if (playerEnterExit.IsPlayerInside || playerEnterExit.IsPlayerInsideDungeon)
                 {
                     Debug.LogWarning("[MPRespawn] Exterior transition did not complete. reason=" + reason);
                     return false;
@@ -1210,6 +1223,13 @@ namespace DaggerfallWorkshop.Game
         private bool TryGetBestDeathLocation(out DFLocation location)
         {
             CacheReferences();
+
+            if (playerEnterExit != null && playerEnterExit.IsPlayerInsideDungeon && playerEnterExit.Dungeon != null &&
+                playerEnterExit.Dungeon.Summary.LocationData.Loaded)
+            {
+                location = playerEnterExit.Dungeon.Summary.LocationData;
+                return true;
+            }
 
             if (playerGPS != null && playerGPS.CurrentLocation.Loaded)
             {

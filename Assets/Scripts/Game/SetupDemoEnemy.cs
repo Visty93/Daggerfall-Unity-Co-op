@@ -19,6 +19,84 @@ namespace DaggerfallWorkshop.Game
         [SyncVar] public MobileReactions EnemyReaction = MobileReactions.Passive;
         [SyncVar] public MobileGender EnemyGender = MobileGender.Unspecified;
         [SyncVar] public bool AlliedToPlayer = false;
+
+        // Optional team selected by an external spawner. -1 preserves ordinary setup.
+        [SyncVar(hook = nameof(OnSpawnTeamOverrideChanged))]
+        public int SpawnTeamOverride = -1;
+
+        // Called by EnemyMotor only on its actual provocation path, not by the
+        // initial hostility snapshot. Applies only to opt-in spawner-owned allies.
+        public void HandleSpawnAllyProvocation(DaggerfallEntityBehaviour attacker)
+        {
+            if (SpawnTeamOverride != (int)MobileTeams.PlayerAlly || attacker == null) return;
+            bool localPlayer = GameManager.Instance != null && attacker == GameManager.Instance.PlayerEntityBehaviour;
+            bool networkPlayer = attacker.GetComponentInParent<PlayerMultiplayer>() != null;
+            if (!localPlayer && !networkPlayer) return;
+            if (!NetworkServer.active && !NetworkClient.active) return;
+            if (isServer)
+                BreakSpawnAllegiance();
+            else if (isClient && localPlayer)
+            {
+                // Combat may be reported by a non-owner, just like hostility/pacify.
+                // Keep the local team coherent immediately; the host publishes it.
+                BreakSpawnAllegiance();
+                CmdProvokeSpawnAlly();
+            }
+        }
+
+        void BreakSpawnAllegiance()
+        {
+            var behaviour = GetComponent<DaggerfallEntityBehaviour>();
+            var entity = behaviour != null ? behaviour.Entity as EnemyEntity : null;
+            MobileEnemy defaults;
+            if (entity == null || !GameObjectHelper.EnemyDict.TryGetValue(entity.MobileEnemy.ID, out defaults)) return;
+            if (defaults.Team == MobileTeams.PlayerAlly) return;
+            SpawnTeamOverride = (int)defaults.Team;
+            AlliedToPlayer = false;
+            ApplySpawnTeamOverride();
+            var motor = GetComponent<EnemyMotor>();
+            if (motor != null) motor.IsHostile = true;
+            ApplyBackingHostilityReaction(true);
+            if (isServer) SyncedMotorIsHostile = true;
+            Debug.Log($"[SpawnAllegiance] Player provoked '{name}'; team={defaults.Team}, allied=false.");
+        }
+
+        [Command(requiresAuthority = false)]
+        void CmdProvokeSpawnAlly(NetworkConnectionToClient sender = null)
+        {
+            if (SpawnTeamOverride != (int)MobileTeams.PlayerAlly || sender == null || sender.identity == null) return;
+            var player = sender.identity.GetComponent<PlayerMultiplayer>();
+            var position = sender.identity.GetComponent<PositionMultiplayer>();
+            var world = GetComponent<EnemyWorldPosition>();
+            if (player == null || position == null || world == null || !world.initialized) return;
+            double dx = ((double)position.x - world.worldX) / 40.0;
+            double dz = ((double)position.z - world.worldZ) / 40.0;
+            if (dx * dx + dz * dz > 200.0 * 200.0 ||
+                Mathf.Abs(sender.identity.transform.position.y - transform.position.y) > 100f) return;
+            BreakSpawnAllegiance();
+            var attacker = sender.identity.GetComponent<DaggerfallEntityBehaviour>();
+            var motor = GetComponent<EnemyMotor>();
+            if (motor != null && attacker != null) motor.MakeEnemyHostileToAttacker(attacker);
+        }
+
+        void OnSpawnTeamOverrideChanged(int previous, int current)
+        {
+            ApplySpawnTeamOverride();
+        }
+
+        public void ApplySpawnTeamOverride()
+        {
+            if (SpawnTeamOverride < 0 || !System.Enum.IsDefined(typeof(MobileTeams), SpawnTeamOverride))
+                return;
+            var behaviour = GetComponent<DaggerfallEntityBehaviour>();
+            var enemy = behaviour != null ? behaviour.Entity as EnemyEntity : null;
+            if (enemy == null) return;
+            MobileTeams team = (MobileTeams)SpawnTeamOverride;
+            MobileEnemy mobile = enemy.MobileEnemy;
+            mobile.Team = team;
+            enemy.SetMobileEnemy(mobile);
+            enemy.Team = team;
+        }
         [SyncVar] public byte ClassicSpawnDistanceType = 0;
 
 // Live hostility sync + inspector/debug visibility
@@ -172,7 +250,9 @@ private void ApplyHostilityStateLocally(bool makeHostile, string reason, bool as
         if (makeHostile)
         {
             var playerAttacker = GameManager.Instance != null ? GameManager.Instance.PlayerEntityBehaviour : null;
-            if (assignLocalPlayerAsAttacker && playerAttacker != null)
+            // A spawner's hostile reaction is not evidence the local player hit
+            // it. In particular, PlayerAlly guards can attack OTHER hostile teams.
+            if (assignLocalPlayerAsAttacker && playerAttacker != null && SpawnTeamOverride < 0)
                 motor.MakeEnemyHostileToAttacker(playerAttacker);
             else
                 motor.IsHostile = true;
@@ -342,6 +422,7 @@ public bool isDungeonEnemy = false;
         {
             receivedInitialServerSettings = true;
             clientVisualSettingsApplied = true;
+            ApplySpawnTeamOverride();
         }
 
         // Called immediately before the full settings payload recreates the local
@@ -589,7 +670,8 @@ public override void OnStartServer()
             return;
         }
 
-        mobileEnemy.Team = EnemyBasics.Enemies[mobileEnemy.ID].Team;
+        mobileEnemy.Team = SpawnTeamOverride >= 0 && System.Enum.IsDefined(typeof(MobileTeams), SpawnTeamOverride)
+            ? (MobileTeams)SpawnTeamOverride : EnemyBasics.Enemies[mobileEnemy.ID].Team;
         enemyEntity.SetMobileEnemy(mobileEnemy);
 
         EnemyType = (MobileTypes)mobileEnemy.ID;
@@ -598,6 +680,8 @@ public override void OnStartServer()
 
         Debug.Log($"[SetupDemoEnemy] (Server) Published enemy SyncVars: Type={EnemyType}, Gender={EnemyGender}, Reaction={EnemyReaction}, ID={mobileEnemy.ID}");
     }
+
+    ApplySpawnTeamOverride();
 
     // Safety net for any server spawn path that did not manually capture HP before NetworkServer.Spawn().
     // For correct initial spawn payloads, prefer calling ServerCaptureAuthoritativeSpawnHealth() before spawn.
@@ -918,6 +1002,8 @@ private IEnumerator WaitForDungeon()
 
             if (AlliedToPlayer)
                 mobileEnemy.Team = MobileTeams.PlayerAlly;
+            if (SpawnTeamOverride >= 0 && System.Enum.IsDefined(typeof(MobileTeams), SpawnTeamOverride))
+                mobileEnemy.Team = (MobileTeams)SpawnTeamOverride;
 
             // Find mobile unit in children
             MobileUnit dfMobile = GetMobileBillboardChild();
@@ -1149,3 +1235,4 @@ public void ApplyEnemySettingsWithScalingLevel(
         }
     }
 }
+

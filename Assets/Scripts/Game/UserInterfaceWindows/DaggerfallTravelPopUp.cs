@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -86,6 +86,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         // That routine resolves the actual entrance mesh height after the location is loaded,
         // which is safer than exact X/Z with terrain-only Y at raised stair/platform entrances.
         bool useDungeonEntranceReposition = false;
+        bool partyDestinationIsDungeon = false;
 
         // Dungeon party travel still performs the normal exterior fast travel first.
         // Once the destination exterior is ready, enter the already-synced network
@@ -151,6 +152,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             bool useDirectPartyDungeonRendezvous = false)
         {
             hasTravelStartOverride = true;
+            partyDestinationIsDungeon = partyDungeonTargetPlayer != null && !string.IsNullOrEmpty(partyDungeonInstanceId);
             travelStartOverride = startMapPixel;
             hasExactDestinationWorldCoordinates =
                 useExactDestinationWorldCoordinates && destinationWorldX > 0 && destinationWorldZ > 0;
@@ -189,6 +191,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             hasExactDestinationWorldY = false;
             exactDestinationWorldY = 0f;
             useDungeonEntranceReposition = false;
+            partyDestinationIsDungeon = false;
             usePartyDungeonRendezvous = false;
             partyDungeonTargetPlayer = null;
             partyDungeonInstanceId = string.Empty;
@@ -466,7 +469,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 GameManager.Instance.PlayerEnterExit != null &&
                 GameManager.Instance.PlayerEnterExit.IsPlayerInsideDungeon;
             bool suppressPartyDungeonHealthRestore =
-                isPartyTravel && (startedInsideDungeon || rendezvousInsidePartyDungeon);
+                isPartyTravel && (startedInsideDungeon || partyDestinationIsDungeon);
 
             global::PlayerMultiplayer dungeonTargetPlayer = partyDungeonTargetPlayer;
             string expectedDungeonInstanceId = partyDungeonInstanceId;

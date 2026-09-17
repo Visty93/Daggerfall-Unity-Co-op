@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -213,8 +213,38 @@ namespace DaggerfallWorkshop.Game
             playerLayerMask = ~(1 << LayerMask.NameToLayer("Player"));
         }
 
+        global::PlayerMultiplayer heldReviveTarget;
+        float heldReviveStart;
+        float nextReviveHeartbeat;
+        bool reviveTouchedThisFrame;
+
+        void LateUpdate()
+        {
+            // Also cancels when Update returned early for a spell, menu, cursor HUD, etc.
+            if (!reviveTouchedThisFrame)
+                CancelHeldRevive();
+        }
+
+        void OnDisable() { CancelHeldRevive(); }
+
+        void CancelHeldRevive()
+        {
+            if (heldReviveTarget == null) return;
+            var local = global::PlayerMultiplayer.GetLocalPlayer();
+            if (local != null && local.isLocalPlayer && Mirror.NetworkClient.isConnected)
+                local.CmdCancelReviveHold();
+            heldReviveTarget = null;
+        }
+
         void Update()
         {
+            reviveTouchedThisFrame = false;
+            if (MultiplayerRespawnManager.IsMultiplayerActive() &&
+                (InputManager.Instance == null || InputManager.Instance.IsPaused))
+            {
+                CancelHeldRevive();
+                return;
+            }
             if (mainCamera == null)
                 return;
 
@@ -266,6 +296,9 @@ namespace DaggerfallWorkshop.Game
                 }
             }
 
+            if (UpdateHeldRevive())
+                return;
+
             // Handle click delay
             if (clickDelay > 0 && Time.realtimeSinceStartup < clickDelayStartTime + clickDelay)
             {
@@ -281,34 +314,7 @@ namespace DaggerfallWorkshop.Game
             if (InputManager.Instance.ActionComplete(InputManager.Actions.ActivateCenterObject))
             {
                 // Fire ray into scene from active mouse cursor or camera
-                Ray ray = new Ray();
-                if (GameManager.Instance.PlayerMouseLook.cursorActive)
-                {
-                    if (DaggerfallUnity.Settings.RetroRenderingMode > 0)
-                    {
-                        // Need to scale screen mouse position to match actual viewport area when retro rendering enabled
-                        // Also need to account for when large HUD is enabled and docked as this changes the retro viewport area
-                        // Undocked large HUD does not change retro viewport area
-                        float largeHUDHeight = 0;
-                        if (DaggerfallUI.Instance.DaggerfallHUD != null && DaggerfallUI.Instance.DaggerfallHUD.LargeHUD.Enabled && DaggerfallUnity.Settings.LargeHUDDocked)
-                            largeHUDHeight = DaggerfallUI.Instance.DaggerfallHUD.LargeHUD.ScreenHeight;
-                        float xm = Input.mousePosition.x / Screen.width;
-                        float ym = (Input.mousePosition.y - largeHUDHeight) / (Screen.height - largeHUDHeight);
-                        Vector2 retroMousePos = new Vector2(mainCamera.targetTexture.width * xm, mainCamera.targetTexture.height * ym);
-                        ray = mainCamera.ScreenPointToRay(retroMousePos);
-                        //Debug.Log(retroMousePos);
-                    }
-                    else
-                    {
-                        // Ray from mouse position into viewport
-                        ray = mainCamera.ScreenPointToRay(Input.mousePosition);
-                    }
-                }
-                else
-                {
-                    // Ray from camera crosshair position
-                    ray = new Ray(mainCamera.transform.position, mainCamera.transform.forward);
-                }
+                Ray ray = GetActivationRay();
 
                 // Revive check must run with a separate raycast before the normal activation raycast.
                 // The vanilla activation ray deliberately excludes the Player layer, and the MP player
@@ -475,6 +481,47 @@ namespace DaggerfallWorkshop.Game
             }
         }
 
+        Ray GetActivationRay()
+        {
+                Ray ray = new Ray();
+                if (GameManager.Instance.PlayerMouseLook.cursorActive)
+                {
+                    if (DaggerfallUnity.Settings.RetroRenderingMode > 0)
+                    {
+                        // Need to scale screen mouse position to match actual viewport area when retro rendering enabled
+                        // Also need to account for when large HUD is enabled and docked as this changes the retro viewport area
+                        // Undocked large HUD does not change retro viewport area
+                        float largeHUDHeight = 0;
+                        if (DaggerfallUI.Instance.DaggerfallHUD != null && DaggerfallUI.Instance.DaggerfallHUD.LargeHUD.Enabled && DaggerfallUnity.Settings.LargeHUDDocked)
+                            largeHUDHeight = DaggerfallUI.Instance.DaggerfallHUD.LargeHUD.ScreenHeight;
+                        float xm = Input.mousePosition.x / Screen.width;
+                        float ym = (Input.mousePosition.y - largeHUDHeight) / (Screen.height - largeHUDHeight);
+                        Vector2 retroMousePos = new Vector2(mainCamera.targetTexture.width * xm, mainCamera.targetTexture.height * ym);
+                        ray = mainCamera.ScreenPointToRay(retroMousePos);
+                        //Debug.Log(retroMousePos);
+                    }
+                    else
+                    {
+                        // Ray from mouse position into viewport
+                        ray = mainCamera.ScreenPointToRay(Input.mousePosition);
+                    }
+                }
+                else
+                {
+                    // Ray from camera crosshair position
+                    ray = new Ray(mainCamera.transform.position, mainCamera.transform.forward);
+                }
+
+            return ray;
+        }
+
+        bool UpdateHeldRevive()
+        {
+            if (!MultiplayerRespawnManager.IsMultiplayerActive() || !Input.GetMouseButton(0))
+                return false;
+            return TryActivateDownedMultiplayerPlayerFromRay(GetActivationRay());
+        }
+
         private bool TryActivateDownedMultiplayerPlayerFromRay(Ray ray)
         {
             // Use all layers here. Normal PlayerActivate ignores the Player layer so the remote
@@ -547,7 +594,28 @@ namespace DaggerfallWorkshop.Game
             if (localPlayer == null)
                 return true;
 
-            localPlayer.CmdRequestRevivePlayer(targetPlayer.netId);
+            if (!Input.GetMouseButton(0) || localPlayer.LifeState != global::PlayerMultiplayer.MultiplayerLifeState.Alive)
+                return true;
+
+            reviveTouchedThisFrame = true;
+            if (heldReviveTarget != targetPlayer)
+            {
+                CancelHeldRevive();
+                heldReviveTarget = targetPlayer;
+                heldReviveStart = Time.realtimeSinceStartup;
+                nextReviveHeartbeat = 0f;
+            }
+            float duration = Mathf.Clamp(OptionsMultiplayer.reviveHoldSeconds, 1, 10);
+            float elapsed = Time.realtimeSinceStartup - heldReviveStart;
+            MultiplayerRespawnStatus.Show("Reviving... " + Mathf.Min(elapsed, duration).ToString("0.0") +
+                " / " + duration.ToString("0") + " seconds", elapsed / duration);
+            if (Time.realtimeSinceStartup >= nextReviveHeartbeat)
+            {
+                nextReviveHeartbeat = Time.realtimeSinceStartup + 0.15f;
+                localPlayer.CmdContinueReviveHold(targetPlayer.netId);
+                if (elapsed >= duration)
+                    localPlayer.CmdRequestRevivePlayer(targetPlayer.netId);
+            }
             return true;
         }
 

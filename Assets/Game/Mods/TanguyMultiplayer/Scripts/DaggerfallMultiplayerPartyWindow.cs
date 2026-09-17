@@ -1,7 +1,4 @@
-// Project:         Daggerfall Unity - TanguyMultiplayer detailed party window
-// Notes:           Journal-style party roster opened from HudMultiplayer, with shared-location fast travel.
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
 using Mirror;
@@ -597,7 +594,9 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 tokens.Add(TextFile.CreateTextToken(
                     request.useDirectDungeonRendezvous
                         ? "This dungeon has no streamable exterior. Arrival will be directly inside near this player."
-                        : "Arrival will be inside the dungeon near this player."));
+                        : (OptionsMultiplayer.partyTravelInsideDungeon
+                            ? "Arrival will be inside the dungeon near this player."
+                            : "Arrival will be outside at the dungeon fast-travel point.")));
             }
 
             tokens.Add(TextFile.CreateFormatToken(TextFile.Formatting.EndOfRecord));
@@ -633,16 +632,10 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
             DFPosition startMapPixel = GetLocalPartyTravelStartPixel();
 
+            // Party rendezvous uses our fast-travel popup without a travel map.
+            // Mod replacements can require their own map and change the travel flow.
             DaggerfallTravelPopUp travelPopup =
-                (DaggerfallTravelPopUp)UIWindowFactory.GetInstanceWithArgs(
-                    UIWindowType.TravelPopUp,
-                    new object[] { uiManager, this, null });
-
-            if (travelPopup == null)
-            {
-                Debug.LogWarning("[MultiplayerPartyWindow] Could not create the normal travel popup.");
-                return;
-            }
+                new DaggerfallTravelPopUp(uiManager, this, null);
 
             // Direct off-map rendezvous has no valid exterior destination. Reuse the
             // start pixel only for the popup's time/cost calculation; the popup will
@@ -655,7 +648,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             // safe exterior doorway anchor published by PositionMultiplayer.
             bool useDungeonEntranceReposition =
                 request.locationState == global::PositionMultiplayer.PartyLocationState.DungeonInterior &&
-                !request.useDirectDungeonRendezvous;
+                !request.useDirectDungeonRendezvous && OptionsMultiplayer.partyTravelInsideDungeon;
 
             // Exterior players retain exact X/Z/Y rendezvous placement. Dungeon targets use
             // DFU's normal dungeon entrance reposition so raised stairs/platforms get their
@@ -663,6 +656,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             bool useExactDestination =
                 !request.useDirectDungeonRendezvous &&
                 !useDungeonEntranceReposition &&
+                request.locationState != global::PositionMultiplayer.PartyLocationState.DungeonInterior &&
                 (request.locationState != global::PositionMultiplayer.PartyLocationState.BuildingInterior ||
                  request.usesSafeBuildingEntranceAnchor);
 
@@ -676,7 +670,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 destinationWorldY: request.exteriorArrivalY,
                 useDungeonEntranceReposition: useDungeonEntranceReposition,
                 usePartyDungeonRendezvous:
-                    request.locationState == global::PositionMultiplayer.PartyLocationState.DungeonInterior,
+                    request.locationState == global::PositionMultiplayer.PartyLocationState.DungeonInterior &&
+                    (OptionsMultiplayer.partyTravelInsideDungeon || request.useDirectDungeonRendezvous),
                 partyDungeonTargetPlayer: request.targetPlayer,
                 partyDungeonInstanceId: request.dungeonInstanceId,
                 useDirectPartyDungeonRendezvous: request.useDirectDungeonRendezvous);

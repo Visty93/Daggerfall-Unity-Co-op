@@ -99,10 +99,19 @@ namespace DaggerfallWorkshop.Game
                     // other players have time to notice/react before the dead player comes back.
                     float respawnDelay = respawnManager != null ? respawnManager.RespawnDelaySeconds : 30f;
                     float elapsed = Time.realtimeSinceStartup - timeOfDeathRealtime;
+                    float manualWait = Mathf.Clamp(OptionsMultiplayer.manualRespawnSeconds, 5, 30);
+                    string message = respawnManager != null && respawnManager.RespawnInProgress
+                        ? "Respawning..."
+                        : "Automatic respawn in " + Mathf.CeilToInt(Mathf.Max(0f, respawnDelay - elapsed)) + " seconds";
+                    if (respawnManager != null && !respawnManager.RespawnInProgress && respawnManager.AllowManualRespawnInput)
+                        message += elapsed < manualWait
+                            ? "\nYou can respawn in " + Mathf.CeilToInt(manualWait - elapsed) + " seconds"
+                            : "\nLeft-click to respawn";
+                    MultiplayerRespawnStatus.Show(message, -1f);
 
                     if (respawnManager != null &&
                         respawnManager.AllowManualRespawnInput &&
-                        elapsed >= respawnManager.ManualRespawnMinDelaySeconds &&
+                        elapsed >= Mathf.Clamp(OptionsMultiplayer.manualRespawnSeconds, 5, 30) &&
                         Input.GetMouseButtonDown(0))
                     {
                         respawnManager.RequestRespawnNow("manual-left-click");

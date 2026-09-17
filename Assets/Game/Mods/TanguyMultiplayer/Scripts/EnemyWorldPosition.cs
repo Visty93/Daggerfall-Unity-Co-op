@@ -46,6 +46,20 @@ public class EnemyWorldPosition : NetworkBehaviour
 
     public bool initialized { get; private set; } = false;
 
+    // Opt-in for retained exterior actors. Their initial placement may span many
+    // terrain tiles; it must not be folded into the nearest 819.2-unit frame.
+    [SyncVar] public bool PreserveDistantExteriorCoordinates;
+
+    public void SetDistantExteriorCoordinates(int x, int z)
+    {
+        PreserveDistantExteriorCoordinates = true;
+        worldX = x;
+        worldZ = z;
+        mapPixel = MapsFile.WorldCoordToMapPixel(x, z);
+        lastUnityPos = transform.position;
+        initialized = true;
+    }
+
     // Track last known Unity position so we can update DF coords incrementally.
     // This avoids problems when enemies are hard-teleported after spawn (quest wave reposition, root reparent, etc.).
     private Vector3 lastUnityPos;
@@ -657,6 +671,18 @@ public class EnemyWorldPosition : NetworkBehaviour
             if (!initialized)
                 continue;
 
+            // A dormant retained actor has no physical movement. Keep its logical
+            // position stable while the host streams/rebases distant terrain.
+            if (PreserveDistantExteriorCoordinates)
+            {
+                var retentionAuthority = GetComponent<DynamicEnemyAuthority>();
+                if (retentionAuthority != null && retentionAuthority.IsAuthorityDeactivatedForRetention)
+                {
+                    lastUnityPos = transform.position;
+                    continue;
+                }
+            }
+
             // Bound actors publish all location modes from their owner's frame.
             // Do not add server-side interpolated Unity deltas to those coordinates.
             if (BoundActorOwner() != 0)
@@ -788,3 +814,4 @@ public class EnemyWorldPosition : NetworkBehaviour
                   $"X={playerWorldX},Z={playerWorldZ} + d({offsetX},{offsetZ}) => enemy X={worldX},Z={worldZ} (isInterior={isInteriorSpawn}, requester={requesterNetId})");
     }
 }
+

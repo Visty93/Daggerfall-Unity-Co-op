@@ -325,6 +325,7 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
 
     void Update()
     {
+        MaintainServerReviveHold();
         SyncLocalPlayerHealthToMP();
         SyncLocalPlayerStealthAndConcealmentToMP();
         ApplyLifeStateVisualIfChanged(false);
@@ -778,6 +779,75 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
         ApplyLifeStateVisualIfChanged(true);
     }
 
+    uint serverReviveTarget;
+    float serverReviveStarted;
+    float serverReviveLastHeartbeat;
+    float serverReviveTargetDeath;
+
+    bool CanMaintainRevive(PlayerMultiplayer target)
+    {
+        if (target == null || target == this || !target.IsDownedForRevive ||
+            LifeState != MultiplayerLifeState.Alive || PlayerMPCurrentHealth <= 0)
+            return false;
+        float distance = ReviveInteractDistance + 1.25f;
+        if ((target.transform.position - transform.position).sqrMagnitude > distance * distance)
+            return false;
+        var here = GetComponent<PositionMultiplayer>();
+        var there = target.GetComponent<PositionMultiplayer>();
+        if (here != null && there != null &&
+            here.PartyCurrentLocationState != PositionMultiplayer.PartyLocationState.Unknown &&
+            there.PartyCurrentLocationState != PositionMultiplayer.PartyLocationState.Unknown)
+        {
+            if (here.PartyCurrentLocationState != PositionMultiplayer.PartyLocationState.Unknown &&
+                there.PartyCurrentLocationState != PositionMultiplayer.PartyLocationState.Unknown &&
+                here.PartyCurrentLocationState != there.PartyCurrentLocationState)
+                return false;
+            if (!string.IsNullOrEmpty(here.PartyDungeonInstanceId) || !string.IsNullOrEmpty(there.PartyDungeonInstanceId))
+                if (here.PartyDungeonInstanceId != there.PartyDungeonInstanceId) return false;
+            if (here.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.BuildingInterior &&
+                (here.PartyBuildingKey != there.PartyBuildingKey ||
+                 here.PartyRegionName != there.PartyRegionName ||
+                 here.PartyLocationName != there.PartyLocationName))
+                return false;
+        }
+        return true;
+    }
+
+    PlayerMultiplayer GetServerReviveTarget(uint id)
+    {
+        NetworkIdentity identity;
+        return NetworkServer.spawned.TryGetValue(id, out identity) && identity != null
+            ? identity.GetComponent<PlayerMultiplayer>() : null;
+    }
+
+    void MaintainServerReviveHold()
+    {
+        if (!isServer || serverReviveTarget == 0) return;
+        var target = GetServerReviveTarget(serverReviveTarget);
+        if (Time.realtimeSinceStartup - serverReviveLastHeartbeat > 1f ||
+            !CanMaintainRevive(target) || target.LifeStateServerTime != serverReviveTargetDeath)
+            serverReviveTarget = 0;
+    }
+
+    [Command]
+    public void CmdCancelReviveHold() { serverReviveTarget = 0; }
+
+    [Command]
+    public void CmdContinueReviveHold(uint targetId)
+    {
+        var target = GetServerReviveTarget(targetId);
+        if (!CanMaintainRevive(target)) { serverReviveTarget = 0; return; }
+        float now = Time.realtimeSinceStartup;
+        if (serverReviveTarget != targetId || now - serverReviveLastHeartbeat > 1f ||
+            target.LifeStateServerTime != serverReviveTargetDeath)
+        {
+            serverReviveTarget = targetId;
+            serverReviveStarted = now;
+            serverReviveTargetDeath = target.LifeStateServerTime;
+        }
+        serverReviveLastHeartbeat = now;
+    }
+
     [Command]
     public void CmdRequestRevivePlayer(uint targetPlayerNetId)
     {
@@ -785,6 +855,10 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
             return;
 
         if (targetPlayerNetId == 0 || targetPlayerNetId == netId)
+            return;
+        MaintainServerReviveHold();
+        if (serverReviveTarget != targetPlayerNetId ||
+            Time.realtimeSinceStartup - serverReviveStarted < Mathf.Clamp(OptionsMultiplayer.reviveHoldSeconds, 1, 10))
             return;
 
         NetworkIdentity targetIdentity;
@@ -833,11 +907,12 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
             return;
         }
 
+        serverReviveTarget = 0;
         // Temporarily leave Downed so two players cannot spam multiple revive TargetRpcs.
         targetPlayer.ServerSetLifeState(MultiplayerLifeState.Respawning, "revive-request-from-" + netId);
-        targetPlayer.TargetReviveDownedPlayer(targetConnection, netId, DefaultReviveHealthPercent);
+        targetPlayer.TargetReviveDownedPlayer(targetConnection, netId, Mathf.Clamp(OptionsMultiplayer.reviveHealthPercent, 10, 50));
 
-        Debug.Log("[PlayerRevive][ServerAccept] reviver=" + netId + " target=" + targetPlayerNetId + " healthPercent=" + DefaultReviveHealthPercent);
+        Debug.Log("[PlayerRevive][ServerAccept] reviver=" + netId + " target=" + targetPlayerNetId + " healthPercent=" + OptionsMultiplayer.reviveHealthPercent);
     }
 
     [TargetRpc]
@@ -855,6 +930,10 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
                 if (respawnManager == null)
                     respawnManager = GameManager.Instance.PlayerObject.AddComponent<MultiplayerRespawnManager>();
 
+                // Manual/automatic respawn may already have won on the owning client.
+                // Do not cancel that transition or report it as Downed again.
+                if (respawnManager.RespawnInProgress)
+                    return;
                 success = respawnManager.ReviveLocalPlayerFromNetwork(reviveHealthPercent, reviverNetId);
             }
         }
@@ -1507,7 +1586,7 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
 	[ClientRpc]
 	public void rpcImportOptions(string s)
 	{
-		if (!isServer && localPlayer){
+		if (!isServer){
 			OptionsMultiplayer.Import(s);
 		}
 	}

@@ -47,6 +47,45 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     [Tooltip("Max Daggerfall X/Z distance before enemy is destroyed entirely (DF units).")]
     public float destroyDistance = 300f;
 
+    // Optional exterior retention policy. Zero preserves the normal DF+Y checks.
+    // Set by compatibility adapters BEFORE network spawn, in raw DF world units.
+    [System.NonSerialized] public float HorizontalRetentionDistanceDF;
+    public bool IsAuthorityDeactivatedForRetention => authorityDeactivated;
+
+    private NetworkConnection initialExteriorOwner;
+    private float initialExteriorOwnerUntil;
+
+    // Opt-in startup grace for retained exterior spawns. Ownership is assigned by
+    // Spawn itself; this only prevents the first proximity tick immediately undoing
+    // it while client setup and network position updates are still arriving.
+    public void PreserveInitialExteriorOwner(NetworkConnection owner)
+    {
+        initialExteriorOwner = owner;
+        initialExteriorOwnerUntil = Time.unscaledTime + 2f;
+    }
+
+    private bool KeepInitialExteriorOwner()
+    {
+        if (initialExteriorOwner == null || Time.unscaledTime >= initialExteriorOwnerUntil)
+        {
+            initialExteriorOwner = null;
+            return false;
+        }
+        if (HorizontalRetentionDistanceDF <= 0f || worldPosition == null ||
+            !worldPosition.PreserveDistantExteriorCoordinates || worldPosition.isInteriorSpawn || worldPosition.isDungeonSpawn ||
+            netIdentity.connectionToClient != initialExteriorOwner || !initialExteriorOwner.isReady ||
+            initialExteriorOwner.identity == null) return false;
+        var position = initialExteriorOwner.identity.GetComponent<PositionMultiplayer>();
+        if (position == null || position.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.BuildingInterior ||
+            position.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.DungeonInterior) return false;
+        double dx = ((double)position.x - worldPosition.worldX) * unityPerDF;
+        double dz = ((double)position.z - worldPosition.worldZ) * unityPerDF;
+        if (dx * dx + dz * dz > 125.0 * 125.0 ||
+            Mathf.Abs(initialExteriorOwner.identity.transform.position.y - transform.position.y) > maxYDistance) return false;
+        SetAuthorityDeactivated(false);
+        return true;
+    }
+
     [Tooltip("Max Unity Y distance difference before deactivation/destroy checks (Unity units).")]
     public float maxYDistance = 100f;
 
@@ -489,8 +528,13 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         // This avoids wrapping truly distant exterior enemies into view.
         if (worldPosition != null)
         {
-            float expectedDx = NormalizeTerrainFrameDelta((worldPosition.worldX - localWorldX) * unityPerDF);
-            float expectedDz = NormalizeTerrainFrameDelta((worldPosition.worldZ - localWorldZ) * unityPerDF);
+            float expectedDx = (float)(((double)worldPosition.worldX - localWorldX) * unityPerDF);
+            float expectedDz = (float)(((double)worldPosition.worldZ - localWorldZ) * unityPerDF);
+            if (!worldPosition.PreserveDistantExteriorCoordinates)
+            {
+                expectedDx = NormalizeTerrainFrameDelta(expectedDx);
+                expectedDz = NormalizeTerrainFrameDelta(expectedDz);
+            }
 
             if (expectedDx * expectedDx + expectedDz * expectedDz >
                 LocalPerPlayerCullDistanceUnity * LocalPerPlayerCullDistanceUnity)
@@ -504,10 +548,19 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         float ndz = NormalizeTerrainFrameDelta(dz);
 
         Vector3 corrected = new Vector3(localPlayerPos.x + ndx, pos.y, localPlayerPos.z + ndz);
+        if (worldPosition != null && worldPosition.PreserveDistantExteriorCoordinates &&
+            (!hasAuthority || authorityDeactivated))
+        {
+            corrected.x = localPlayerPos.x + (float)(((double)worldPosition.worldX - localWorldX) * unityPerDF);
+            corrected.z = localPlayerPos.z + (float)(((double)worldPosition.worldZ - localWorldZ) * unityPerDF);
+        }
         Vector3 correction = corrected - pos;
         correction.y = 0f;
 
-        if (correction.sqrMagnitude < TerrainFrameCorrectionThresholdUnity * TerrainFrameCorrectionThresholdUnity)
+        float correctionThreshold = worldPosition != null &&
+            worldPosition.PreserveDistantExteriorCoordinates && authorityDeactivated
+            ? 0.1f : TerrainFrameCorrectionThresholdUnity;
+        if (correction.sqrMagnitude < correctionThreshold * correctionThreshold)
             return;
 
         transform.position = corrected;
@@ -686,6 +739,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         if (worldPosition == null || !worldPosition.isActiveAndEnabled || !worldPosition.initialized)
             return;
 
+        if (KeepInitialExteriorOwner())
+            return;
+
         bool inGrace = (Time.time - spawnTime < destroyGracePeriod);
 
         currentOwner = netIdentity.connectionToClient as NetworkConnectionToClient;
@@ -731,7 +787,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
             float absYU = Mathf.Abs(dyU);
 
             // Destroy consideration: within 3D Unity radius AND Y close enough
-            if (distU < destroyDistanceU && absYU < maxYDistance)
+            if (HorizontalRetentionDistanceDF > 0f
+                ? IsWithinHorizontalRetention(pos)
+                : distU < destroyDistanceU && absYU < maxYDistance)
                 anyPlayerWithinDestroy = true;
 
             // Deactivate consideration: smaller middle range between active authority
@@ -1284,6 +1342,8 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
         if (destroyCoroutine == null)
         {
+            if (HorizontalRetentionDistanceDF > 0f && worldPosition != null)
+                Debug.Log($"[ExteriorRetention] Starting cleanup countdown for '{name}' net={netId}, DF={worldPosition.worldX}/{worldPosition.worldZ}, horizontal radius={HorizontalRetentionDistanceDF * unityPerDF}m; no player in range (Y ignored).");
             destroyCoroutine = StartCoroutine(DestroyAfterDelay());
         }
     }
@@ -1312,6 +1372,16 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     // NOTE: This keeps your original predicate: returns TRUE if any player is in range (DF + Y).
     // Caller uses !IsAnyPlayerStillOutOfRange() to decide destroy. Leaving as-is to avoid changing behavior.
+    bool IsWithinHorizontalRetention(PositionMultiplayer player)
+    {
+        // Never wrap by terrain size: different peers can share Unity coordinates
+        // while being kilometres apart in the Daggerfall world.
+        double dx = (double)worldPosition.worldX - player.x;
+        double dz = (double)worldPosition.worldZ - player.z;
+        double radius = HorizontalRetentionDistanceDF;
+        return dx * dx + dz * dz <= radius * radius;
+    }
+
     bool IsAnyPlayerStillOutOfRange()
     {
         var players = GetCachedPlayers(true);
@@ -1332,7 +1402,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
             float yDistance = Mathf.Abs(transform.position.y - player.transform.position.y);
 
-            if (daggerfallDistance < destroyDistance && yDistance < maxYDistance)
+            if (HorizontalRetentionDistanceDF > 0f
+                ? IsWithinHorizontalRetention(pos)
+                : daggerfallDistance < destroyDistance && yDistance < maxYDistance)
                 return true;
         }
 
@@ -1382,15 +1454,15 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         _createFoeAuthorityResnapCo = StartCoroutine(CoResnapCreateFoeOnAuthority());
     }
 
-    private void RestoreSettledMotorState(EnemyMotor settleMotor, bool motorWasEnabled, bool motorWasHostile, string source)
+    private void RestoreSettledMotorState(EnemyMotor settleMotor, bool motorWasEnabled, string source)
     {
         if (settleMotor == null)
             return;
 
-        // Preserve the quest/passive hostility state across the temporary motor disable.
-        // EnemyMotor.Start() reads MobileEnemy.Reactions when the component first becomes enabled,
-        // so update the underlying entity reaction before re-enabling the component.
-        ForceMotorHostilityState(settleMotor, motorWasHostile, source + ":before-enable");
+        // Settling owns positioning and motor enablement, not combat state.
+        // Preserve the live value, including changes received while settling.
+        // Prevent a deferred first Start() from replacing it with spawn reaction.
+        settleMotor.PreserveCurrentHostilityOnStart();
 
         // Do NOT blindly restore motorWasEnabled here.
         //
@@ -1405,57 +1477,24 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool shouldEnableAfterSettle = !authorityDeactivated;
         settleMotor.enabled = shouldEnableAfterSettle;
 
-        Debug.Log($"[DynamicEnemyAuthority][MotorSettleRestore] {source} enemy='{name}' capturedEnabled={motorWasEnabled} restoredEnabled={shouldEnableAfterSettle} hostile={motorWasHostile} authorityDeactivated={authorityDeactivated}");
+        Debug.Log($"[DynamicEnemyAuthority][MotorSettleRestore] {source} enemy='{name}' capturedEnabled={motorWasEnabled} restoredEnabled={shouldEnableAfterSettle} hostile={settleMotor.IsHostile} authorityDeactivated={authorityDeactivated}");
 
-        // If Unity runs EnemyMotor.Start() after this enable, it can still overwrite IsHostile.
-        // Re-apply once on the next frame as a safety net.
+        // Retain the next-frame enable safety net without replaying combat state.
         if (shouldEnableAfterSettle)
-            StartCoroutine(CoRestoreMotorHostilityNextFrame(settleMotor, motorWasHostile, source));
+            StartCoroutine(CoRestoreMotorEnabledNextFrame(settleMotor, source));
     }
 
-    private IEnumerator CoRestoreMotorHostilityNextFrame(EnemyMotor settleMotor, bool shouldBeHostile, string source)
+    private IEnumerator CoRestoreMotorEnabledNextFrame(EnemyMotor settleMotor, string source)
     {
         yield return null;
 
         if (settleMotor != null && !settleMotor.enabled && !authorityDeactivated)
         {
+            settleMotor.PreserveCurrentHostilityOnStart();
             settleMotor.enabled = true;
             Debug.Log($"[DynamicEnemyAuthority][MotorSettleRestore] {source}:next-frame re-enabled EnemyMotor on '{name}'");
         }
 
-        ForceMotorHostilityState(settleMotor, shouldBeHostile, source + ":next-frame");
-    }
-
-    private void ForceMotorHostilityState(EnemyMotor motor, bool shouldBeHostile, string source)
-    {
-        if (motor == null)
-            return;
-
-        DaggerfallEntityBehaviour entityBehaviour = GetComponent<DaggerfallEntityBehaviour>();
-        if (entityBehaviour != null && entityBehaviour.Entity is EnemyEntity enemyEntity)
-        {
-            var mobileEnemy = enemyEntity.MobileEnemy;
-            mobileEnemy.Reactions = shouldBeHostile ? MobileReactions.Hostile : MobileReactions.Passive;
-            enemyEntity.SetMobileEnemy(mobileEnemy);
-        }
-
-        motor.IsHostile = shouldBeHostile;
-
-        if (!shouldBeHostile)
-        {
-            EnemySenses senses = GetComponent<EnemySenses>();
-            if (senses != null)
-            {
-                senses.Target = null;
-                senses.SecondaryTarget = null;
-                senses.DetectedTarget = false;
-                senses.LastKnownTargetPos = transform.position;
-                senses.OldLastKnownTargetPos = transform.position;
-                senses.PredictedTargetPos = transform.position;
-            }
-        }
-
-        Debug.Log($"[DynamicEnemyAuthority][MotorSettleHostility] {source} enemy='{name}' shouldBeHostile={shouldBeHostile}");
     }
 
     private IEnumerator CoServerSettleCreateFoeSpawn()
@@ -1486,13 +1525,11 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool rbHadGravity = rbHad && rb.useGravity;
         EnemyMotor settleMotor = GetComponent<EnemyMotor>();
         bool motorWasEnabled = settleMotor != null && settleMotor.enabled;
-        bool motorWasHostile = settleMotor != null && settleMotor.IsHostile;
 
         // While the CharacterController is disabled for spawn settling, also disable
         // EnemyMotor. Otherwise EnemyMotor.FixedUpdate can call Move/SimpleMove on an
         // inactive CharacterController for enemies stamped as create-foe/wave spawns.
-        // Capture IsHostile first so passive quest foes do not become hostile when the
-        // motor is re-enabled and EnemyMotor.Start() runs late.
+        // Combat state stays live while disabled and is preserved on re-enable.
         if (settleMotor != null)
             settleMotor.enabled = false;
 
@@ -1526,7 +1563,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         }
         if (cc && ccWasEnabled) cc.enabled = true;
         if (settleMotor != null)
-            RestoreSettledMotorState(settleMotor, motorWasEnabled, motorWasHostile, "create-foe-settle");
+            RestoreSettledMotorState(settleMotor, motorWasEnabled, "create-foe-settle");
 
         _serverCreateFoeSpawnSettleCo = null;
     }
@@ -1630,13 +1667,11 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool rbHadGravity = rbHad && rb.useGravity;
         EnemyMotor settleMotor = GetComponent<EnemyMotor>();
         bool motorWasEnabled = settleMotor != null && settleMotor.enabled;
-        bool motorWasHostile = settleMotor != null && settleMotor.IsHostile;
 
         // While the CharacterController is disabled for spawn settling, also disable
         // EnemyMotor. Otherwise EnemyMotor.FixedUpdate can call Move/SimpleMove on an
         // inactive CharacterController for enemies stamped as create-foe/wave spawns.
-        // Capture IsHostile first so passive quest foes do not become hostile when the
-        // motor is re-enabled and EnemyMotor.Start() runs late.
+        // Combat state stays live while disabled and is preserved on re-enable.
         if (settleMotor != null)
             settleMotor.enabled = false;
 
@@ -1673,7 +1708,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         }
         if (cc && ccWasEnabled) cc.enabled = true;
         if (settleMotor != null)
-            RestoreSettledMotorState(settleMotor, motorWasEnabled, motorWasHostile, "create-foe-settle");
+            RestoreSettledMotorState(settleMotor, motorWasEnabled, "create-foe-settle");
 
         _didCreateFoeAuthorityResnap = true;
         _createFoeAuthorityResnapCo = null;
@@ -1749,13 +1784,11 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool rbHadGravity = rbHad && rb.useGravity;
         EnemyMotor settleMotor = GetComponent<EnemyMotor>();
         bool motorWasEnabled = settleMotor != null && settleMotor.enabled;
-        bool motorWasHostile = settleMotor != null && settleMotor.IsHostile;
 
         // While the CharacterController is disabled for spawn settling, also disable
         // EnemyMotor. Otherwise EnemyMotor.FixedUpdate can call Move/SimpleMove on an
         // inactive CharacterController for enemies stamped as create-foe/wave spawns.
-        // Capture IsHostile first so passive quest foes do not become hostile when the
-        // motor is re-enabled and EnemyMotor.Start() runs late.
+        // Combat state stays live while disabled and is preserved on re-enable.
         if (settleMotor != null)
             settleMotor.enabled = false;
 
@@ -1790,8 +1823,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         }
         if (cc && ccWasEnabled) cc.enabled = true;
         if (settleMotor != null)
-            RestoreSettledMotorState(settleMotor, motorWasEnabled, motorWasHostile, "create-foe-settle");
+            RestoreSettledMotorState(settleMotor, motorWasEnabled, "create-foe-settle");
     }
 
 
 }
+

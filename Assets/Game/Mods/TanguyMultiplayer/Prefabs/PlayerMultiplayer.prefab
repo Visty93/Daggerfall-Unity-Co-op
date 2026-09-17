@@ -278,6 +278,7 @@ MonoBehaviour:
     Texture3: 0
     Texture4: 0
     Texture5: 0
+    InitialSavedActionState: 
   syncedActiveGuards: 0
   PlayerMPCurrentHealth: 0
   PlayerMPMaxHealth: 0
@@ -1290,6 +1291,8 @@ MonoBehaviour:
   faceIndex: 0
   race: 0
   faceArchive: 
+  horseMounted: 0
+  lycanthropeVisualState: 0
   nameText: {fileID: 963891597948954120}
   torch: {fileID: 724284812834266966}
   spriteMultiplayer: {fileID: 3249992873265154161}
@@ -1339,10 +1342,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   syncMode: 0
   syncInterval: 0.1
-  doorsOpened: []
   layerMask:
     serializedVersion: 2
     m_Bits: 1
+  logActionSync: 0
 --- !u!114 &2881908305128725156
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1412,11 +1415,14 @@ MonoBehaviour:
   PartyRegionName: 
   PartyLocationName: 
   PartyCurrentLocationState: 0
+  NpcBuildingRevealMapID: -1
+  PartyBuildingKey: 0
   PartyBuildingEntranceAnchorValid: 0
   PartyBuildingEntranceAnchorX: 0
   PartyBuildingEntranceAnchorZ: 0
   PartyExteriorArrivalYValid: 0
   PartyExteriorArrivalY: 0
+  PartyDungeonInstanceId: 
 --- !u!54 &5613315724050198418
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -1519,6 +1525,7 @@ MonoBehaviour:
   keepRootControllerEnabled: 1
   keepRemotePlayersSolid: 1
   ignoreOnlyOwnLocalProxy: 1
+  hideOwnProxyFromDefaultRaycasts: 1
   visualRoot: {fileID: 0}
   captureInitialVisualLocalPosition: 1
   lockedVisualLocalPosition: {x: 0, y: 0, z: 0}
@@ -1574,7 +1581,7 @@ MonoBehaviour:
   - Block
   - RMB
   scanAllSafeRootsIfNoHintRootsFound: 1
-  verboseLogging: 1
+  verboseLogging: 0
 --- !u!114 &3209919402064685695
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1601,7 +1608,14 @@ MonoBehaviour:
   remoteSmoothing: 10
   steamPositionSmoothTime: 0.14
   steamStopSmoothTime: 0.04
-  steamMovingCorrectionBlendTime: 0.12
+  steamStopMaxVisualCorrection: 0.12
+  steamResumeVisualOffsetMaxCarry: 1
+  steamResumeVisualOffsetCorrectionSpeed: 0.15
+  steamVelocitySmoothing: 3
+  steamMeasuredVelocityMaxMultiplier: 1.75
+  steamWalkingCorrectionDeadZone: 0.06
+  steamWalkingCorrectionMaxCarry: 0.1
+  steamWalkingCorrectionSpeed: 0.08
   steamMaxPredictionSeconds: 0.5
   snapDistance: 8
   predictedMoveSpeed: 1.3
@@ -1610,6 +1624,7 @@ MonoBehaviour:
   localIdleOverrideForRemoteGhosts: 1
   localIdleDistance: 2.5
   steamStopRequestLeadSeconds: 0.75
+  steamStopOwnerAheadCompensationMax: 0.5
   remoteIdleRenewInterval: 1.5
   remoteIdleLeaseSeconds: 5
   disabledGhostMotionIgnoreSeconds: 3
@@ -1627,7 +1642,7 @@ MonoBehaviour:
   clearGhostsWhenLeavingExterior: 1
   exteriorStateCheckInterval: 0.25
   verboseLogging: 0
-  enableMotionDiagnostics: 0
+  enableVelocityMotionDiagnostics: 0
   motionDiagnosticsInterval: 5
 --- !u!114 &3249992873265154161
 MonoBehaviour:
