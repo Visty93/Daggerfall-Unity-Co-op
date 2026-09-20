@@ -184,17 +184,17 @@ public class HudMultiplayer : MonoBehaviour
         launch.GetComponent<RectTransform>().sizeDelta = new Vector2(180, 40);
         launch.SetActive(true);
 
-        var panel = SettingsRect("Respawn travel panel", canvas.transform, new Vector2(590, 435), Vector2.zero);
+        var panel = SettingsRect("Respawn travel panel", canvas.transform, new Vector2(590, 535), Vector2.zero);
         panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
         panel.gameObject.AddComponent<UnityEngine.UI.Image>().color = new Color(0.08f, 0.08f, 0.08f, 0.98f);
         respawnSettingsPanel = panel.gameObject;
         SettingsText(panel, "Respawn / travel", new Vector2(530, 32), new Vector2(0, -16), 23);
         SettingsText(panel, "Host settings - applied to all players", new Vector2(530, 26), new Vector2(0, -50), 16);
-        string[] names = { "Hold to revive", "Wait before self-respawn", "Revive health", "Respawn health" };
-        int[] min = { 1, 5, 10, 10 }, max = { 10, 30, 50, 50 };
-        respawnSliders = new UnityEngine.UI.Slider[4];
-        respawnValueLabels = new Text[4];
-        for (int i = 0; i < 4; i++)
+        string[] names = { "Hold to revive", "Wait before self-respawn", "Revive health", "Respawn health", "Revive fatigue", "Respawn fatigue" };
+        int[] min = { 1, 5, 10, 10, 10, 10 }, max = { 10, 30, 50, 50, 50, 50 };
+        respawnSliders = new UnityEngine.UI.Slider[6];
+        respawnValueLabels = new Text[6];
+        for (int i = 0; i < 6; i++)
         {
             int index = i;
             float y = -90 - i * 47;
@@ -222,7 +222,7 @@ public class HudMultiplayer : MonoBehaviour
         for (int i = 0; i < 2; i++)
         {
             int index = i;
-            float y = -286 - i * 38;
+            float y = -380 - i * 38;
             var row = SettingsRect(toggles[i], panel, new Vector2(530, 30), new Vector2(0, y));
             var toggle = row.gameObject.AddComponent<UnityEngine.UI.Toggle>();
             var box = SettingsRect("Box", row, new Vector2(25, 25), new Vector2(-250, 0));
@@ -274,7 +274,7 @@ public class HudMultiplayer : MonoBehaviour
         respawnSettingsPanel.SetActive(true);
         respawnSettingsPanel.transform.SetAsLastSibling();
         var canvasRect = canvas.GetComponent<RectTransform>();
-        float scale = Mathf.Min(1f, Mathf.Min(canvasRect.rect.width / 620f, canvasRect.rect.height / 465f));
+        float scale = Mathf.Min(1f, Mathf.Min(canvasRect.rect.width / 620f, canvasRect.rect.height / 565f));
         respawnSettingsPanel.transform.localScale = Vector3.one * scale;
     }
 
@@ -282,9 +282,10 @@ public class HudMultiplayer : MonoBehaviour
     {
         refreshingRespawnSettings = true;
         int[] values = { OptionsMultiplayer.reviveHoldSeconds, OptionsMultiplayer.manualRespawnSeconds,
-            OptionsMultiplayer.reviveHealthPercent, OptionsMultiplayer.respawnHealthPercent };
-        string[] names = { "Hold to revive", "Wait before self-respawn", "Revive health", "Respawn health" };
-        for (int i = 0; i < 4; i++)
+            OptionsMultiplayer.reviveHealthPercent, OptionsMultiplayer.respawnHealthPercent,
+            OptionsMultiplayer.reviveFatiguePercent, OptionsMultiplayer.respawnFatiguePercent };
+        string[] names = { "Hold to revive", "Wait before self-respawn", "Revive health", "Respawn health", "Revive fatigue", "Respawn fatigue" };
+        for (int i = 0; i < 6; i++)
         {
             respawnSliders[i].value = values[i];
             respawnValueLabels[i].text = names[i] + ": " + values[i] + (i < 2 ? " s" : "%");
@@ -303,6 +304,8 @@ public class HudMultiplayer : MonoBehaviour
             case 1: OptionsMultiplayer.manualRespawnSeconds = value; break;
             case 2: OptionsMultiplayer.reviveHealthPercent = value; break;
             case 3: OptionsMultiplayer.respawnHealthPercent = value; break;
+            case 4: OptionsMultiplayer.reviveFatiguePercent = value; break;
+            case 5: OptionsMultiplayer.respawnFatiguePercent = value; break;
         }
         PublishRespawnSettings();
     }

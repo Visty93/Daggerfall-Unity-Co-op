@@ -176,8 +176,10 @@ namespace DaggerfallWorkshop.Game
             int maxHealth = Mathf.Max(1, playerEntity.MaxHealth);
             int percent = Mathf.Clamp(reviveHealthPercent, 10, 50);
             int restoreHealth = Mathf.Clamp(Mathf.CeilToInt(maxHealth * (percent / 100f)), 1, maxHealth);
+            int restoreFatigue = GetRecoveryFatigue(OptionsMultiplayer.reviveFatiguePercent);
 
             playerEntity.SetHealth(restoreHealth, true);
+            playerEntity.SetFatigue(restoreFatigue, true);
 
             if (playerDeath != null)
                 playerDeath.ClearDeathAnimation();
@@ -185,8 +187,9 @@ namespace DaggerfallWorkshop.Game
             if (InputManager.Instance != null)
                 InputManager.Instance.IsPaused = false;
 
-            // Apply again after clearing death in case another system disturbed health during the same frame.
+            // Apply again after clearing death in case another system disturbed vitals during the same frame.
             playerEntity.SetHealth(restoreHealth, true);
+            playerEntity.SetFatigue(restoreFatigue, true);
 
             try
             {
@@ -205,7 +208,10 @@ namespace DaggerfallWorkshop.Game
                 StopCoroutine(positionRefreshCoroutine);
             positionRefreshCoroutine = StartCoroutine(ForcePositionSyncForASecond(serial));
 
-            Debug.Log("[MPRespawn] Local player revived by netId=" + reviverNetId + " health=" + restoreHealth + "/" + maxHealth + " percent=" + percent);
+            Debug.Log("[MPRespawn] Local player revived by netId=" + reviverNetId +
+                " health=" + restoreHealth + "/" + maxHealth + " percent=" + percent +
+                " fatigue=" + restoreFatigue + "/" + Mathf.Max(1, playerEntity.MaxFatigue) +
+                " fatigueFloorPercent=" + Mathf.Clamp(OptionsMultiplayer.reviveFatiguePercent, 10, 50));
             return true;
         }
 
@@ -240,9 +246,12 @@ namespace DaggerfallWorkshop.Game
             ClearTemporaryLethalEffectsForFullRespawn(reason);
 
             int restoreHealth = GetRespawnHealth();
+            int restoreFatigue = GetRecoveryFatigue(OptionsMultiplayer.respawnFatiguePercent);
 
-            // Restore health before moving/clearing death, otherwise the death state can retrigger.
+            // Restore health/fatigue before moving/clearing death, otherwise the death state can retrigger.
+            // Fatigue uses a floor: preserve the pre-respawn value when it was already higher.
             playerEntity.SetHealth(restoreHealth, true);
+            playerEntity.SetFatigue(restoreFatigue, true);
 
             if (diedInsideDungeon)
             {
@@ -327,9 +336,13 @@ namespace DaggerfallWorkshop.Game
 
             CacheReferences();
 
-            // Some transitions or collision correction can disturb the health value. Re-apply once.
+            // Some transitions or collision correction can disturb vitals. Re-apply the
+            // exact recovery values once so travel/transition code cannot silently fill fatigue.
             if (playerEntity != null)
+            {
                 playerEntity.SetHealth(restoreHealth, true);
+                playerEntity.SetFatigue(restoreFatigue, true);
+            }
 
             if (playerDeath != null)
                 playerDeath.ClearDeathAnimation();
@@ -398,6 +411,21 @@ namespace DaggerfallWorkshop.Game
 
             return Mathf.Clamp(Mathf.CeilToInt(maxHealth *
                 (Mathf.Clamp(OptionsMultiplayer.respawnHealthPercent, 10, 50) / 100f)), 1, maxHealth);
+        }
+
+        private int GetRecoveryFatigue(int minimumPercent)
+        {
+            if (playerEntity == null)
+                return 1;
+
+            int maxFatigue = Mathf.Max(1, playerEntity.MaxFatigue);
+            int currentFatigue = Mathf.Clamp(playerEntity.CurrentFatigue, 0, maxFatigue);
+            int fatigueFloor = Mathf.Clamp(Mathf.CeilToInt(maxFatigue *
+                (Mathf.Clamp(minimumPercent, 10, 50) / 100f)), 1, maxFatigue);
+
+            // Never reduce fatigue as part of revive/respawn. Only raise it to the
+            // configured minimum when the player was below that threshold.
+            return Mathf.Max(currentFatigue, fatigueFloor);
         }
 
         private bool TryRespawnInsideCurrentDungeon()

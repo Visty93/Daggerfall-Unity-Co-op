@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -22,6 +22,101 @@ public class LootCatcher : NetworkBehaviour
     static uint nextServerLootId = 1;
     static readonly Dictionary<uint, string> serverLootItemsById = new Dictionary<uint, string>();
     static readonly Dictionary<uint, int> serverLootVersionById = new Dictionary<uint, int>();
+    // Lifetime only. Each player-owned LootCatcher represents one connection.
+    static readonly Dictionary<uint, HashSet<LootCatcher>> droppedLootReaders =
+        new Dictionary<uint, HashSet<LootCatcher>>();
+    readonly HashSet<uint> openedDroppedLoot = new HashSet<uint>();
+
+    public void SetDroppedLootOpen(uint lootId, bool open)
+    {
+        if (!isLocalPlayer || lootId == 0 || IsCorpseLootId(lootId))
+            return;
+        CmdSetDroppedLootOpen(lootId, open);
+    }
+
+    [Command]
+    void CmdSetDroppedLootOpen(uint lootId, bool open)
+    {
+        if (lootId == 0 || IsCorpseLootId(lootId))
+            return;
+        if (open)
+        {
+            if (!serverLootItemsById.ContainsKey(lootId))
+                return;
+            HashSet<LootCatcher> readers;
+            if (!droppedLootReaders.TryGetValue(lootId, out readers))
+            {
+                readers = new HashSet<LootCatcher>();
+                droppedLootReaders.Add(lootId, readers);
+            }
+            readers.Add(this);
+            openedDroppedLoot.Add(lootId);
+        }
+        else
+        {
+            RemoveDroppedLootReader(lootId);
+            DeleteEmptyClosedDrop(lootId);
+        }
+    }
+
+    void RemoveDroppedLootReader(uint lootId)
+    {
+        openedDroppedLoot.Remove(lootId);
+        HashSet<LootCatcher> readers;
+        if (!droppedLootReaders.TryGetValue(lootId, out readers))
+            return;
+        readers.Remove(this);
+        if (readers.Count == 0)
+            droppedLootReaders.Remove(lootId);
+    }
+
+    static bool HasDroppedLootReaders(uint lootId)
+    {
+        HashSet<LootCatcher> readers;
+        return droppedLootReaders.TryGetValue(lootId, out readers) && readers.Count != 0;
+    }
+
+    void DeleteEmptyClosedDrop(uint lootId)
+    {
+        string items;
+        if (lootEdits.ContainsKey(lootId) || HasDroppedLootReaders(lootId) ||
+            !serverLootItemsById.TryGetValue(lootId, out items) ||
+            !string.IsNullOrEmpty(items))
+            return;
+        serverLootItemsById.Remove(lootId);
+        serverLootVersionById.Remove(lootId);
+        rpcDisableLootById(lootId);
+    }
+
+    public override void OnStopServer()
+    {
+        ReleaseDisconnectedEdits();
+        // Relay cleanup through a surviving player, not the despawning identity.
+        LootCatcher survivor = null;
+        foreach (NetworkIdentity identity in NetworkServer.spawned.Values)
+        {
+            if (identity == null || identity == netIdentity) continue;
+            var candidate = identity.GetComponent<LootCatcher>();
+            if (candidate != null && candidate.isServer) { survivor = candidate; break; }
+        }
+        foreach (uint lootId in new List<uint>(openedDroppedLoot))
+        {
+            RemoveDroppedLootReader(lootId);
+            if (survivor != null)
+                survivor.DeleteEmptyClosedDrop(lootId);
+            else if (!HasDroppedLootReaders(lootId))
+            {
+                string items;
+                if (serverLootItemsById.TryGetValue(lootId, out items) && string.IsNullOrEmpty(items))
+                {
+                    serverLootItemsById.Remove(lootId);
+                    serverLootVersionById.Remove(lootId);
+                }
+            }
+        }
+        base.OnStopServer();
+    }
+
 
     // Local scene state. Also static so RPCs from any player's LootCatcher can find any local loot pile.
     static readonly Dictionary<uint, DaggerfallLoot> localLootById = new Dictionary<uint, DaggerfallLoot>();
@@ -45,6 +140,188 @@ public class LootCatcher : NetworkBehaviour
     // corpse publish finally arrives.
     static readonly Dictionary<uint, string> serverPendingUnknownCorpseItemsById = new Dictionary<uint, string>();
 
+
+    // One short edit transaction at a time per container, not an inventory-window lock.
+    sealed class LootEdit
+    {
+        public LootCatcher owner;
+        public uint request;
+        public float startedRealtime;
+    }
+    static readonly Dictionary<uint, LootEdit> lootEdits = new Dictionary<uint, LootEdit>();
+    uint nextEditRequest;
+    static readonly HashSet<uint> clientInitializedCorpses = new HashSet<uint>();
+
+    // Event-only diagnostics: no polling and no change to death/quest scheduling.
+    static void TraceLootPause(string phase, uint id, string detail)
+    {
+        try
+        {
+            string enemyState = "not-corpse";
+            if (IsCorpseLootId(id))
+            {
+                uint enemyId = id & ~CorpseLootIdFlag;
+                NetworkIdentity identity;
+                enemyState = "enemyNetId=" + enemyId + " serverEnemy=absent";
+                if (NetworkServer.active && NetworkServer.spawned.TryGetValue(enemyId, out identity) && identity != null)
+                {
+                    var behaviour = identity.GetComponent<DaggerfallEntityBehaviour>();
+                    enemyState = "enemyNetId=" + enemyId + " serverEnemy=present active=" + identity.gameObject.activeInHierarchy +
+                        " hp=" + (behaviour != null && behaviour.Entity != null ? behaviour.Entity.CurrentHealth.ToString() : "unknown") +
+                        " corpseAssigned=" + (behaviour != null && behaviour.CorpseLootContainer != null);
+                }
+            }
+            var ui = DaggerfallUI.UIManager;
+            string window = ui != null && ui.TopWindow != null ? ui.TopWindow.GetType().Name : "none";
+            Debug.Log("[LootPauseProbe] phase=" + phase + " peer=" + (NetworkServer.active ? "host" : "client") +
+                " lootId=" + id + " realtime=" + Time.realtimeSinceStartup.ToString("F3") +
+                " gameTime=" + Time.time.ToString("F3") + " timeScale=" + Time.timeScale +
+                " window=" + window + " " + enemyState + " " + detail);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("[LootPauseProbe] Diagnostic unavailable: " + ex.Message);
+        }
+    }
+
+    public uint RequestLootEdit(uint id, int version)
+    {
+        return ++nextEditRequest;
+    }
+
+    public void SendLootEditRequest(uint id, int version, uint request)
+    {
+        if (!isLocalPlayer) return;
+        // Sample on an inventory action, not during the empty corpse-created callback.
+        // The action itself has not run: these are the pre-transfer contents.
+        var corpse = IsCorpseLootId(id) ? FindLocalLootById(id) : null;
+        string corpseItems = corpse != null ? SerializeLootItems(corpse) : null;
+        CmdBeginLootEdit(id, version, request, corpseItems);
+    }
+
+    public void CommitLootEdit(uint id, uint request, string items)
+    {
+        if (isLocalPlayer) CmdCommitLootEdit(id, request, items);
+    }
+
+    [Command]
+    void CmdBeginLootEdit(uint id, int version, uint request, string corpseItems)
+    {
+        // Commands are processed serially: only the first valid initial snapshot wins.
+        // Other clients must match its contents and version before they can edit it.
+        if (!serverLootItemsById.ContainsKey(id))
+            TryInitializePausedCorpse(id, version, corpseItems);
+        string items;
+        int current;
+        if (!serverLootItemsById.TryGetValue(id, out items) ||
+            !serverLootVersionById.TryGetValue(id, out current))
+        {
+            TraceLootPause("request-rejected", id, "reason=unregistered requester=" + netId + " request=" + request + " clientVersion=" + version);
+            TargetLootEditGrant(connectionToClient, id, request, false, -1, "");
+            return;
+        }
+        LootEdit edit;
+        bool available = !lootEdits.TryGetValue(id, out edit);
+        bool sameCorpseContents = current != 0 || !clientInitializedCorpses.Contains(id) ||
+            string.Equals(corpseItems, items, StringComparison.Ordinal);
+        bool accepted = available && current == version && sameCorpseContents;
+        if (accepted)
+            lootEdits[id] = new LootEdit { owner = this, request = request, startedRealtime = Time.realtimeSinceStartup };
+        TraceLootPause(accepted ? "request-granted" : "request-rejected", id,
+            "reason=" + (accepted ? "ready" : (!available ? "reserved" : (current != version ? "version-mismatch" : "corpse-content-mismatch"))) +
+            " requester=" + netId + " request=" + request + " clientVersion=" + version + " serverVersion=" + current +
+            (!available ? " holder=" + (edit.owner != null ? edit.owner.netId.ToString() : "gone") +
+                " holderRequest=" + edit.request + " heldSeconds=" + (Time.realtimeSinceStartup - edit.startedRealtime).ToString("F3") : ""));
+        Debug.Log("[LootTransaction] request=" + request + " lootId=" + id +
+            " accepted=" + accepted + " version=" + current);
+        TargetLootEditGrant(connectionToClient, id, request, accepted, current, items);
+    }
+
+    // Only bridges the demonstrated paused-host initialization gap. It never
+    // replaces an existing record or accepts a living/unknown enemy as loot.
+    bool TryInitializePausedCorpse(uint id, int version, string items)
+    {
+        if (!NetworkServer.active || Time.timeScale != 0f || version != 0 ||
+            !IsCorpseLootId(id) || string.IsNullOrEmpty(items) || items.Length > 262144)
+            return false;
+        NetworkIdentity enemy;
+        if (!NetworkServer.spawned.TryGetValue(id & ~CorpseLootIdFlag, out enemy) || enemy == null)
+            return false;
+        var behaviour = enemy.GetComponent<DaggerfallEntityBehaviour>();
+        if (enemy.GetComponent<SetupDemoEnemy>() == null || behaviour == null ||
+            behaviour.Entity == null || behaviour.Entity.CurrentHealth > 0 ||
+            behaviour.CorpseLootContainer != null)
+            return false;
+
+        serverLootItemsById[id] = items;
+        serverLootVersionById[id] = 0;
+        clientInitializedCorpses.Add(id);
+        TraceLootPause("client-corpse-initialized", id, "requester=" + netId);
+        rpcRegisterCorpseLoot(id, 0, items);
+        return true;
+    }
+
+    [TargetRpc]
+    void TargetLootEditGrant(NetworkConnection target, uint id, uint request, bool accepted, int version, string items)
+    {
+        TraceLootPause("grant-received", id, "request=" + request + " accepted=" + accepted + " serverVersion=" + version);
+        var loot = FindLocalLootById(id);
+        var sync = loot == null ? null : loot.GetComponent<LootMultiplayer>();
+        if (sync != null && sync.ReceiveEditGrant(request, accepted, version, items))
+            return;
+        // Window/scene disappeared before permission arrived. No action occurred.
+        if (accepted) CmdCommitLootEdit(id, request, items);
+    }
+
+    [Command]
+    void CmdCommitLootEdit(uint id, uint request, string items)
+    {
+        LootEdit edit;
+        if (!lootEdits.TryGetValue(id, out edit) || edit.owner != this || edit.request != request)
+            return; // A repeated/stale commit can never be applied twice.
+
+        string previous;
+        int version;
+        if (!serverLootItemsById.TryGetValue(id, out previous) ||
+            !serverLootVersionById.TryGetValue(id, out version))
+            return;
+
+        // Reservation guarantees no competing inventory edit changed this state.
+        items = items ?? "";
+        serverLootItemsById[id] = items;
+        if (items != previous) ++version;
+        serverLootVersionById[id] = version;
+        TraceLootPause("commit", id, "requester=" + netId + " request=" + request + " heldSeconds=" + (Time.realtimeSinceStartup - edit.startedRealtime).ToString("F3"));
+        lootEdits.Remove(id);
+        Debug.Log("[LootTransaction] committed request=" + request + " lootId=" + id + " version=" + version);
+
+        // Target ACK first: the editor stops protecting its local action before
+        // the ordinary broadcast. Other peers only apply the resulting snapshot.
+        TargetLootEditCommitted(connectionToClient, id, request, version, items);
+        rpcReplaceLootContents(id, version, items);
+        if (!IsCorpseLootId(id)) DeleteEmptyClosedDrop(id);
+    }
+
+    [TargetRpc]
+    void TargetLootEditCommitted(NetworkConnection target, uint id, uint request, int version, string items)
+    {
+        var loot = FindLocalLootById(id);
+        var sync = loot == null ? null : loot.GetComponent<LootMultiplayer>();
+        if (sync != null) sync.ReceiveEditCommit(request, version, items);
+    }
+
+    public void ApplyLootEditSnapshot(uint id, int version, string items)
+    {
+        ApplyReplaceLootContents(id, version, items);
+    }
+
+    void ReleaseDisconnectedEdits()
+    {
+        var remove = new List<uint>();
+        foreach (var entry in lootEdits)
+            if (entry.Value.owner == this) remove.Add(entry.Key);
+        foreach (uint id in remove) lootEdits.Remove(id);
+    }
 
     public static uint BuildCorpseLootId(uint enemyNetId)
     {
@@ -115,6 +392,7 @@ public class LootCatcher : NetworkBehaviour
             return;
         }
 
+        TraceLootPause("local-corpse-created", corpseLootId, "items=" + corpseLoot.Items.Count);
         string localItems = SerializeLootItems(corpseLoot);
         catcher.RegisterLocalCorpseLoot(corpseLootId, 0, corpseLoot, localItems, "local-corpse-created");
     }
@@ -228,6 +506,10 @@ public class LootCatcher : NetworkBehaviour
                         lootMultiplayer = t.gameObject.AddComponent<LootMultiplayer>();
 
                     lootMultiplayer.lootCatcher = this;
+                    // The player may have reopened it during the discovery interval.
+                    if (DaggerfallUI.Instance != null &&
+                        DaggerfallUI.Instance.InventoryWindow.LootTarget == loot)
+                        LootMultiplayer.InventoryOpened(loot);
                     return loot;
                 }
             }
@@ -247,7 +529,19 @@ public class LootCatcher : NetworkBehaviour
         Vector3 pos = loot.transform.position;
         string parentName = loot.transform.parent != null ? loot.transform.parent.name : string.Empty;
 
-        cmdSpawnLoot(pos.x, pos.y, pos.z, items, parentName);
+        var game = GameManager.Instance;
+        bool exterior = !game.PlayerEnterExit.IsPlayerInside;
+        double worldX = 0, worldZ = 0;
+        float exteriorY = pos.y;
+        if (exterior)
+        {
+            // Keep fractional DF units. Unity origins differ between peers at seams.
+            Vector3 player = game.PlayerObject.transform.position;
+            worldX = (double)game.PlayerGPS.WorldX + (double)(pos.x - player.x) * 40.0;
+            worldZ = (double)game.PlayerGPS.WorldZ + (double)(pos.z - player.z) * 40.0;
+            exteriorY -= game.PlayerEnterExit.ExteriorParent.transform.position.y;
+        }
+        cmdSpawnLoot(pos.x, pos.y, pos.z, items, parentName, exterior, worldX, worldZ, exteriorY);
     }
 
     public static string SerializeLootItems(DaggerfallLoot loot)
@@ -517,7 +811,7 @@ public class LootCatcher : NetworkBehaviour
     }
 
     [Command]
-    void cmdSpawnLoot(float x, float y, float z, string items, string parentName)
+    void cmdSpawnLoot(float x, float y, float z, string items, string parentName, bool exterior, double worldX, double worldZ, float exteriorY)
     {
         uint lootId = nextServerLootId++;
         int version = 0;
@@ -527,15 +821,35 @@ public class LootCatcher : NetworkBehaviour
 
         Debug.Log("[LootCatcher] Server registered lootId=" + lootId + " version=" + version + " items=" + items);
 
-        rpcSpawnLoot(lootId, version, x, y, z, items, parentName);
+        rpcSpawnLoot(lootId, version, x, y, z, items, parentName, exterior, worldX, worldZ, exteriorY);
     }
 
     [ClientRpc]
-    void rpcSpawnLoot(uint lootId, int version, float x, float y, float z, string items, string parentName)
+    void rpcSpawnLoot(uint lootId, int version, float x, float y, float z, string items, string parentName, bool exterior, double worldX, double worldZ, float exteriorY)
     {
         try
         {
             Vector3 pos = new Vector3(x, y, z);
+            Transform exteriorLootParent = null;
+            if (exterior)
+            {
+                var game = GameManager.Instance;
+                if (game.PlayerEnterExit.IsPlayerInside)
+                {
+                    Debug.Log("[LootPosition] Skipped exterior pile while inside. lootId=" + lootId);
+                    return;
+                }
+                Vector3 player = game.PlayerObject.transform.position;
+                Transform exteriorRoot = game.PlayerEnterExit.ExteriorParent.transform;
+                pos = new Vector3(
+                    player.x + (float)((worldX - game.PlayerGPS.WorldX) / 40.0),
+                    exteriorRoot.position.y + exteriorY,
+                    player.z + (float)((worldZ - game.PlayerGPS.WorldZ) / 40.0));
+                // Use this peer's standard loose-loot parent, not a name from the sender.
+                if (exteriorRoot.childCount > 2) exteriorLootParent = exteriorRoot.GetChild(2);
+                Debug.Log("[LootPosition] lootId=" + lootId + " DF=" + worldX + "/" + worldZ +
+                    " senderUnity=" + new Vector3(x, y, z) + " localUnity=" + pos);
+            }
 
             // The sender already has the real local dropped loot. Do not spawn a duplicate.
             // Instead, assign the network lootId to that existing local DroppedLoot# object.
@@ -561,7 +875,9 @@ public class LootCatcher : NetworkBehaviour
                 return;
             }
 
-            GameObject parent = !string.IsNullOrEmpty(parentName) ? GameObject.Find(parentName) : null;
+            GameObject parent = exterior
+                ? (exteriorLootParent != null ? exteriorLootParent.gameObject : null)
+                : (!string.IsNullOrEmpty(parentName) ? GameObject.Find(parentName) : null);
             if (parent == null)
             {
                 Debug.LogWarning("[LootCatcher] Could not find loot parent '" + parentName + "'. Multiplayer loot not spawned.");
@@ -906,7 +1222,26 @@ public class LootCatcher : NetworkBehaviour
         if (!NetworkServer.active)
             return;
 
+        // A client may already have initialized and looted this dead enemy while
+        // the host was paused. Bind the newly created host marker to that state.
+        // Never reset its revision or resurrect items from the host's fresh roll.
+        string sharedItems;
+        int sharedVersion;
+        if (serverLootItemsById.TryGetValue(corpseLootId, out sharedItems) &&
+            serverLootVersionById.TryGetValue(corpseLootId, out sharedVersion))
+        {
+            serverPendingUnknownCorpseItemsById.Remove(corpseLootId);
+            pendingCorpseItemsById.Remove(corpseLootId);
+            pendingCorpseVersionById.Remove(corpseLootId);
+            RegisterLocalLoot(corpseLootId, sharedVersion, corpseLoot, sharedItems);
+            ApplyReplaceLootContents(corpseLootId, sharedVersion, sharedItems);
+            TraceLootPause("server-corpse-reused", corpseLootId, "version=" + sharedVersion);
+            rpcRegisterCorpseLoot(corpseLootId, sharedVersion, sharedItems);
+            return;
+        }
+
         const int version = 0;
+        TraceLootPause("server-corpse-publish", corpseLootId, "items=" + (corpseLoot != null ? corpseLoot.Items.Count.ToString() : "missing"));
 
         string pendingClientItems;
         if (serverPendingUnknownCorpseItemsById.TryGetValue(corpseLootId, out pendingClientItems))
@@ -925,11 +1260,104 @@ public class LootCatcher : NetworkBehaviour
         rpcRegisterCorpseLoot(corpseLootId, version, authoritativeItems ?? string.Empty);
     }
 
+    // Diagnostic only: follow quest inventory identities without changing them.
+    sealed class CorpseQuestWatch
+    {
+        public ulong quest;
+        public string symbol;
+        public uint corpse;
+        public string lastState;
+        public readonly HashSet<ulong> seenItemIds = new HashSet<ulong>();
+        public float until;
+        public float nextLog;
+        public int logsRemaining = 20;
+    }
+    readonly Dictionary<string, CorpseQuestWatch> corpseQuestWatches = new Dictionary<string, CorpseQuestWatch>();
+    Coroutine corpseQuestWatchRoutine;
+
+    void WatchCorpseQuestItems(uint id, string items)
+    {
+        if (!IsCorpseLootId(id) || string.IsNullOrEmpty(items)) return;
+        var local = GetLocalLootCatcher();
+        if (local != this) { if (local != null) local.WatchCorpseQuestItems(id, items); return; }
+        foreach (string entry in items.Split('#'))
+        {
+            ulong quest; string symbol; int message, value, variant;
+            if (!TryReadQuestLootMetadata(entry.Split('@'), out quest, out symbol, out message, out value, out variant)) continue;
+            string key = quest + ":" + symbol;
+            CorpseQuestWatch watch;
+            if (!corpseQuestWatches.TryGetValue(key, out watch))
+            {
+                watch = new CorpseQuestWatch { quest = quest, symbol = symbol, corpse = id, until = Time.realtimeSinceStartup + 180f };
+                corpseQuestWatches[key] = watch;
+            }
+
+        }
+        if (corpseQuestWatches.Count > 0 && corpseQuestWatchRoutine == null)
+            corpseQuestWatchRoutine = StartCoroutine(TraceCorpseQuestInventory());
+    }
+
+    IEnumerator TraceCorpseQuestInventory()
+    {
+        while (corpseQuestWatches.Count > 0)
+        {
+            TraceCorpseQuestInventoryNow("sample");
+            yield return new WaitForSecondsRealtime(0.25f);
+        }
+        corpseQuestWatchRoutine = null;
+    }
+
+    void TraceCorpseQuestInventoryNow(string phase)
+    {
+        var local = GetLocalLootCatcher();
+        if (local != this) { if (local != null) local.TraceCorpseQuestInventoryNow(phase); return; }
+        var expired = new List<string>();
+        foreach (var pair in corpseQuestWatches)
+        {
+            var w = pair.Value;
+            if (Time.realtimeSinceStartup > w.until || w.logsRemaining <= 0) { expired.Add(pair.Key); continue; }
+            try
+            {
+                var game = GameManager.Instance;
+                var inventory = game.PlayerEntity.Items;
+                var quest = QuestMachine.Instance.GetQuest(w.quest);
+                var resource = quest != null ? quest.GetItem(new Symbol(w.symbol)) : null;
+                var reference = resource != null ? resource.DaggerfallUnityItem : null;
+                string carried = "";
+                for (int itemIndex = 0; itemIndex < inventory.Count; itemIndex++)
+                {
+                    var item = inventory.GetItem(itemIndex);
+                    if (item == null) continue;
+                    bool linked = item.IsQuestItem && item.QuestUID == w.quest &&
+                        item.QuestItemSymbol != null && item.QuestItemSymbol.Name == w.symbol;
+                    if (linked || object.ReferenceEquals(item, reference)) w.seenItemIds.Add(item.UID);
+                    if (linked || object.ReferenceEquals(item, reference) || w.seenItemIds.Contains(item.UID))
+                        carried += item.UID + ":count=" + item.stackCount + ":linked=" + linked + ":resource=" + object.ReferenceEquals(item, reference) + ";";
+                }
+                var corpse = FindLocalLootById(w.corpse);
+                string state = "carried=[" + carried + "] resourceUid=" + (reference != null ? reference.UID.ToString() : "none") +
+                    " corpsePresent=" + (corpse != null) + " collectionAlias=" + (corpse != null && object.ReferenceEquals(corpse.Items, inventory));
+                if (state != w.lastState && Time.realtimeSinceStartup >= w.nextLog)
+                {
+                    w.lastState = state;
+                    w.nextLog = Time.realtimeSinceStartup + 1f;
+                    --w.logsRemaining;
+                    Debug.Log("[CorpseQuestInventory] phase=" + phase + " peer=" + (NetworkServer.active ? "host" : "client") +
+                        " localNetId=" + netId + " quest=" + w.quest + " symbol=" + w.symbol + " corpse=" + w.corpse +
+                        " realtime=" + Time.realtimeSinceStartup + " timeScale=" + Time.timeScale + " " + state);
+                }
+            }
+            catch (Exception ex) { Debug.LogWarning("[CorpseQuestInventory] Probe stopped: " + ex.Message); expired.Add(pair.Key); }
+        }
+        foreach (string key in expired) corpseQuestWatches.Remove(key);
+    }
+
     [ClientRpc]
     void rpcRegisterCorpseLoot(uint corpseLootId, int version, string authoritativeItems)
     {
         try
         {
+            WatchCorpseQuestItems(corpseLootId, authoritativeItems);
             DaggerfallLoot localCorpse = FindLocalLootById(corpseLootId);
             if (localCorpse != null)
             {
@@ -1038,46 +1466,11 @@ public class LootCatcher : NetworkBehaviour
             return;
         }
 
-        int currentVersion = 0;
-        serverLootVersionById.TryGetValue(lootId, out currentVersion);
-
-        // Version guard. This prevents an older stale window-close update from overwriting
-        // a newer server loot state. It does not fully prevent inventory duping if two players
-        // loot the same item at the exact same time; that requires a real lock-on-open system.
-        if (baseVersion != currentVersion)
-        {
-            string currentItems = serverLootItemsById[lootId];
-            Debug.LogWarning("[LootCatcher] Server rejected stale loot update. lootId=" + lootId + " clientBase=" + baseVersion + " serverVersion=" + currentVersion);
-            TargetResyncLootContents(connectionToClient, lootId, currentVersion, currentItems, false);
-            return;
-        }
-
-        if (string.IsNullOrEmpty(newSerializedItems))
-        {
-            if (IsCorpseLootId(lootId))
-            {
-                int emptyCorpseVersion = currentVersion + 1;
-                serverLootItemsById[lootId] = string.Empty;
-                serverLootVersionById[lootId] = emptyCorpseVersion;
-
-                Debug.Log("[LootCatcher] Server accepted empty corpse loot update. Keeping corpse marker active. lootId=" + lootId + " version=" + emptyCorpseVersion);
-                rpcReplaceLootContents(lootId, emptyCorpseVersion, string.Empty);
-                return;
-            }
-
-            serverLootItemsById.Remove(lootId);
-            serverLootVersionById.Remove(lootId);
-            Debug.Log("[LootCatcher] Server accepted empty loot update. Disabling lootId=" + lootId);
-            rpcDisableLootById(lootId);
-            return;
-        }
-
-        int newVersion = currentVersion + 1;
-        serverLootItemsById[lootId] = newSerializedItems;
-        serverLootVersionById[lootId] = newVersion;
-
-        Debug.Log("[LootCatcher] Server accepted loot update. lootId=" + lootId + " version=" + newVersion + " items=" + newSerializedItems);
-        rpcReplaceLootContents(lootId, newVersion, newSerializedItems);
+        // Registered inventory containers now edit via reservations. Never accept
+        // an unsolicited whole-container poll from an observer or an older build.
+        int version;
+        serverLootVersionById.TryGetValue(lootId, out version);
+        TargetResyncLootContents(connectionToClient, lootId, version, serverLootItemsById[lootId], false);
     }
 
     [TargetRpc]
@@ -1131,11 +1524,19 @@ public class LootCatcher : NetworkBehaviour
             }
 
             LootMultiplayer lootMultiplayer = loot.GetComponent<LootMultiplayer>();
+            if (lootMultiplayer != null && lootMultiplayer.DeferSnapshot(version, items))
+                return;
+            int appliedVersion;
+            if (localLootVersionById.TryGetValue(lootId, out appliedVersion) && version < appliedVersion)
+                return;
             if (lootMultiplayer != null)
                 lootMultiplayer.BeginNetworkApply();
 
+            WatchCorpseQuestItems(lootId, items);
+            if (IsCorpseLootId(lootId)) TraceCorpseQuestInventoryNow("before-corpse-replace");
             loot.Items.Clear();
             int added = AddSerializedItemsToLoot(loot, items);
+            if (IsCorpseLootId(lootId)) TraceCorpseQuestInventoryNow("after-corpse-replace");
 
             localLootItemsById[lootId] = items ?? string.Empty;
             localLootVersionById[lootId] = version;
@@ -1189,9 +1590,9 @@ public class LootCatcher : NetworkBehaviour
     [Command]
     void cmdDisableLootById(uint lootId)
     {
-        serverLootItemsById.Remove(lootId);
-        serverLootVersionById.Remove(lootId);
-
+        // Scene/local cleanup cannot remove a dropped pile another player is using.
+        if (lootEdits.ContainsKey(lootId) || (!IsCorpseLootId(lootId) && HasDroppedLootReaders(lootId)))
+            return;
         // Corpse markers are local DFU corpse objects. Do not network-disable them just
         // because one client cleaned/unloaded one locally. Empty corpse contents are synced
         // through rpcReplaceLootContents(..., string.Empty) instead.
@@ -1201,6 +1602,8 @@ public class LootCatcher : NetworkBehaviour
             return;
         }
 
+        serverLootItemsById.Remove(lootId);
+        serverLootVersionById.Remove(lootId);
         rpcDisableLootById(lootId);
     }
 
@@ -1287,3 +1690,4 @@ public class LootCatcher : NetworkBehaviour
         }
     }
 }
+

@@ -15,6 +15,8 @@ public class OptionsMultiplayer : MonoBehaviour
     public static int manualRespawnSeconds = 10;
     public static int reviveHealthPercent = 30;
     public static int respawnHealthPercent = 30;
+    public static int reviveFatiguePercent = 30;
+    public static int respawnFatiguePercent = 30;
     public static bool respawnOutsideDungeon = false;
     public static bool partyTravelInsideDungeon = true;
 
@@ -37,6 +39,8 @@ public class OptionsMultiplayer : MonoBehaviour
         manualRespawnSeconds = PlayerPrefs.GetInt(RespawnPrefsPrefix + "ManualRespawnSeconds", 10);
         reviveHealthPercent = PlayerPrefs.GetInt(RespawnPrefsPrefix + "ReviveHealthPercent", 30);
         respawnHealthPercent = PlayerPrefs.GetInt(RespawnPrefsPrefix + "RespawnHealthPercent", 30);
+        reviveFatiguePercent = PlayerPrefs.GetInt(RespawnPrefsPrefix + "ReviveFatiguePercent", 30);
+        respawnFatiguePercent = PlayerPrefs.GetInt(RespawnPrefsPrefix + "RespawnFatiguePercent", 30);
         respawnOutsideDungeon = PlayerPrefs.GetInt(RespawnPrefsPrefix + "RespawnOutsideDungeon", 0) != 0;
         partyTravelInsideDungeon = PlayerPrefs.GetInt(RespawnPrefsPrefix + "PartyTravelInsideDungeon", 1) != 0;
         ClampRespawnSettings();
@@ -62,6 +66,8 @@ public class OptionsMultiplayer : MonoBehaviour
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "ManualRespawnSeconds", manualRespawnSeconds);
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "ReviveHealthPercent", reviveHealthPercent);
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "RespawnHealthPercent", respawnHealthPercent);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "ReviveFatiguePercent", reviveFatiguePercent);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "RespawnFatiguePercent", respawnFatiguePercent);
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "RespawnOutsideDungeon", respawnOutsideDungeon ? 1 : 0);
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "PartyTravelInsideDungeon", partyTravelInsideDungeon ? 1 : 0);
         PlayerPrefs.Save();
@@ -77,6 +83,8 @@ public class OptionsMultiplayer : MonoBehaviour
         manualRespawnSeconds = 10;
         reviveHealthPercent = 30;
         respawnHealthPercent = 30;
+        reviveFatiguePercent = 30;
+        respawnFatiguePercent = 30;
         respawnOutsideDungeon = false;
         partyTravelInsideDungeon = true;
     }
@@ -87,6 +95,8 @@ public class OptionsMultiplayer : MonoBehaviour
         manualRespawnSeconds = Mathf.Clamp(manualRespawnSeconds, 5, 30);
         reviveHealthPercent = Mathf.Clamp(reviveHealthPercent, 10, 50);
         respawnHealthPercent = Mathf.Clamp(respawnHealthPercent, 10, 50);
+        reviveFatiguePercent = Mathf.Clamp(reviveFatiguePercent, 10, 50);
+        respawnFatiguePercent = Mathf.Clamp(respawnFatiguePercent, 10, 50);
     }
 
     static int ReadInt(string[] fields, int index, int fallback, int min, int max)
@@ -118,6 +128,9 @@ public class OptionsMultiplayer : MonoBehaviour
         respawnHealthPercent = ReadInt(list, 9, 30, 10, 50);
         respawnOutsideDungeon = list.Length >= 11 && list[10] == "True";
         partyTravelInsideDungeon = list.Length < 12 || list[11] == "True";
+        // Backward compatibility: older option strings ended at field 11.
+        reviveFatiguePercent = ReadInt(list, 12, 30, 10, 50);
+        respawnFatiguePercent = ReadInt(list, 13, 30, 10, 50);
 	}
 	
     public static void SetMobileNpcSync(bool enabled)
@@ -134,7 +147,7 @@ public class OptionsMultiplayer : MonoBehaviour
 	{
         EnsureLocalRespawnSettings();
         ClampRespawnSettings();
-        return timeHost + "#" + displayName + "#" + useHighestLevel + '#' + sendLocation + '#' + sendMessage + '#' + mobileNpcSync + '#' + reviveHoldSeconds + '#' + manualRespawnSeconds + '#' + reviveHealthPercent + '#' + respawnHealthPercent + '#' + respawnOutsideDungeon + '#' + partyTravelInsideDungeon;
+        return timeHost + "#" + displayName + "#" + useHighestLevel + '#' + sendLocation + '#' + sendMessage + '#' + mobileNpcSync + '#' + reviveHoldSeconds + '#' + manualRespawnSeconds + '#' + reviveHealthPercent + '#' + respawnHealthPercent + '#' + respawnOutsideDungeon + '#' + partyTravelInsideDungeon + '#' + reviveFatiguePercent + '#' + respawnFatiguePercent;
 	}
 }
 

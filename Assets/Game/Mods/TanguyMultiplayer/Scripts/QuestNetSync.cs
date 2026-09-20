@@ -769,7 +769,12 @@ private static readonly System.Collections.Generic.Dictionary<ulong, string> _ra
         public string itemDataJson;
         public float queuedAtRealtime;
         public float nextDebugLogRealtime;
+        // A single HUD frame is not enough to prove an inventory/menu transition is finished.
+        // Keep this per queued item so a popup/menu appearing during the settle window resets it.
+        public float safeHudSinceRealtime;
     }
+
+    private const float PendingQuestInventorySafeHudSeconds = 0.20f;
 
     private static readonly Dictionary<string, PendingQuestInventoryChange> _pendingQuestInventoryChanges =
         new Dictionary<string, PendingQuestInventoryChange>(StringComparer.OrdinalIgnoreCase);
@@ -7584,6 +7589,8 @@ if (!isServer) return;
 
         pending.inInventory = inInventory;
         pending.itemDataJson = itemDataJson ?? string.Empty;
+        // Any new state for this item must survive a fresh uninterrupted safe-HUD period.
+        pending.safeHudSinceRealtime = 0f;
 
         _pendingQuestInventoryChanges[key] = pending;
 
@@ -7600,14 +7607,45 @@ if (!isServer) return;
         if (_pendingQuestInventoryChanges.Count == 0)
             return;
 
-        if (IsQuestNetSyncPausedForLoad() || ShouldDeferQuestInventoryApplyNow())
-            return;
-
+        bool uiUnsafe = IsQuestNetSyncPausedForLoad() || ShouldDeferQuestInventoryApplyNow();
         List<string> keys = new List<string>(_pendingQuestInventoryChanges.Keys);
+
+        if (uiUnsafe)
+        {
+            // A popup/menu appearing after a brief HUD frame means the UI transition was not
+            // actually finished. Reset the settle window without touching popup behaviour.
+            for (int i = 0; i < keys.Count; i++)
+            {
+                PendingQuestInventoryChange blocked;
+                if (!_pendingQuestInventoryChanges.TryGetValue(keys[i], out blocked))
+                    continue;
+
+                if (blocked.safeHudSinceRealtime != 0f)
+                {
+                    blocked.safeHudSinceRealtime = 0f;
+                    _pendingQuestInventoryChanges[keys[i]] = blocked;
+                }
+            }
+            return;
+        }
+
+        float now = Time.realtimeSinceStartup;
         for (int i = 0; i < keys.Count; i++)
         {
             PendingQuestInventoryChange pending;
             if (!_pendingQuestInventoryChanges.TryGetValue(keys[i], out pending))
+                continue;
+
+            // First safe HUD frame only starts the settle window. This closes the gap where
+            // PauseOptionsWindow briefly returns to HUD before a queued quest MessageBox opens.
+            if (pending.safeHudSinceRealtime <= 0f)
+            {
+                pending.safeHudSinceRealtime = now;
+                _pendingQuestInventoryChanges[keys[i]] = pending;
+                continue;
+            }
+
+            if (now - pending.safeHudSinceRealtime < PendingQuestInventorySafeHudSeconds)
                 continue;
 
             if (TryApplyQuestItemInventoryChangedImmediate(pending.questUID, pending.itemSymbol, pending.inInventory, pending.itemDataJson))

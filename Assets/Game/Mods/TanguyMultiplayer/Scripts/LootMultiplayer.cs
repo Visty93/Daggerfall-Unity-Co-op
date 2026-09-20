@@ -1,4 +1,7 @@
-﻿using UnityEngine;
+using UnityEngine;
+using System;
+using System.Collections;
+using Mirror;
 using DaggerfallWorkshop;
 
 public class LootMultiplayer : MonoBehaviour
@@ -23,6 +26,160 @@ public class LootMultiplayer : MonoBehaviour
     float suppressContentUpdatesUntil = 0f;
 
     DaggerfallLoot loot;
+    // Local action is frozen from request through commit acknowledgement.
+    Action editAction;
+    uint editRequest;
+    bool editGranted, commitSent;
+    int deferredVersion = -1;
+    string deferredItems;
+    public bool EditPending { get { return editRequest != 0; } }
+    public bool EditGranted { get { return editGranted && !commitSent; } }
+
+    public bool BeginEdit(Action action)
+    {
+        if (EditPending || lootId == 0 || lootCatcher == null)
+            return false;
+        editAction = action;
+        editGranted = commitSent = false;
+        editRequest = lootCatcher.RequestLootEdit(lootId, lootVersion);
+        lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest);
+        return true;
+    }
+
+    public bool ReceiveEditGrant(uint request, bool accepted, int version, string items)
+    {
+        if (request != editRequest) return false;
+        if (!accepted)
+        {
+            editRequest = 0;
+            editAction = null;
+            ApplyFinalSnapshot(version, items);
+            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot changed or is busy. Please try again.");
+            return true;
+        }
+        editGranted = true;
+        var action = editAction;
+        editAction = null;
+        try
+        {
+            if (isActiveAndEnabled && action != null) action();
+            else CompleteEdit();
+        }
+        catch (Exception ex)
+        {
+            // Publish any native changes already made, rather than unlocking with
+            // an old snapshot that would duplicate an item already transferred.
+            Debug.LogError("[LootTransaction] Inventory action failed: " + ex);
+            CompleteEdit();
+        }
+        return true;
+    }
+
+    public void CompleteEdit()
+    {
+        if (!EditGranted || lootCatcher == null) return;
+        commitSent = true;
+        lootCatcher.CommitLootEdit(lootId, editRequest, LootCatcher.SerializeLootItems(loot));
+    }
+
+    public void ReceiveEditCommit(uint request, int version, string items)
+    {
+        if (request != editRequest) return;
+        editRequest = 0;
+        editGranted = commitSent = false;
+        editAction = null;
+        ApplyFinalSnapshot(version, items);
+    }
+
+    public bool DeferSnapshot(int version, string items)
+    {
+        if (!EditPending) return false;
+        if (version >= deferredVersion)
+        {
+            deferredVersion = version;
+            deferredItems = items;
+        }
+        return true;
+    }
+
+    void ApplyFinalSnapshot(int version, string items)
+    {
+        if (deferredVersion > version) { version = deferredVersion; items = deferredItems; }
+        deferredVersion = -1;
+        deferredItems = null;
+        if (version >= 0 && lootCatcher != null)
+            lootCatcher.ApplyLootEditSnapshot(lootId, version, items);
+    }
+
+    bool inventoryOpen;
+    uint readerLootId;
+    LootCatcher readerCatcher;
+    Coroutine closeRoutine;
+
+    // Called only by inventory open/close. No changes to the item transfer code.
+    public static void InventoryOpened(DaggerfallLoot target)
+    {
+        if (target == null) return;
+        var sync = target.GetComponent<LootMultiplayer>();
+        if (sync == null || !sync.IsDroppedNetworkLoot()) return;
+        sync.inventoryOpen = true;
+        if (sync.closeRoutine != null)
+        {
+            sync.StopCoroutine(sync.closeRoutine);
+            sync.closeRoutine = null;
+        }
+        sync.EnsureReader();
+    }
+
+    // True means the server owns empty-container cleanup for this target.
+    public static bool InventoryClosed(DaggerfallLoot target)
+    {
+        if (target == null) return false;
+        var sync = target.GetComponent<LootMultiplayer>();
+        if (sync == null || !sync.IsDroppedNetworkLoot()) return false;
+        sync.inventoryOpen = false;
+        if (sync.closeRoutine == null && sync.isActiveAndEnabled)
+            sync.closeRoutine = sync.StartCoroutine(sync.CloseAfterContents());
+        return true;
+    }
+
+    bool IsDroppedNetworkLoot()
+    {
+        if (!NetworkClient.active && !NetworkServer.active) return false;
+        if (loot == null) loot = GetComponent<DaggerfallLoot>();
+        return loot != null && loot.ContainerType == LootContainerTypes.DroppedLoot &&
+            !LootCatcher.IsCorpseLootId(lootId) && lootCatcher != null;
+    }
+
+    void EnsureReader()
+    {
+        if (readerLootId != 0 || lootId == 0 || PlayerMultiplayer.localPlayer == null)
+            return;
+        var catcher = PlayerMultiplayer.localPlayer.GetComponent<LootCatcher>();
+        if (catcher == null || !catcher.isLocalPlayer) return;
+        readerCatcher = catcher;
+        readerLootId = lootId;
+        readerCatcher.SetDroppedLootOpen(readerLootId, true);
+    }
+
+    void ReleaseReader()
+    {
+        uint id = readerLootId;
+        var catcher = readerCatcher;
+        readerLootId = 0;
+        readerCatcher = null;
+        if (id != 0 && catcher != null && NetworkClient.active)
+            catcher.SetDroppedLootOpen(id, false);
+    }
+
+    IEnumerator CloseAfterContents()
+    {
+        yield return null;
+        while (!inventoryOpen && IsDroppedNetworkLoot() && (lootId == 0 || EditPending))
+            yield return null;
+        if (!inventoryOpen) ReleaseReader();
+        closeRoutine = null;
+    }
 
     void Awake()
     {
@@ -42,6 +199,7 @@ public class LootMultiplayer : MonoBehaviour
     {
         lootId = newLootId;
         lootVersion = newVersion;
+        if (inventoryOpen || closeRoutine != null) EnsureReader();
         lastKnownSerializedItems = serializedItems ?? string.Empty;
         pendingContentUpdate = false;
 
@@ -76,64 +234,23 @@ public class LootMultiplayer : MonoBehaviour
         suppressContentUpdatesUntil = Mathf.Max(suppressContentUpdatesUntil, Time.unscaledTime + Mathf.Max(0f, seconds));
     }
 
-    void Update()
-    {
-        if (lootId == 0)
-            return;
-
-        if (lootCatcher == null)
-            return;
-
-        if (applyingNetworkUpdate || suppressRemovalNotification)
-            return;
-
-        if (Time.unscaledTime < suppressContentUpdatesUntil)
-            return;
-
-        if (loot == null)
-            loot = GetComponent<DaggerfallLoot>();
-
-        if (loot == null)
-            return;
-
-        if (Time.unscaledTime < nextContentCheckTime)
-            return;
-
-        nextContentCheckTime = Time.unscaledTime + contentCheckInterval;
-
-        // Prevent command spam while waiting for the server to accept/reject the previous change.
-        if (pendingContentUpdate)
-        {
-            if (Time.unscaledTime - pendingUpdateStartedAt < pendingUpdateTimeout)
-                return;
-
-            // If no server response came back, allow one retry.
-            pendingContentUpdate = false;
-        }
-
-        string current = LootCatcher.SerializeLootItems(loot);
-        if (current == lastKnownSerializedItems)
-            return;
-
-        Debug.Log("[LootMultiplayer] Loot contents changed. lootId=" + lootId + " version=" + lootVersion + " old=" + lastKnownSerializedItems + " new=" + current);
-
-        pendingContentUpdate = true;
-        pendingUpdateStartedAt = Time.unscaledTime;
-
-        // Do not update lootVersion locally here. The server increments it and broadcasts back.
-        // Do update the local last-known string so this object does not spam every check.
-        lastKnownSerializedItems = current;
-
-        lootCatcher.NotifyLootContentsChanged(lootId, lootVersion, current);
-    }
+    // Inventory changes are sent only by an acknowledged edit. Observers must
+    // never echo an incoming snapshot as a new local inventory operation.
+    void Update() { }
 
     void OnDisable()
     {
+        CompleteEdit();
+        editAction = null;
+        inventoryOpen = false;
+        if (closeRoutine != null) { StopCoroutine(closeRoutine); closeRoutine = null; }
+        ReleaseReader();
         NotifyRemoved();
     }
 
     void OnDestroy()
     {
+        ReleaseReader();
         NotifyRemoved();
     }
 
@@ -157,3 +274,4 @@ public class LootMultiplayer : MonoBehaviour
         lootCatcher.NotifyLootRemovedDelayed(lootId, transform.position);
     }
 }
+
