@@ -89,7 +89,12 @@ public class EnemyWorldPosition : NetworkBehaviour
 
     private float NormalizeTerrainFrameDelta(float delta)
     {
-        if (isInteriorSpawn || isDungeonSpawn)
+        // Dungeons use their own anchored/local coordinate space and must never use
+        // exterior terrain-frame wrapping. Building interiors are different: a network
+        // enemy can be detached to scene root while preserving a Unity pose from the
+        // neighbouring floating-origin frame. Normalize that whole +/-819.2 offset before
+        // it is converted into a fake +/-32768 DF-unit world jump.
+        if (isDungeonSpawn)
             return delta;
 
         while (delta > TerrainFrameHalfUnitySize)
