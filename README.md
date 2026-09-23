@@ -9,6 +9,7 @@ This is a heavily modified version of [DFU-Tanguy-Multiplayer](https://github.co
 - [Save compatibility](#save-compatibility)
 - [Issues / limitations](#issues--limitations)
 - [Mod support](#mod-support)
+- [Licensing](#licensing)
 - [Technical details](#technical-details)
 
 ---
@@ -104,11 +105,26 @@ Enemy drops are now synced, including quest items. Random containers in the worl
 
 ### 6) Player down / Respawn system
 
-If the player dies in MP, the game no longer gives you the end-game cutscene. Instead, you will be "downed". The camera will go black, and other players have 30 seconds to click on you to bring you back with 30% health.
+If the player dies in MP, the game no longer gives you the end-game cutscene. Instead, you will be "downed". The camera will go black, and other players can hold left click on you for a few seconds to revive you.
 
-If the 30 seconds pass, or you click the left mouse button during that time, you will be respawned at different locations with 100% HP, depending on where you died.
+By default, reviving takes 5 seconds and brings the player back with 30% health. If the respawn timer runs out, or you click the left mouse button during that time, you will respawn with 30% health.
 
-- If you died in a dungeon, you will be respawned inside at the entrance of the dungeon. The original idea was to respawn outside, but if there are no players inside a dungeon for 10+ seconds, the dungeon ceases to exist. To make it easier to keep the dungeon alive, you will instead respawn at the entrance inside the dungeon.
+The host can change the revive/respawn settings at any time from the multiplayer settings under the **"Respawn/travel"** button:
+
+- Hold to revive: 1-10 seconds (default 5s)
+- Wait before self-respawn: 5-30 seconds (default 10s)
+- Revive health: 10-50% (default 30%)
+- Respawn health: 10-50% (default 30%)
+- Revive fatigue: 10-50% (default 30%)
+- Respawn fatigue: 10-50% (default 30%)
+- Respawn outside dungeons: on/off (off by default)
+- Party travel directly inside dungeons: on/off (on by default)
+
+The revive/respawn fatigue settings act as minimum values, so they won't lower your fatigue if you already have more than the configured amount.
+
+Respawn location depends on where you died:
+
+- If you died in a dungeon, you will be respawned inside at the entrance of the dungeon by default. If **"Respawn outside dungeons"** is enabled, you will instead respawn outside at the dungeon's fast-travel point.
 - If you died outside a dungeon, you will respawn at the fast-travel point.
 - If you died in a town or inside an interior, you will be respawned inside the closest local temple, except if you are a vampire. If there is no temple in the town, you will respawn in one of the nearest tavern's rooms, which is also the default for vampires. If there are no taverns either, you will respawn at the town's fast-travel location.
 - If you died in the exterior wilderness, you will respawn at the latest location you visited, such as a dungeon entrance or town.
@@ -206,10 +222,17 @@ If another player has already generated that dungeon, it won't respawn any new e
 
 ## Mod support
 
-I tested a few mods. Surprisingly, most interior/dungeon-related stuff actually worked out of the box with little to no issues. These should give some rough idea about mod compatibility.
+I tested a few mods. Surprisingly, most interior/dungeon-related stuff actually worked out of the box with little to no issues. I haven't tested every feature of every mod, but this should give some rough idea about compatibility.
+
+**World of Daggerfall:**  
+World of Daggerfall spawns open-world enemies in a way vanilla DFU normally doesn't, so the multiplayer enemy system wasn't really prepared for them.
+I added an unofficial compatibility helper. WoD-spawned enemies stay as normal SP enemies until a player gets close to them, then they get converted into MP enemies with some special cleanup rules.
+This is still fairly experimental and could use some more feedback.
 
 **Warm Ashes - Wilderness Encounters:**  
-Gave me a few quests/events. They were in sync, and one event even spawned a thief in a city, which was also synced. The slightly weird part is that when someone travels, it can trigger enemy spawns even for the other players, because it seems to run these events as quests, which get auto-synced. But all in all, it seems to be working fine.
+Events/enemy spawns in cities and after fast travel worked in sync.  The slightly weird part is that when someone travels, it can trigger enemy spawns even for the other players, because it seems to run these events as quests, which get auto-synced.
+Quests given by guards at World of Daggerfall outposts had some multiplayer issues and couldn't start, so I added an unofficial compatibility helper for those.
+Events around WoD camps might still need some more attention. I had a hard time triggering some of them even in SP, so I didn't get to test those properly.
 
 **Dungeons of Daggerfall Vanilla Redux:**  
 Just a brief test with 2 random dungeons, but they worked.
@@ -218,42 +241,85 @@ Just a brief test with 2 random dungeons, but they worked.
 Encountered a Land Dreugh and a Will-o'-Wisp in a dungeon. Worked.
 
 **Iliac Puddle No More:**  
-Broken, and doesn't seem like an easy fix. For now, it is not working.
+This had quite a few issues at first, both with swimming and enemy spawning, so I added an unofficial compatibility helper.
+Swimming works now, and IPNM spawned enemies use a similar multiplayer conversion system to the World of Daggerfall enemies.
+Respawning currently happens in the water.
 
 **Come Sail Away:**  
-Tested this mod with a simple boat. You see the other player walking on the water, so it is not really working. At least it doesn't break the game; it is mostly immersion-breaking.
+Added an unofficial compatibility helper to sync boats between players.
+Other players can see your boat, board it, and walk around on it while it is moving. I only tested basic boats so far, and the movement sync is not the smoothest, but it works. The mod also tries to parent nearby enemies, which caused pretty bad desync in multiplayer, so the helper prevents it from parenting MP enemies.
 
 **DREAM:**  
 Works.
 
 **Vanilla Enhanced:**  
-Had to add a helper script to make it work. It should work fine starting from version 1.01.
+This had several multiplayer-specific issues, so I added an unofficial compatibility helper.
+There were issues with wandering NPC sync, enemy sprite rotation, some dungeon NPCs appearing partly sunk into the ground, and it also tried to replace the multiplayer player sprites, which caused disconnects when players attacked.
+The issues I encountered are fixed by the helper, including player visuals and synchronized wandering NPC clothing. There might still be other things I haven't run into yet.
 
-Multiplayer compatibility is included for player visuals and synchronized wandering-NPC clothing. Vanilla Enhanced itself is not included; credit to carademono and the Vanilla Enhanced contributors.
+Vanilla Enhanced itself is not included; credit to carademono and the Vanilla Enhanced contributors.
 
-**World of Daggerfall and Beautiful Cities / Villages, with all their requirements:**  
-Had some small issues with interiors. Some of the interiors moved the player to the upper floor/attic instead of the normal entrance. Other than that, they worked well.
-
+**Beautiful Cities / Villages, with all their requirements:**  
+Currently works fine.
+Previously had some small issues with interiors. Some of the interiors moved the player to the upper floor/attic instead of the normal entrance.
 After some testing, I found out that one of the mods uses some kind of teleport inside interiors that conflicted with my "find closest door from the entrance door -250m" logic.
-
 I worked around it with a fix that basically blocks any large player-position change near the entrance door if the player has solid ground to land on. If not, it should let the mystery teleport from the mods do its thing.
-
 The interior player-placement fix is included starting from version 1.01.
+
+**Basic Roads:**  
+Works in my tests.
+
+**Travel Options:**  
+Works.
+Party fast travel previously got stuck because it tried to use DFU's default travel UI while Travel Options replaces it. Party travel no longer depends on that UI, so this should be fixed.
+
+**Unofficial Block, Location and Model Fixes:**  
+Works.
+There was previously a client-side dungeon-generation issue that could leave some dungeon parts without textures, but that has been fixed.
+
+**Retro-Frame:**  
+Works, although the multiplayer party HUD can overlap with some of its UI elements.
+Its UI also used to disappear after multiplayer revive/respawn and couldn't properly restore itself, so I added an unofficial compatibility helper for that.
+
+**Language Skills Overhaul:**  
+Companions needed some changes to multiplayer parenting and authority handling, but they work in MP now.
+Just don't try to make the other player's follower follow you!
+
+**Horrible Hordes:**  
+Had some multiplayer spawning issues, mostly on the client side. Added an unofficial compatibility helper to work around those.
+
+**Killer Instincts:**  
+The mod thought that the MP player gameobject was a non player character, which caused parts of its enemy behaviour to stop working correctly.
+Added an unofficial compatibility helper for it.
+
+**The Penwick Papers:**  
+This mod changes a lot of different things, and a lot of them are probably not affected by multiplayer.
+Some things work better now after I reverted some leftover code from old multiplayer experiments back to vanilla DFU behaviour. For example, the lockpicking minigame works again.
+Enemy blinding currently doesn't work properly in multiplayer, though, so this one would need more attention later.
 
 **Transparent Window:**  
 I wanted to make the "Transparent Window" mod work with the new interior positions, so I made a script that checks whether the mod is installed and, if it is, creates a fake exterior world around the new interior positions.
-
 However, it is only a fake exterior, so no NPCs or enemies are actually visible through the window.
-
 Also, that mod caused issues for me in a few instances, such as falling through the exterior world after the player was teleported. So overall, I do not recommend using it.
 
 ---
 
-Obviously, I can't test every single mod, and it is not realistic to make a compatibility fix for every single one of them.
+Obviously, I can't test every single mod, and it is not realistic to make a compatibility fix for every single one of them. Mods that add entirely new GameObjects, such as the "Piece of Chalk", or add anything else that would need to be manually synchronized between players most likely won't work properly without a compatibility helper specifically made for them.
 
-As much as I would like to make the water-related mods work, I can't promise anything. The base idea was to make vanilla Daggerfall work as a drop-in/drop-out co-op. Anything else is just an extra.
+The base idea was to make vanilla Daggerfall work as a drop-in/drop-out co-op. Anything else is just an extra. 
 
+**Note:** These unofficial compatibility helpers do not include or redistribute source code or assets from the supported mods. They only add compatibility logic on the co-op side.
 ---
+
+## Licensing
+
+Daggerfall Unity Co-op-specific contributions and modifications are released under the MIT License. See [`LICENSE`](LICENSE).
+
+This project contains and modifies code from [Daggerfall Unity](https://github.com/Interkarma/daggerfall-unity), distributed under the MIT License by Daggerfall Workshop. See [`LICENSE-DFU`](LICENSE-DFU).
+
+This project is also based on and contains modified code from [DFU-Tanguy-Multiplayer](https://github.com/EmptyBottleInc/DFU-Tanguy-Multiplayer) by EmptyBottleInc, distributed under the MIT License. See [`LICENSE-TANGUY`](LICENSE-TANGUY).
+
+Third-party mods supported through compatibility helpers are not included and remain subject to their respective licenses.
 
 ## Technical details
 
