@@ -345,18 +345,29 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         public override void Update()
         {
             base.Update();
+            if (networkSplitPending && uiManager.TopWindow == this)
+            {
+                networkSplitPending = false;
+                if (networkEdit != null) networkEdit.CompleteEdit();
+            }
+            if (networkCloseDeferred && (networkEdit == null || !networkEdit.EditPending))
+            {
+                networkCloseDeferred = false;
+                CloseInventoryWhenReady();
+                return;
+            }
 
             if (DaggerfallUI.Instance.HotkeySequenceProcessed == HotkeySequence.HotkeySequenceProcessStatus.NotFound)
             {
                 // Toggle window closed with same hotkey used to open it
                 if (InputManager.Instance.GetKeyUp(toggleClosedBinding) || InputManager.Instance.GetBackButtonUp())
-                    CloseWindow();
+                    CloseInventoryWhenReady();
             }
 
             // Close window immediately if inventory suppressed
             if (suppressInventory)
             {
-                CloseWindow();
+                CloseInventoryWhenReady();
                 if (!string.IsNullOrEmpty(suppressInventoryMessage))
                     DaggerfallUI.MessageBox(suppressInventoryMessage);
                 return;
@@ -576,6 +587,58 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             }
         }
 
+        LootMultiplayer networkEdit;
+        bool networkActionExecuting, networkSplitPending, networkCloseDeferred;
+
+        bool BeginNetworkLootAction(DaggerfallUnityItem item, Action action)
+        {
+            if (networkActionExecuting) return false;
+            if (networkEdit != null && networkEdit.EditPending) return true;
+            var sync = lootTarget == null ? null : lootTarget.GetComponent<LootMultiplayer>();
+            if (sync == null || sync.lootCatcher == null ||
+                (!Mirror.NetworkClient.active && !Mirror.NetworkServer.active))
+                return false;
+            if (sync.lootId == 0)
+            {
+                DaggerfallUI.AddHUDText("Loot is still synchronizing.");
+                return true;
+            }
+            var target = lootTarget;
+            networkEdit = sync;
+            sync.BeginEdit(() =>
+            {
+                if (lootTarget != target || uiManager.TopWindow != this)
+                {
+                    sync.CompleteEdit();
+                    return;
+                }
+                networkActionExecuting = true;
+                try { action(); }
+                finally
+                {
+                    networkActionExecuting = false;
+                    if (!networkSplitPending) sync.CompleteEdit();
+                }
+            });
+            return true;
+        }
+
+        void CloseInventoryWhenReady()
+        {
+            if (networkEdit != null && networkEdit.EditPending)
+            {
+                networkCloseDeferred = true;
+                return;
+            }
+            CloseWindow();
+        }
+
+        bool NetworkOwnsLoot()
+        {
+            return lootTarget != null && lootTarget.GetComponent<LootMultiplayer>() != null &&
+                (Mirror.NetworkClient.active || Mirror.NetworkServer.active);
+        }
+
         public override void OnPush()
         {
             toggleClosedBinding = InputManager.Instance.GetBinding(InputManager.Actions.Inventory);
@@ -613,6 +676,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 remoteTargetType = RemoteTargetTypes.Loot;
                 lootTargetStartCount = remoteItems.Count;
                 lootTarget.OnInventoryOpen();
+                LootMultiplayer.InventoryOpened(lootTarget);
                 if (lootTarget.playerOwned && lootTarget.TextureArchive > 0)
                 {
                     dropIconArchive = lootTarget.TextureArchive;
@@ -672,6 +736,10 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         public override void OnPop()
         {
+            // Forced window removal (load/death) must release an open split dialog.
+            networkSplitPending = false;
+            networkCloseDeferred = false;
+            if (networkEdit != null) networkEdit.CompleteEdit();
             // Reset dungeon wagon access permission
             allowDungeonWagonAccess = false;
 
@@ -687,7 +755,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             shopShelfStealing = false;
 
             // If icon has changed move items to dropped list so this loot is removed and a new one created
-            if (lootTarget != null && lootTarget.playerOwned && lootTarget.TextureArchive > 0 &&
+            if (!NetworkOwnsLoot() && lootTarget != null && lootTarget.playerOwned && lootTarget.TextureArchive > 0 &&
                 (lootTarget.TextureArchive != dropIconArchive || lootTarget.TextureRecord != DaggerfallLootDataTables.dropIconIdxs[dropIconArchive][dropIconTexture]))
             {
                 droppedItems.TransferAll(lootTarget.Items);
@@ -718,7 +786,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             if (lootTarget != null)
             {
                 // Remove loot container if empty
-                if (lootTarget.Items.Count == 0)
+                bool networkOwnsCleanup = LootMultiplayer.InventoryClosed(lootTarget);
+                if (lootTarget.Items.Count == 0 && !networkOwnsCleanup)
                     GameObjectHelper.RemoveLootContainer(lootTarget);
 
                 lootTarget.OnInventoryClose();
@@ -1321,6 +1390,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         protected void EquipItem(DaggerfallUnityItem item)
         {
+            if (!networkActionExecuting && networkEdit != null && networkEdit.EditPending) return;
             const int itemBrokenTextId = 29;
             const int forbiddenEquipmentTextId = 1068;
 
@@ -1533,6 +1603,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                     mb.TextBox.MaxCharacters = 8;
                     mb.TextBox.Text = defaultValue;
                     mb.OnGotUserInput += SplitStackPopup_OnGotUserInput;
+                    if (networkActionExecuting) networkSplitPending = true;
                     mb.Show();
                     return;
                 }
@@ -1544,6 +1615,19 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         }
 
         private void SplitStackPopup_OnGotUserInput(DaggerfallInputMessageBox sender, string input)
+        {
+            bool reserved = networkSplitPending;
+            networkActionExecuting = reserved;
+            try { SplitStackPopup_OnGotUserInputCore(sender, input); }
+            finally
+            {
+                networkActionExecuting = false;
+                networkSplitPending = false;
+                if (reserved && networkEdit != null) networkEdit.CompleteEdit();
+            }
+        }
+
+        private void SplitStackPopup_OnGotUserInputCore(DaggerfallInputMessageBox sender, string input)
         {
             // Determine how many items to split
             int count = 0;
@@ -1586,7 +1670,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             {
                 while (uiManager.TopWindow != this)
                     uiManager.PopWindow();
-                CloseWindow();
+                CloseInventoryWhenReady();
                 chooseOneCallback?.Invoke(item);
             }
         }
@@ -1660,6 +1744,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         // This will need more work as more usable items are available
         protected void UseItem(DaggerfallUnityItem item, ItemCollection collection = null)
         {
+            if (!networkActionExecuting && networkEdit != null && networkEdit.EditPending) return;
             // Allow item to handle its own use.
             if (item.UseItem(collection))
                 return;
@@ -1810,7 +1895,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             if (item.IsEnchanted)
             {
                 // Close the inventory window first. Some artifacts (Azura's Star, the Oghma Infinium) create windows on use and we don't want to close those.
-                CloseWindow();
+                CloseInventoryWhenReady();
                 GameManager.Instance.PlayerEffectManager.DoItemEnchantmentPayloads(MagicAndEffects.EnchantmentPayloadFlags.Used, item, collection);
                 return;
             }
@@ -1972,6 +2057,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         protected virtual void LocalItemListScroller_OnItemClick(DaggerfallUnityItem item, ActionModes actionMode)
         {
+            if (BeginNetworkLootAction(item, () => LocalItemListScroller_OnItemClick(item, actionMode))) return;
             // Handle click based on action
             if (actionMode == ActionModes.Equip)
             {
@@ -2019,11 +2105,13 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         protected virtual void LocalItemListScroller_OnItemMiddleClick(DaggerfallUnityItem item)
         {
+            if (BeginNetworkLootAction(item, () => LocalItemListScroller_OnItemMiddleClick(item))) return;
             NextVariant(item);
         }
 
         protected virtual void RemoteItemListScroller_OnItemClick(DaggerfallUnityItem item, ActionModes actionMode)
         {
+            if (BeginNetworkLootAction(item, () => RemoteItemListScroller_OnItemClick(item, actionMode))) return;
             // Send click to quest system
             if (item.IsQuestItem)
             {
@@ -2074,13 +2162,14 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         protected virtual void RemoteItemListScroller_OnItemMiddleClick(DaggerfallUnityItem item)
         {
+            if (BeginNetworkLootAction(item, () => RemoteItemListScroller_OnItemMiddleClick(item))) return;
             NextVariant(item);
         }
 
         protected void ExitButton_OnMouseClick(BaseScreenComponent sender, Vector2 position)
         {
             DaggerfallUI.Instance.PlayOneShot(SoundClips.ButtonClick);
-            CloseWindow();
+            CloseInventoryWhenReady();
         }
 
         protected void ExitButton_OnKeyboardEvent(BaseScreenComponent sender, Event keyboardEvent)
@@ -2093,7 +2182,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             else if (keyboardEvent.type == EventType.KeyUp && isCloseWindowDeferred)
             {
                 isCloseWindowDeferred = false;
-                CloseWindow();
+                CloseInventoryWhenReady();
             }
         }
 
@@ -2284,3 +2373,4 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         #endregion  
     }
 }
+

@@ -10,6 +10,7 @@ using DaggerfallWorkshop;
 using DaggerfallWorkshop.Game.Items;
 using DaggerfallWorkshop.Game.Entity;
 using DaggerfallWorkshop.Game.Utility;
+using DaggerfallWorkshop.Utility;
 using DaggerfallWorkshop.Game.Questing;
 using DaggerfallWorkshop.Game.MagicAndEffects;
 
@@ -444,11 +445,17 @@ public class LootCatcher : NetworkBehaviour
         if (locations == null)
             return 0;
 
-        for (int i = 0; i < locations.Length; i++)
-        {
-            if (locations[i] != null && locations[i].gameObject.activeSelf)
-                return i;
-        }
+        PlayerEnterExit pEnterExit = GameManager.Instance.PlayerEnterExit;
+        if (pEnterExit == null)
+            return 0;
+
+        // Do not infer the current world context from which root object happens to be active.
+        // Multiplayer dungeon conversion can temporarily leave more than one root/dungeon alive.
+        if (pEnterExit.IsPlayerInsideDungeon && pEnterExit.Dungeon != null)
+            return 2;
+
+        if (pEnterExit.IsPlayerInsideBuilding && pEnterExit.Interior != null)
+            return 1;
 
         return 0;
     }
@@ -470,15 +477,26 @@ public class LootCatcher : NetworkBehaviour
         if (locations == null || loc < 0 || loc >= locations.Length || locations[loc] == null)
             return null;
 
-        // Original layout:
-        // Exterior/Dungeon loose loot parent = child 2
-        // Interior loose loot parent = child 1
-        int childIndex = (loc == 1) ? 1 : 2;
+        PlayerEnterExit pEnterExit = GameManager.Instance.PlayerEnterExit;
 
-        if (locations[loc].childCount <= childIndex)
+        // Use the actual live DFU interior/dungeon object. Fixed child indices are not safe
+        // after multiplayer dungeon conversion because old/local and network copies can coexist.
+        if (loc == 2)
+            return pEnterExit != null && pEnterExit.Dungeon != null
+                ? pEnterExit.Dungeon.transform
+                : null;
+
+        if (loc == 1)
+            return pEnterExit != null && pEnterExit.Interior != null
+                ? pEnterExit.Interior.transform
+                : null;
+
+        // Exterior keeps DFU's normal loose-object parent used by the existing seam logic.
+        const int exteriorChildIndex = 2;
+        if (locations[0].childCount <= exteriorChildIndex)
             return null;
 
-        return locations[loc].GetChild(childIndex);
+        return locations[0].GetChild(exteriorChildIndex);
     }
 
     DaggerfallLoot getPlayerLoot(int loc)
@@ -875,12 +893,28 @@ public class LootCatcher : NetworkBehaviour
                 return;
             }
 
-            GameObject parent = exterior
-                ? (exteriorLootParent != null ? exteriorLootParent.gameObject : null)
-                : (!string.IsNullOrEmpty(parentName) ? GameObject.Find(parentName) : null);
+            GameObject parent = null;
+            if (exterior)
+            {
+                parent = exteriorLootParent != null ? exteriorLootParent.gameObject : null;
+            }
+            else
+            {
+                // Bind replicated indoor loot to this peer's actual live interior/dungeon.
+                // Do not trust sender hierarchy names: multiplayer dungeon conversion can leave
+                // stale/local dungeon objects with the same scene name on a peer.
+                PlayerEnterExit pEnterExit = GameManager.Instance.PlayerEnterExit;
+                if (pEnterExit != null && pEnterExit.IsPlayerInsideDungeon && pEnterExit.Dungeon != null)
+                    parent = pEnterExit.Dungeon.gameObject;
+                else if (pEnterExit != null && pEnterExit.IsPlayerInsideBuilding && pEnterExit.Interior != null)
+                    parent = pEnterExit.Interior.gameObject;
+                else if (!string.IsNullOrEmpty(parentName))
+                    parent = GameObject.Find(parentName);
+            }
+
             if (parent == null)
             {
-                Debug.LogWarning("[LootCatcher] Could not find loot parent '" + parentName + "'. Multiplayer loot not spawned.");
+                Debug.LogWarning("[LootCatcher] Could not find current loot parent '" + parentName + "'. Multiplayer loot not spawned.");
                 return;
             }
 
@@ -1643,7 +1677,11 @@ public class LootCatcher : NetworkBehaviour
             return;
         }
 
-        loot.gameObject.SetActive(false);
+        // A network-consumed custom drop must be removed, not merely hidden.
+        // Otherwise SerializableLootContainer remains registered and DFU can cache/restore
+        // the original owner's still-full DroppedLoot when the interior is entered again.
+        loot.Items.Clear();
+        GameObjectHelper.RemoveLootContainer(loot);
     }
 
     // Position fallback kept for old/unregistered loot.
