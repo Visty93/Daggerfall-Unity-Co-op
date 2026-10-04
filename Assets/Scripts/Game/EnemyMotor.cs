@@ -309,6 +309,138 @@ namespace DaggerfallWorkshop.Game
             return hasAuthority;
         }
 
+        // Multiplayer knockback is an event, not a second transform authority system.
+        // Only the enemy's current movement owner runs KnockbackMovement(); everyone else
+        // observes the resulting movement through the existing NetworkTransform.
+        public void RequestNetworkKnockback(float speed, Vector3 direction)
+        {
+            // Preserve the original DFU single-player path exactly. Do not clamp,
+            // normalize, validate, or otherwise reinterpret values supplied by vanilla
+            // code or mods while no network session is active.
+            if (!IsNetworkActive())
+            {
+                KnockbackSpeed = speed;
+                KnockbackDirection = direction;
+                return;
+            }
+
+            // Validation is multiplayer-only because these values can cross a network
+            // boundary when the attacker does not own the target enemy.
+            if (!TrySanitizeNetworkKnockback(ref speed, ref direction))
+                return;
+
+            // On the listen host/server we already know the current enemy owner, so route
+            // directly instead of sending a Command through the local client.
+            if (isServer)
+            {
+                ServerRouteNetworkKnockback(speed, direction);
+                return;
+            }
+
+            // If this client currently owns the enemy, it is the simulator. Apply immediately;
+            // NetworkTransform will publish the resulting movement as usual.
+            if (hasAuthority)
+            {
+                ApplyNetworkKnockbackLocal(speed, direction);
+                return;
+            }
+
+            // A non-owner attacker asks the server to forward the one-shot knockback event
+            // to whichever client currently owns the enemy.
+            if (NetworkClient.active)
+                CmdRequestNetworkKnockback(speed, direction);
+        }
+
+        private bool TrySanitizeNetworkKnockback(ref float speed, ref Vector3 direction)
+        {
+            if (float.IsNaN(speed) || float.IsInfinity(speed) ||
+                float.IsNaN(direction.x) || float.IsInfinity(direction.x) ||
+                float.IsNaN(direction.y) || float.IsInfinity(direction.y) ||
+                float.IsNaN(direction.z) || float.IsInfinity(direction.z))
+                return false;
+
+            if (speed <= 0f || direction.sqrMagnitude < 0.0001f)
+                return false;
+
+            // Match KnockbackMovement()'s own hard cap so an untrusted non-owner request
+            // cannot inject a larger speed than the motor would ever accept locally.
+            float maxSpeed = 40f / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10f);
+            speed = Mathf.Clamp(speed, 0f, maxSpeed);
+            direction.Normalize();
+            return speed > 0f;
+        }
+
+        private void ApplyNetworkKnockbackLocal(float speed, Vector3 direction)
+        {
+            if (!TrySanitizeNetworkKnockback(ref speed, ref direction))
+                return;
+
+            KnockbackSpeed = speed;
+            KnockbackDirection = direction;
+        }
+
+        [Command(requiresAuthority = false)]
+        private void CmdRequestNetworkKnockback(
+            float speed,
+            Vector3 direction,
+            NetworkConnectionToClient sender = null)
+        {
+            if (!isServer || sender == null || !sender.isReady || sender.identity == null ||
+                sender.identity.GetComponent<PlayerMultiplayer>() == null)
+                return;
+
+            if (!TrySanitizeNetworkKnockback(ref speed, ref direction))
+                return;
+
+            ServerRouteNetworkKnockback(speed, direction);
+        }
+
+        [Server]
+        private void ServerRouteNetworkKnockback(float speed, Vector3 direction)
+        {
+            if (!TrySanitizeNetworkKnockback(ref speed, ref direction))
+                return;
+
+            NetworkIdentity ni = cachedNetworkIdentity;
+            if (ni == null)
+            {
+                ni = GetComponent<NetworkIdentity>();
+                cachedNetworkIdentity = ni;
+            }
+
+            NetworkConnectionToClient owner = ni != null ? ni.connectionToClient : null;
+            NetworkConnectionToClient hostConnection =
+                NetworkServer.localConnection as NetworkConnectionToClient;
+
+            // Server-owned and listen-host-owned enemies simulate on this server copy.
+            if (owner == null || (hostConnection != null && owner == hostConnection))
+            {
+                ApplyNetworkKnockbackLocal(speed, direction);
+                return;
+            }
+
+            if (!owner.isReady)
+                return;
+
+            // Remote client owns movement. Only that client should run the vanilla
+            // KnockbackMovement(); its normal NetworkTransform then syncs the pose.
+            TargetApplyNetworkKnockback(owner, speed, direction);
+        }
+
+        [TargetRpc]
+        private void TargetApplyNetworkKnockback(
+            NetworkConnection target,
+            float speed,
+            Vector3 direction)
+        {
+            // Authority may have changed while the RPC was in flight. Never let a stale
+            // former owner move the enemy against the current NetworkTransform owner.
+            if (!hasAuthority)
+                return;
+
+            ApplyNetworkKnockbackLocal(speed, direction);
+        }
+
         private void SuppressClientGravityFor(float seconds)
         {
             if (NetworkClient.active && !isServer)
@@ -658,6 +790,13 @@ public IEnumerator EnsureEnemyEntityIsSet()
         /// <param name="attacker">Attacker to become hostile towards</param>
         public void MakeEnemyHostileToAttacker(DaggerfallEntityBehaviour attacker)
         {
+            if (!senses)
+                senses = GetComponent<EnemySenses>();
+            // Hits can bypass the normal target scan. Do not start retaliation
+            // against another enemy when either side is a protected quest foe.
+            if (senses && senses.IsQuestInfightingTargetBlocked(attacker))
+                return;
+
             // Optional spawner allegiance must follow actual MP player attacks too.
             // Ordinary enemies (SpawnTeamOverride == -1) keep the existing path.
             var spawnSetup = GetComponent<SetupDemoEnemy>();

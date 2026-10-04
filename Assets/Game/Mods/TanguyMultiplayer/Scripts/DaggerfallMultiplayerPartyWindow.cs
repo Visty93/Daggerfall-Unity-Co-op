@@ -69,6 +69,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         Button dialogNotesButton;
         Button upArrowButton;
         Button downArrowButton;
+        Button manageButton;
+        TextLabel manageLabel;
         Button exitButton;
 
         int currentPage;
@@ -154,6 +156,22 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             pageLabel.Size = new Vector2(18, 8);
             mainPanel.Components.Add(pageLabel);
 
+            // Party membership and invitation protocol lives in MultiplayerPartyManager.
+            // Keep this window as a presentation layer with one small entry point.
+            manageLabel = new TextLabel();
+            manageLabel.Position = new Vector2(232, 187);
+            manageLabel.Text = "MANAGE";
+            manageLabel.TextScale = 0.8f;
+            manageLabel.ShadowPosition = new Vector2(1f, 1f);
+            mainPanel.Components.Add(manageLabel);
+
+            manageButton = new Button();
+            manageButton.Position = new Vector2(229, 184);
+            manageButton.Size = new Vector2(46, 14);
+            manageButton.OnMouseClick += ManageButton_OnMouseClick;
+            manageButton.Name = "party_manage_button";
+            mainPanel.Components.Add(manageButton);
+
             exitButton = new Button();
             exitButton.Position = new Vector2(278, 187);
             exitButton.Size = new Vector2(30, 9);
@@ -234,6 +252,11 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             {
                 global::PlayerMultiplayer player = players[i];
                 if (player == null || !player.isActiveAndEnabled)
+                    continue;
+
+                // A network session can now contain multiple independent parties.
+                // Never expose players outside the local player's server-owned PartyId.
+                if (!global::MultiplayerPartyManager.IsLocalPartyMember(player))
                     continue;
 
                 global::PlayerAssets assets = player.GetComponent<global::PlayerAssets>();
@@ -337,7 +360,10 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
             List<TextFile.Token> tokens = new List<TextFile.Token>();
 
+            bool isLeader = global::MultiplayerPartyManager.IsPartyLeader(member.player);
             string nameLine = member.isLocalPlayer ? name + " (You)" : name;
+            if (isLeader)
+                nameLine += " (Leader)";
             tokens.Add(new TextFile.Token() { text = nameLine, formatting = TextFile.Formatting.TextHighlight });
             tokens.Add(TextFile.CreateTextToken(string.Format(
                 "  {0}  Lv {1}",
@@ -410,6 +436,12 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             useDirectDungeonRendezvous = false;
 
             if (member == null || member.isLocalPlayer || member.position == null)
+                return false;
+
+            // Re-check membership at activation time as well as roster-build time.
+            // This closes the tiny window where a kick/leave snapshot can arrive while
+            // an already-rendered travel row is still clickable.
+            if (!global::MultiplayerPartyManager.IsLocalPartyMember(member.player))
                 return false;
 
             global::PositionMultiplayer position = member.position;
@@ -829,6 +861,12 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         void DownArrowButton_OnMouseClick(BaseScreenComponent sender, Vector2 position)
         {
             NextPage();
+        }
+
+        void ManageButton_OnMouseClick(BaseScreenComponent sender, Vector2 position)
+        {
+            DaggerfallUI.Instance.PlayOneShot(SoundClips.ButtonClick);
+            global::MultiplayerPartyManager.OpenManagementWindow(uiManager, this);
         }
 
         void ExitButton_OnMouseClick(BaseScreenComponent sender, Vector2 position)

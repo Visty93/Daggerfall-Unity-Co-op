@@ -176,9 +176,9 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
 
             GameManager.Instance.PlayerEntity.PreventEnemySpawns = true;
 
-            if (IsPureClientWithHostAuthoritativeTime())
+            if (IsPartyFollowerUsingLeaderTime())
             {
-                Debug.Log("[VampireMP] Immediate fallback on pure client under host-authoritative time: skipping local two-week vampire RaiseTime.");
+                Debug.Log("[VampireMP] Immediate fallback on party follower under leader-authoritative time: skipping local two-week vampire RaiseTime.");
                 if (GameManager.Instance != null && GameManager.Instance.EntityEffectBroker != null)
                     GameManager.Instance.EntityEffectBroker.AlignMagicRoundTimerToCurrentTime("VampireMP-immediate-fallback-skip-client-two-week-timejump");
             }
@@ -209,17 +209,17 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
             GameManager.Instance.PlayerEntity.PreventEnemySpawns = true;
 
             bool multiplayerActive = IsMultiplayerActive();
-            bool skipLocalTwoWeekTimeJump = IsPureClientWithHostAuthoritativeTime();
+            bool skipLocalTwoWeekTimeJump = IsPartyFollowerUsingLeaderTime();
 
-            // Original SP/host behaviour raises game time to an evening two weeks later.
-            // Pure clients under host-authoritative MP time must NOT do this locally:
-            // TimeCatcher will snap the client back to host time, leaving EntityEffectBroker
+            // Original SP/leader behaviour raises game time to an evening two weeks later.
+            // Party followers under leader-authoritative MP time must NOT do this locally:
+            // TimeCatcher will snap the follower back to leader time, leaving EntityEffectBroker
             // with a future magic-round baseline. That freezes temporary spell expiration
-            // and vampire sun/holy damage until the host eventually advances past the discarded
+            // and vampire sun/holy damage until the leader eventually advances past the discarded
             // two-week client jump.
             if (skipLocalTwoWeekTimeJump)
             {
-                Debug.Log("[VampireMP] Pure client under host-authoritative time: skipping local two-week vampire RaiseTime. Host time remains authoritative.");
+                Debug.Log("[VampireMP] Party follower under leader-authoritative time: skipping local two-week vampire RaiseTime. Party leader time remains authoritative.");
                 if (GameManager.Instance != null && GameManager.Instance.EntityEffectBroker != null)
                     GameManager.Instance.EntityEffectBroker.AlignMagicRoundTimerToCurrentTime("VampireMP-skip-client-two-week-timejump");
             }
@@ -339,9 +339,9 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
             return NetworkServer.active || NetworkClient.active;
         }
 
-        private bool IsPureClientWithHostAuthoritativeTime()
+        private bool IsPartyFollowerUsingLeaderTime()
         {
-            return NetworkClient.active && !NetworkServer.active && OptionsMultiplayer.timeHost;
+            return global::TimeCatcher.ShouldSuppressLocalTimeJump;
         }
 
         private void StartMultiplayerVampireCemeteryWake(DFLocation location, DFPosition worldPos)

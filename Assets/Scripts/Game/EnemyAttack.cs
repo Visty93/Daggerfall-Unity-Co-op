@@ -730,7 +730,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
             if (applyActualDamage && canCalculateDamage && calculatedDamage > 0)
                 targetEntity.DecreaseHealth(calculatedDamage);
 
-            // Knockback only where authoritative.
+            // Route knockback to the target enemy's current movement owner.
             if (applyActualDamage && canCalculateDamage && calculatedDamage > 0 && targetMotor)
             {
                 float enemyWeight = targetEntity.GetWeightInClassicUnits();
@@ -741,8 +741,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
                 if (knockBackSpeed < (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10)))
                     knockBackSpeed = (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10));
 
-                targetMotor.KnockbackSpeed = knockBackSpeed;
-                targetMotor.KnockbackDirection = direction;
+                targetMotor.RequestNetworkKnockback(knockBackSpeed, direction);
             }
 
             if (targetMotor)
@@ -813,7 +812,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
         targetEntity.DecreaseHealth(damage);
     }
 
-    // Knockback (only on host)
+    // Route host-calculated knockback to the target enemy's current movement owner.
     if (isDamageAllowed && damage > 0 && targetMotor)
     {
         float enemyWeight = targetEntity.GetWeightInClassicUnits();
@@ -824,8 +823,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
         if (KnockbackSpeed < (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10)))
             KnockbackSpeed = (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10));
 
-        targetMotor.KnockbackSpeed = KnockbackSpeed;
-        targetMotor.KnockbackDirection = direction;
+        targetMotor.RequestNetworkKnockback(KnockbackSpeed, direction);
     }
 
     // Make enemy hostile

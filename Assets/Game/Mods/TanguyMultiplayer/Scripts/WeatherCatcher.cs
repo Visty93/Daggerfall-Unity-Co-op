@@ -1,242 +1,302 @@
-﻿using System.Collections;
-using System.Collections.Generic;
-using UnityEngine;
+﻿using UnityEngine;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.Serialization;
 using DaggerfallWorkshop.Game.Weather;
 using Mirror;
 
+// Uses the party membership/epoch supplied by the party-time patch.
+// The physical server validates and relays; it never supplies its own weather.
 public class WeatherCatcher : NetworkBehaviour
 {
     WeatherManager weatherManager;
     PlayerWeather playerWeather;
-    WeatherType lastWeather;
-    string weatherName;
+    bool subscribed, wasLoading, routeKnown, waitingForFreshSample;
+    bool applyingSyncedWeather, hasAppliedSyncedWeather, hasPendingWeather;
+    bool forceNextSyncedWeatherApply;
+    WeatherType lastAppliedSyncedWeather, pendingWeather;
+    ulong localParty, localEpoch, requestToken, lastDelivery;
+    uint localLeader;
+    float nextSyncTime;
+    const float checkIntervalSeconds = 2.56f;
+    // Subscription belongs to this player's replica on the physical server.
+    ulong serverParty, serverEpoch, serverToken, serverDelivery;
+    uint serverLeader;
 
-    // Client-side guard against re-applying the same synced weather every check.
-    // WeatherManager.SetWeather(Rain/Snow/Fog) can randomly choose Rain1/Rain2 or
-    // Snow1/Snow2 sky variants, so calling it repeatedly for the same WeatherType
-    // makes the sky flicker even though the weather did not really change.
-    bool hasAppliedSyncedWeather = false;
-    WeatherType lastAppliedSyncedWeather = WeatherType.Sunny;
-
-    // Prevent the OnWeatherChange event raised by our own synced SetWeather() from
-    // immediately asking the host for the same weather again.
-    bool applyingSyncedWeather = false;
-    bool subscribedToWeatherEvents = false;
-    Coroutine delayedSyncCoroutine = null;
-
-    // After leaving a dungeon/interior the WeatherType enum can already match the host
-    // while RenderSettings/DaggerfallSky still have stale dungeon fog. Bypass the
-    // same-weather skip once so WeatherManager.SetWeather(Fog) can rebuild visuals.
-    bool forceNextSyncedWeatherApply = false;
-
-    void Start()
+    public override void OnStartLocalPlayer()
     {
-        init();
+        base.OnStartLocalPlayer();
+        InitializeLocal();
     }
 
-    void OnDestroy()
+    void Start() { if (isLocalPlayer) InitializeLocal(); }
+    void OnDestroy() { Unsubscribe(); }
+    public override void OnStopClient() { Unsubscribe(); base.OnStopClient(); }
+
+    void InitializeLocal()
     {
-        UnsubscribeWeatherEvents();
+        if (subscribed || !isLocalPlayer) return;
+        WeatherManager.OnWeatherChange += HandleWeatherChange;
+        SaveLoadManager.OnStartLoad += HandleStartLoad;
+        SaveLoadManager.OnLoad += HandleLoadComplete;
+        MultiplayerPartyManager.PartyStateChanged += HandlePartyStateChanged;
+        Mirror.NetworkManager.SessionStopped += Unsubscribe;
+        PlayerEnterExit.OnRespawnerComplete += HandleRespawnerComplete;
+        PlayerEnterExit.OnTransitionExterior += HandleExterior;
+        PlayerEnterExit.OnTransitionDungeonExterior += HandleExterior;
+        subscribed = true;
+        wasLoading = IsLoadInProgress();
+        InvalidateSample();
+        nextSyncTime = Time.realtimeSinceStartup + 0.75f;
     }
 
-    void init()
+    void Unsubscribe()
     {
-        weatherManager = GameManager.Instance.WeatherManager;
-        playerWeather = weatherManager.PlayerWeather;
-
-        if (isLocalPlayer)
+        if (subscribed)
         {
-            SubscribeWeatherEvents();
-            StartCoroutine(Check());
+            WeatherManager.OnWeatherChange -= HandleWeatherChange;
+            SaveLoadManager.OnStartLoad -= HandleStartLoad;
+            SaveLoadManager.OnLoad -= HandleLoadComplete;
+            MultiplayerPartyManager.PartyStateChanged -= HandlePartyStateChanged;
+            Mirror.NetworkManager.SessionStopped -= Unsubscribe;
+            PlayerEnterExit.OnRespawnerComplete -= HandleRespawnerComplete;
+            PlayerEnterExit.OnTransitionExterior -= HandleExterior;
+            PlayerEnterExit.OnTransitionDungeonExterior -= HandleExterior;
+        }
+        subscribed = routeKnown = hasPendingWeather = false;
+        serverParty = serverEpoch = serverToken = 0UL;
+    }
 
-            // Initial connect/join sync. The old code initialized lastWeather to the
-            // local value and then waited for a change, so a newly joined client could
-            // keep its own startup/load weather until something changed later.
-            QueueWeatherSync(0.75f);
+    bool EnsureWeather()
+    {
+        if (GameManager.Instance == null) return false;
+        weatherManager = GameManager.Instance.WeatherManager;
+        playerWeather = weatherManager != null ? weatherManager.PlayerWeather : null;
+        return playerWeather != null;
+    }
+
+    bool IsLoadInProgress()
+    {
+        return SaveLoadManager.Instance != null && SaveLoadManager.Instance.LoadInProgress;
+    }
+
+    bool TryGetLocalRoute(out ulong party, out uint leader, out ulong epoch)
+    {
+        party = epoch = 0UL; leader = 0U;
+        if (netId == 0U) return false;
+        if (NetworkServer.active)
+            return MultiplayerPartyManager.ServerTryGetPartyTimeRoute(netId, out party, out leader, out epoch);
+        MultiplayerPartyManager.PartyClientState state;
+        if (!MultiplayerPartyManager.TryGetClientPartyState(netId, out state) || state == null) return false;
+        party = state.PartyId; leader = state.LeaderNetId; epoch = state.TimeEpoch;
+        return party != 0UL && leader != 0U && epoch != 0UL;
+    }
+
+    void InvalidateSample()
+    {
+        requestToken++;
+        if (requestToken == 0UL) requestToken++;
+        lastDelivery = 0UL;
+        waitingForFreshSample = true;
+        hasPendingWeather = false;
+        hasAppliedSyncedWeather = false;
+    }
+
+    void RefreshRoute()
+    {
+        ulong party, epoch; uint leader;
+        bool known = TryGetLocalRoute(out party, out leader, out epoch);
+        if (known == routeKnown && party == localParty && leader == localLeader && epoch == localEpoch) return;
+        routeKnown = known; localParty = party; localLeader = leader; localEpoch = epoch;
+        InvalidateSample();
+        nextSyncTime = 0f;
+        // Becoming solo or leader keeps current weather. Discard old deferred samples.
+    }
+
+    void HandlePartyStateChanged() { if (isLocalPlayer) RefreshRoute(); }
+    void HandleStartLoad(SaveData_v1 data)
+    {
+        wasLoading = true;
+        InvalidateSample();
+    }
+    void HandleLoadComplete(SaveData_v1 data)
+    {
+        wasLoading = false;
+        InvalidateSample();
+        forceNextSyncedWeatherApply = true;
+        nextSyncTime = Time.realtimeSinceStartup + 0.75f;
+    }
+    void HandleWeatherChange(WeatherType weather)
+    {
+        if (isLocalPlayer && !applyingSyncedWeather)
+            nextSyncTime = Time.realtimeSinceStartup + 0.15f;
+        // The event precedes PlayerWeather.WeatherType assignment; sample in Update.
+    }
+    void HandleRespawnerComplete()
+    {
+        if (!isLocalPlayer) return;
+        InvalidateSample();
+        forceNextSyncedWeatherApply = true;
+        nextSyncTime = Time.realtimeSinceStartup + 0.75f;
+    }
+    void HandleExterior(PlayerEnterExit.TransitionEventArgs args)
+    {
+        if (!isLocalPlayer) return;
+        InvalidateSample();
+        forceNextSyncedWeatherApply = true;
+        nextSyncTime = Time.realtimeSinceStartup + 0.5f;
+    }
+
+    void Update()
+    {
+        if (!isLocalPlayer || !(NetworkServer.active || NetworkClient.isConnected)) return;
+        InitializeLocal();
+        RefreshRoute();
+        bool loading = IsLoadInProgress();
+        if (loading && !wasLoading) HandleStartLoad(default(SaveData_v1));
+        else if (!loading && wasLoading) HandleLoadComplete(default(SaveData_v1));
+        if (loading || !EnsureWeather() || !routeKnown || !TimeCatcher.IsPostLoadAuthoritativeTimeReady) return;
+        ApplyPendingWeather();
+        if (Time.realtimeSinceStartup < nextSyncTime) return;
+        nextSyncTime = Time.realtimeSinceStartup + checkIntervalSeconds;
+        if (localLeader == netId)
+        {
+            // First publication and periodic refresh also cover missed events.
+            CmdPublishPartyWeather(localParty, localEpoch, playerWeather.WeatherType);
+        }
+        else
+        {
+            // Request a fresh sample even if our local weather did not change.
+            // This also recovers when the leader was loading or snapshots were in flight.
+            CmdRequestPartyWeather(localParty, localEpoch, requestToken);
         }
     }
 
-    void SubscribeWeatherEvents()
+    void ApplyPendingWeather()
     {
-        if (subscribedToWeatherEvents)
-            return;
-
-        WeatherManager.OnWeatherChange += WeatherManager_OnWeatherChange;
-        SaveLoadManager.OnLoad += SaveLoadManager_OnLoad;
-        PlayerEnterExit.OnRespawnerComplete += PlayerEnterExit_OnRespawnerComplete;
-        PlayerEnterExit.OnTransitionExterior += PlayerEnterExit_OnTransitionExterior;
-        PlayerEnterExit.OnTransitionDungeonExterior += PlayerEnterExit_OnTransitionExterior;
-
-        subscribedToWeatherEvents = true;
-    }
-
-    void UnsubscribeWeatherEvents()
-    {
-        if (!subscribedToWeatherEvents)
-            return;
-
-        WeatherManager.OnWeatherChange -= WeatherManager_OnWeatherChange;
-        SaveLoadManager.OnLoad -= SaveLoadManager_OnLoad;
-        PlayerEnterExit.OnRespawnerComplete -= PlayerEnterExit_OnRespawnerComplete;
-        PlayerEnterExit.OnTransitionExterior -= PlayerEnterExit_OnTransitionExterior;
-        PlayerEnterExit.OnTransitionDungeonExterior -= PlayerEnterExit_OnTransitionExterior;
-
-        subscribedToWeatherEvents = false;
-    }
-
-    void WeatherManager_OnWeatherChange(WeatherType weather)
-    {
-        if (!isLocalPlayer || applyingSyncedWeather)
-            return;
-
-        // Event-based sync catches save loads and immediate weather changes instead
-        // of waiting only for the 2.56s polling loop.
-        QueueWeatherSync(0.15f);
-    }
-
-    void SaveLoadManager_OnLoad(SaveData_v1 saveData)
-    {
-        if (!isLocalPlayer)
-            return;
-
-        // SaveLoadManager.OnLoad sets local weather from the save in WeatherManager.
-        // After a short delay, resync from host so clients do not keep stale save/load weather.
-        QueueWeatherSync(0.75f);
-    }
-
-    void PlayerEnterExit_OnRespawnerComplete()
-    {
-        if (!isLocalPlayer)
-            return;
-
-        // Fast travel / respawn can roll or restore weather through WeatherManager.
-        // Force one visual reapply because the enum can be correct while fog/sky settings are stale.
-        forceNextSyncedWeatherApply = true;
-        QueueWeatherSync(0.75f);
-    }
-
-    void PlayerEnterExit_OnTransitionExterior(PlayerEnterExit.TransitionEventArgs args)
-    {
-        if (!isLocalPlayer)
-            return;
-
-        // Re-apply/request after exterior is actually present so deferred weather from
-        // interiors/dungeons does not get stuck until the next natural weather change.
-        // This must bypass the same-weather skip once, especially for WeatherType.Fog.
-        forceNextSyncedWeatherApply = true;
-        QueueWeatherSync(0.5f);
-    }
-
-    void QueueWeatherSync(float delay)
-    {
-        if (!isLocalPlayer)
-            return;
-
-        if (delayedSyncCoroutine != null)
-            StopCoroutine(delayedSyncCoroutine);
-
-        delayedSyncCoroutine = StartCoroutine(DelayedWeatherSync(delay));
-    }
-
-    IEnumerator DelayedWeatherSync(float delay)
-    {
-        if (delay > 0f)
-            yield return new WaitForSeconds(delay);
-
-        delayedSyncCoroutine = null;
-        SyncWeatherNow();
-    }
-
-    void SyncWeatherNow()
-    {
-        if (!isLocalPlayer || weatherManager == null || playerWeather == null)
-            return;
-
-        if (isServer)
-            SendHostWeather();
-        else
-            cmdReceiveWeather();
-
-        lastWeather = playerWeather.WeatherType;
-    }
-
-    IEnumerator Check()
-    {
-        lastWeather = playerWeather.WeatherType;
-
-        while (true)
+        if (!hasPendingWeather || !routeKnown || localLeader == netId || IsLoadInProgress() ||
+            !TimeCatcher.IsPostLoadAuthoritativeTimeReady || !EnsureWeather()) return;
+        // Preserve interior/dungeon fog. Keep only the latest party sample until outside.
+        if (GameManager.Instance.IsPlayerInsideBuilding || GameManager.Instance.IsPlayerInsideDungeon ||
+            GameManager.Instance.IsPlayerInsideCastle || GameObject.Find("Exterior") == null) return;
+        WeatherType incoming = NormalizeWeatherForLocalClimate(pendingWeather);
+        if (!forceNextSyncedWeatherApply && hasAppliedSyncedWeather &&
+            lastAppliedSyncedWeather == incoming && playerWeather.WeatherType == incoming)
         {
-            if (lastWeather != playerWeather.WeatherType)
-            {
-                SyncWeatherNow();
-            }
+            hasPendingWeather = false;
+            return;
+        }
+        applyingSyncedWeather = true;
+        try { weatherManager.SetWeather(incoming); }
+        finally { applyingSyncedWeather = false; }
+        hasAppliedSyncedWeather = true;
+        lastAppliedSyncedWeather = incoming;
+        hasPendingWeather = forceNextSyncedWeatherApply = false;
+    }
 
-            yield return new WaitForSeconds(2.56f);
+    static bool IsValidWeather(WeatherType weather)
+    {
+        return weather == WeatherType.Sunny || weather == WeatherType.Cloudy ||
+            weather == WeatherType.Overcast || weather == WeatherType.Fog ||
+            weather == WeatherType.Rain || weather == WeatherType.Snow || weather == WeatherType.Thunder;
+    }
+
+    static WeatherCatcher FindServerWeather(uint player)
+    {
+        NetworkIdentity identity;
+        return NetworkServer.spawned.TryGetValue(player, out identity) && identity != null
+            ? identity.GetComponent<WeatherCatcher>() : null;
+    }
+
+    bool ServerMatchesRoute(ulong party, ulong epoch, out uint leader)
+    {
+        ulong currentParty, currentEpoch;
+        return MultiplayerPartyManager.ServerTryGetPartyTimeRoute(netId, out currentParty, out leader, out currentEpoch) &&
+            currentParty == party && currentEpoch == epoch;
+    }
+
+    [Command]
+    void CmdPublishPartyWeather(ulong party, ulong epoch, WeatherType weather)
+    {
+        uint leader;
+        if (!IsValidWeather(weather) || !ServerMatchesRoute(party, epoch, out leader) || leader != netId)
+            return;
+        foreach (NetworkConnection connection in MultiplayerPartyManager.ServerGetPartyConnections(netId))
+        {
+            if (connection == null || !connection.isReady || connection.identity == null || connection.identity.netId == netId)
+                continue;
+            WeatherCatcher follower = connection.identity.GetComponent<WeatherCatcher>();
+            if (follower != null)
+                follower.SendPartySample(party, epoch, netId, follower.serverToken, weather, false);
         }
     }
 
     [Command]
-    void cmdReceiveWeather()
+    void CmdRequestPartyWeather(ulong party, ulong epoch, ulong token)
     {
-        SendHostWeather();
-    }
-
-    void SendHostWeather()
-    {
-        if (!isServer || playerWeather == null)
+        uint leader;
+        if (token == 0UL ||
+            !ServerMatchesRoute(party, epoch, out leader) || leader == netId)
             return;
-
-        print("WEATHER SEND " + playerWeather.WeatherType.ToString());
-        rpcSendWeather(playerWeather.WeatherType.ToString());
-        lastWeather = playerWeather.WeatherType;
+        serverParty = party;
+        serverEpoch = epoch;
+        serverLeader = leader;
+        serverToken = token;
+        WeatherCatcher source = FindServerWeather(leader);
+        if (source != null && source.connectionToClient != null && source.connectionToClient.isReady)
+            source.TargetCapturePartyWeather(source.connectionToClient, netId, party, epoch, token);
     }
 
-    [ClientRpc]
-    public void rpcSendWeather(string weather)
+    [TargetRpc]
+    void TargetCapturePartyWeather(NetworkConnection target, uint requester, ulong party, ulong epoch, ulong token)
     {
-        if (!isServer)
-        {
-            WeatherType incomingWeather = NormalizeWeatherForLocalClimate(getWeatherType(weather));
-
-            // If this exact synced weather has already been applied and the local
-            // PlayerWeather still matches it, do not call WeatherManager.SetWeather()
-            // again. Re-applying Rain/Snow/Fog randomly picks a sky variant again.
-            if (!forceNextSyncedWeatherApply &&
-                hasAppliedSyncedWeather &&
-                lastAppliedSyncedWeather == incomingWeather &&
-                playerWeather != null &&
-                playerWeather.WeatherType == incomingWeather)
-            {
-                lastWeather = incomingWeather;
-                return;
-            }
-
-            weatherName = incomingWeather.ToString();
-            setWeather();
-        }
+        if (!isLocalPlayer || IsLoadInProgress() || !TimeCatcher.IsPostLoadAuthoritativeTimeReady || !EnsureWeather())
+            return;
+        InitializeLocal();
+        RefreshRoute();
+        if (!routeKnown || localParty != party || localEpoch != epoch || localLeader != netId)
+            return;
+        CmdReplyPartyWeather(requester, party, epoch, token, playerWeather.WeatherType);
     }
 
-    void setWeather()
+    [Command]
+    void CmdReplyPartyWeather(uint requester, ulong party, ulong epoch, ulong token, WeatherType weather)
     {
-        WeatherType incomingWeather = NormalizeWeatherForLocalClimate(getWeatherType(weatherName));
+        uint leader;
+        if (!IsValidWeather(weather) || !ServerMatchesRoute(party, epoch, out leader) || leader != netId)
+            return;
+        WeatherCatcher follower = FindServerWeather(requester);
+        if (follower != null && requester != netId)
+            follower.SendPartySample(party, epoch, netId, token, weather, true);
+    }
 
-        if (GameObject.Find("Exterior") != null)
-        {
-            applyingSyncedWeather = true;
-            weatherManager.SetWeather(incomingWeather);
-            applyingSyncedWeather = false;
+    void SendPartySample(ulong party, ulong epoch, uint leader, ulong token, WeatherType weather, bool freshReply)
+    {
+        uint currentLeader;
+        if (!NetworkServer.active || token == 0UL || serverToken != token || serverParty != party ||
+            serverEpoch != epoch || serverLeader != leader || !ServerMatchesRoute(party, epoch, out currentLeader) ||
+            currentLeader != leader || connectionToClient == null || !connectionToClient.isReady)
+            return;
+        serverDelivery++;
+        TargetApplyPartyWeather(connectionToClient, party, epoch, leader, token, serverDelivery, weather, freshReply);
+    }
 
-            hasAppliedSyncedWeather = true;
-            lastAppliedSyncedWeather = incomingWeather;
-            lastWeather = incomingWeather;
-            forceNextSyncedWeatherApply = false;
-        }
-        else
-        {
-            Invoke("setWeather", 0.5f); // retry setting weather later if player still isn't outside
-        }
+    [TargetRpc]
+    void TargetApplyPartyWeather(NetworkConnection target, ulong party, ulong epoch, uint leader,
+        ulong token, ulong delivery, WeatherType weather, bool freshReply)
+    {
+        if (!isLocalPlayer || IsLoadInProgress() || !TimeCatcher.IsPostLoadAuthoritativeTimeReady || !EnsureWeather())
+            return;
+        InitializeLocal();
+        RefreshRoute();
+        if (!routeKnown || localParty != party || localEpoch != epoch || localLeader != leader ||
+            leader == netId || token != requestToken || delivery <= lastDelivery ||
+            (waitingForFreshSample && !freshReply))
+            return;
+        lastDelivery = delivery;
+        waitingForFreshSample = false;
+        pendingWeather = weather;
+        hasPendingWeather = true;
+        ApplyPendingWeather();
     }
 
     WeatherType NormalizeWeatherForLocalClimate(WeatherType incomingWeather)
@@ -249,7 +309,7 @@ public class WeatherCatcher : NetworkBehaviour
             int climateIndex = playerWeather.PlayerGps.CurrentClimateIndex;
             if (WeatherManager.IsSnowFreeClimate(climateIndex))
             {
-                // Host can be in a snowy climate while this client is in desert,
+                // Leader can be in a snowy climate while this client is in desert,
                 // rainforest, or subtropical climate. Keep the bad-weather sync
                 // feeling, but do not show impossible snow in snow-free climates.
                 return WeatherType.Rain;
@@ -259,29 +319,4 @@ public class WeatherCatcher : NetworkBehaviour
         return incomingWeather;
     }
 
-    WeatherType getWeatherType(string s)
-    {
-        switch (s)
-        {
-            case "Sunny":
-                return WeatherType.Sunny;
-            case "Cloudy":
-                return WeatherType.Cloudy;
-            case "Overcast":
-                return WeatherType.Overcast;
-            case "Fog":
-                return WeatherType.Fog;
-            case "Rain":
-                return WeatherType.Rain;
-            case "Rain_Normal":
-                return WeatherType.Rain;
-            case "Snow":
-                return WeatherType.Snow;
-            case "Snow_Normal":
-                return WeatherType.Snow;
-            case "Thunder":
-                return WeatherType.Thunder;
-        }
-        return WeatherType.Sunny;
-    }
 }

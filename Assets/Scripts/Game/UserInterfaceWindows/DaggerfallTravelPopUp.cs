@@ -474,7 +474,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             global::PlayerMultiplayer dungeonTargetPlayer = partyDungeonTargetPlayer;
             string expectedDungeonInstanceId = partyDungeonInstanceId;
             bool closePartySourceWindow = closeSourceWindowAfterTravel;
-            bool suppressLocalTravelTime = global::TimeCatcher.IsPureClientUsingHostTime;
+            bool suppressLocalTravelTime = global::TimeCatcher.ShouldSuppressLocalTimeJump;
 
             // The vanilla travel map is exterior-only. Normal party travel therefore
             // restores exterior state first. A direct off-map rendezvous can switch from
@@ -556,7 +556,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                     GameManager.Instance.PlayerEntity.CurrentMagicka = GameManager.Instance.PlayerEntity.MaxMagicka;
             }
 
-            // Pure clients keep the host's authoritative clock. Travel duration remains
+            // Party followers keep the leader's authoritative clock. Travel duration remains
             // calculated and is still used for the countdown, price, and all other effects.
             if (!directPartyDungeonRendezvous && !suppressLocalTravelTime)
                 DaggerfallUnity.WorldTime.DaggerfallDateTime.RaiseTime(travelTimeTotalMins * 60);
@@ -566,8 +566,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 GameManager.Instance.PlayerEntity.PreventEnemySpawns = true;
 
             // Arrival-time normalization is also a world-time change. Keep the original
-            // vampire/sunlight and cautious-travel behaviour for SP, the host, and clients
-            // not using host-authoritative time, but never move a pure client's clock.
+            // vampire/sunlight and cautious-travel behaviour for SP, party leaders, and players
+            // not using host-authoritative time, but never move a party follower's clock.
             if (!directPartyDungeonRendezvous && !suppressLocalTravelTime)
             {
                 // Vampires and characters with Damage from Sunlight disadvantage never arrive between 6am and 6pm regardless of travel type

@@ -15,18 +15,22 @@ using DFUI = DaggerfallWorkshop.Game.DaggerfallUI;
 
 public struct MultiplayerChatSubmitMessage : NetworkMessage
 {
+    public int channel; // 0 = All, 1 = Party
+    public ulong partyId;
     public string text;
 }
 
 public struct MultiplayerChatBroadcastMessage : NetworkMessage
 {
+    public int channel;
+    public ulong partyId;
     public string senderName;
     public string text;
     public bool isSystemMessage;
 }
 
 /// <summary>
-/// Global multiplayer text chat created entirely at runtime.
+/// Global and party multiplayer text chat created entirely at runtime.
 /// It remains dormant and creates no visible UI in singleplayer.
 /// </summary>
 public sealed class MultiplayerTextChat : MonoBehaviour
@@ -42,7 +46,14 @@ public sealed class MultiplayerTextChat : MonoBehaviour
 
     static MultiplayerTextChat instance;
 
-    readonly List<string> history = new List<string>();
+    readonly List<string> allHistory = new List<string>();
+    readonly List<string> partyHistory = new List<string>();
+    List<string> history { get { return selectedChannel == 1 ? partyHistory : allHistory; } }
+    int selectedChannel, pendingChannel = -1;
+    int allUnread, partyUnread;
+    ulong chatPartyId;
+    Text allTabText, partyTabText;
+
     readonly Dictionary<int, float> serverNextAllowedMessageTime = new Dictionary<int, float>();
     readonly Dictionary<int, string> serverAnnouncedPlayerNames = new Dictionary<int, string>();
     readonly List<int> serverConnectionIdsScratch = new List<int>();
@@ -154,6 +165,7 @@ public sealed class MultiplayerTextChat : MonoBehaviour
     {
         RefreshNetworkHandlers();
         UpdateServerPresenceAnnouncements();
+        RefreshPartyChatMembership();
 
         bool chatAvailable = IsMultiplayerChatAvailable();
         if (!chatAvailable)
@@ -169,6 +181,18 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         }
 
         EnsureChatUI();
+        if (pendingChannel >= 0)
+        {
+            selectedChannel = pendingChannel;
+            pendingChannel = -1;
+            RefreshChannelHistory();
+            if (chatOpen) focusInputAtFrame = Time.frameCount + 1;
+        }
+        if (chatOpen)
+        {
+            if (selectedChannel == 1) partyUnread = 0; else allUnread = 0;
+        }
+        RefreshChatTabs();
 
         // Keep the runtime chat canvas out of the way while DFU's journal-style
         // party popup is the active window. This also gives the party window sole
@@ -396,6 +420,13 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         }
         else
         {
+            if (clientHandlerRegistered)
+            {
+                allHistory.Clear(); partyHistory.Clear(); allUnread = partyUnread = 0;
+                selectedChannel = 0; pendingChannel = -1; chatPartyId = 0UL;
+                if (inputField != null) inputField.text = string.Empty;
+                RefreshChannelHistory();
+            }
             clientHandlerRegistered = false;
         }
     }
@@ -619,7 +650,7 @@ public sealed class MultiplayerTextChat : MonoBehaviour
 
         inputField.text = string.Empty;
         if (inputPlaceholder != null)
-            inputPlaceholder.text = "Type a message and press Enter...";
+            inputPlaceholder.text = (selectedChannel == 1 ? "[Party] " : "[All] ") + "Type a message and press Enter...";
         inputField.ForceLabelUpdate();
         lastCaretText = string.Empty;
         lastCaretPosition = -1;
@@ -661,12 +692,19 @@ public sealed class MultiplayerTextChat : MonoBehaviour
 
     void SubmitCurrentMessageAndClose()
     {
+        RefreshPartyChatMembership();
         string text = inputField != null ? inputField.text : string.Empty;
         string cleaned = SanitizeMessage(text);
 
         if (!string.IsNullOrEmpty(cleaned) && NetworkClient.active && NetworkClient.isConnected)
         {
-            NetworkClient.Send(new MultiplayerChatSubmitMessage { text = cleaned });
+            if (selectedChannel == 1 && chatPartyId == 0UL)
+            {
+                ShowTemporaryHudMessage("Party membership is still synchronizing.");
+                return;
+            }
+            NetworkClient.Send(new MultiplayerChatSubmitMessage { text = cleaned,
+                channel = selectedChannel, partyId = selectedChannel == 1 ? chatPartyId : 0UL });
         }
 
         BeginCloseChat(true, KeyCode.Return);
@@ -978,6 +1016,12 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         if (connection == null || connection.identity == null)
             return;
 
+        if (message.channel != 0 && message.channel != 1) return;
+        ulong party = 0UL, epoch; uint leader;
+        if (message.channel == 1 &&
+            (!MultiplayerPartyManager.ServerTryGetPartyTimeRoute(connection.identity.netId, out party, out leader, out epoch) ||
+             message.partyId != party)) return;
+
         string cleaned = SanitizeMessage(message.text);
         if (string.IsNullOrEmpty(cleaned))
             return;
@@ -993,12 +1037,18 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         string senderName = GetServerAuthoritativeCharacterName(connection);
         MultiplayerChatBroadcastMessage broadcast = new MultiplayerChatBroadcastMessage
         {
+            channel = message.channel,
+            partyId = party,
             senderName = senderName,
             text = cleaned,
             isSystemMessage = false,
         };
 
-        NetworkServer.SendToAll(broadcast);
+        if (message.channel == 0)
+            NetworkServer.SendToAll(broadcast);
+        else
+            foreach (NetworkConnection recipient in MultiplayerPartyManager.ServerGetPartyConnections(connection.identity.netId))
+                if (recipient != null && recipient.isReady) recipient.Send(broadcast);
     }
 
     static string GetServerAuthoritativeCharacterName(NetworkConnection connection)
@@ -1033,6 +1083,9 @@ public sealed class MultiplayerTextChat : MonoBehaviour
 
     void OnClientChatBroadcast(MultiplayerChatBroadcastMessage message)
     {
+        RefreshPartyChatMembership();
+        if (message.channel != 0 && message.channel != 1) return;
+        if (message.channel == 1 && (chatPartyId == 0UL || message.partyId != chatPartyId)) return;
         string text = SanitizeMessage(message.text);
         if (string.IsNullOrEmpty(text))
             return;
@@ -1049,8 +1102,8 @@ public sealed class MultiplayerTextChat : MonoBehaviour
             senderName = "Player";
 
         string line = senderName + ": " + text;
-        AppendHistoryLine(line);
-        ShowTemporaryHudMessage(line);
+        AppendHistoryLine(line, message.channel);
+        ShowTemporaryHudMessage((message.channel == 1 ? "[Party] " : "[All] ") + line);
     }
 
     static string SanitizeMessage(string value)
@@ -1108,13 +1161,19 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         return builder.ToString().Trim();
     }
 
-    void AppendHistoryLine(string line)
+    void AppendHistoryLine(string line, int channel = 0)
     {
         bool wasNearBottom = scrollRect == null || scrollRect.verticalNormalizedPosition <= 0.08f;
 
-        history.Add(line);
-        while (history.Count > MaxHistoryLines)
-            history.RemoveAt(0);
+        List<string> target = channel == 1 ? partyHistory : allHistory;
+        target.Add(line);
+        while (target.Count > MaxHistoryLines) target.RemoveAt(0);
+        if (!chatOpen || selectedChannel != channel)
+        {
+            if (channel == 1) partyUnread++; else allUnread++;
+        }
+        RefreshChatTabs();
+        if (selectedChannel != channel) return;
 
         if (historyText == null)
             return;
@@ -1124,6 +1183,61 @@ public sealed class MultiplayerTextChat : MonoBehaviour
 
         if (wasNearBottom || !chatOpen)
             scrollToBottomAtFrame = Mathf.Max(scrollToBottomAtFrame, Time.frameCount + 1);
+    }
+
+    void RefreshPartyChatMembership()
+    {
+        MultiplayerPartyManager.PartyClientState state;
+        ulong party = NetworkClient.localPlayer != null &&
+            MultiplayerPartyManager.TryGetClientPartyState(NetworkClient.localPlayer.netId, out state) && state != null
+            ? state.PartyId : 0UL;
+        if (party == chatPartyId) return;
+        chatPartyId = party;
+        // Never carry a former party's conversation/draft into a new party.
+        partyHistory.Clear(); partyUnread = 0;
+        if (selectedChannel == 1 && inputField != null) inputField.text = string.Empty;
+        RefreshChannelHistory();
+    }
+
+    void RefreshChannelHistory()
+    {
+        if (historyText != null) historyText.text = string.Join("\n", history.ToArray());
+        ResizeHistoryContent();
+        scrollToBottomAtFrame = Time.frameCount + 1;
+        RefreshChatTabs();
+    }
+
+    void RefreshChatTabs()
+    {
+        if (chatOpen && inputPlaceholder != null)
+            inputPlaceholder.text = (selectedChannel == 1 ? "[Party] " : "[All] ") + "Type a message and press Enter...";
+        if (allTabText != null)
+        {
+            allTabText.text = "All" + (allUnread > 0 ? " (" + allUnread + ")" : "");
+            allTabText.color = selectedChannel == 0 ? Color.yellow : Color.white;
+        }
+        if (partyTabText != null)
+        {
+            partyTabText.text = "Party" + (partyUnread > 0 ? " (" + partyUnread + ")" : "");
+            partyTabText.color = selectedChannel == 1 ? Color.yellow : Color.white;
+        }
+    }
+
+    Text CreateChannelTab(Transform parent, Font font, string label, int channel)
+    {
+        UnityEngine.UI.Button button = CreateButton(label + "ChatTab", parent, font, label);
+        RectTransform rect = button.GetComponent<RectTransform>();
+        rect.anchorMin = rect.anchorMax = new Vector2(0f, 1f);
+        rect.pivot = new Vector2(0f, 1f);
+        rect.anchoredPosition = new Vector2(8f + channel * 130f, -34f);
+        rect.sizeDelta = new Vector2(124f, 26f);
+        Navigation navigation = button.navigation;
+        navigation.mode = Navigation.Mode.None;
+        button.navigation = navigation;
+        button.onClick.AddListener(delegate { pendingChannel = channel; });
+        Text labelText = button.GetComponentInChildren<Text>();
+        labelText.fontSize = 16;
+        return labelText;
     }
 
     void ResizeHistoryContent()
@@ -1295,7 +1409,7 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         enterOpensChatToggle.navigation = toggleNavigation;
         enterOpensChatToggle.onValueChanged.AddListener(OnEnterOpensChatChanged);
 
-        UnityEngine.UI.Button partyButton = CreateButton("PartyButton", headerObject.transform, font, "Party");
+        UnityEngine.UI.Button partyButton = CreateButton("PartyButton", headerObject.transform, font, "Roster");
         RectTransform partyRect = partyButton.GetComponent<RectTransform>();
         partyRect.anchorMin = new Vector2(1f, 0.5f);
         partyRect.anchorMax = new Vector2(1f, 0.5f);
@@ -1316,12 +1430,15 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         dragHandle = headerObject.GetComponent<MultiplayerChatDragHandle>();
         dragHandle.Initialize(chatRoot);
 
+        allTabText = CreateChannelTab(rootObject.transform, font, "All", 0);
+        partyTabText = CreateChannelTab(rootObject.transform, font, "Party", 1);
+
         GameObject scrollObject = CreateUIObject("MessageScroll", rootObject.transform, typeof(Image), typeof(ScrollRect));
         RectTransform scrollRectTransform = scrollObject.GetComponent<RectTransform>();
         scrollRectTransform.anchorMin = Vector2.zero;
         scrollRectTransform.anchorMax = Vector2.one;
         scrollRectTransform.offsetMin = new Vector2(8f, 45f);
-        scrollRectTransform.offsetMax = new Vector2(-8f, -36f);
+        scrollRectTransform.offsetMax = new Vector2(-8f, -66f);
 
         Image scrollBackground = scrollObject.GetComponent<Image>();
         scrollBackground.color = new Color(0f, 0f, 0f, 0.12f);
@@ -1408,6 +1525,7 @@ public sealed class MultiplayerTextChat : MonoBehaviour
         historyText.fontStyle = FontStyle.Bold;
         historyText.color = new Color(1f, 1f, 0f, 1f);
         historyText.raycastTarget = false;
+        historyText.text = string.Join("\n", history.ToArray());
 
         scrollRect.viewport = viewportRect;
         scrollRect.content = scrollContent;
@@ -1699,6 +1817,14 @@ public sealed class MultiplayerChatDragHandle : MonoBehaviour, IBeginDragHandler
         }
 
         target.localPosition = position;
+        ClampToParent();
+    }
+
+    // CanvasScaler changes the available canvas bounds when the game window or
+    // aspect ratio changes. Keep the whole chat panel (including its draggable
+    // header and Roster button) reachable even when no drag event occurs.
+    void LateUpdate()
+    {
         ClampToParent();
     }
 

@@ -605,7 +605,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             }
             var target = lootTarget;
             networkEdit = sync;
-            sync.BeginEdit(() =>
+            sync.BeginEdit(item, () =>
             {
                 if (lootTarget != target || uiManager.TopWindow != this)
                 {

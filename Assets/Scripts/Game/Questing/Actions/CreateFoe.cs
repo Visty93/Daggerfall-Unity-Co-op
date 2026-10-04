@@ -331,10 +331,19 @@ public override void Update(Task caller)
         return;
 
     bool mpActive = Mirror.NetworkClient.active || Mirror.NetworkServer.active;
-    bool suppressQuestLinkForMP = mpActive && IsQuestSharingBlacklisted(ParentQuest);
+    bool privateQuestBinding = mpActive &&
+        global::QuestNetSync.ShouldUsePrivateQuestFoeBinding(ParentQuest);
+
+    // Preserve the historical Full-mode blacklist behaviour. In SharedOnly/Off the
+    // same local-only quests can use requester-only private foe binding instead.
+    bool suppressQuestLinkForMP = mpActive &&
+        IsQuestSharingBlacklisted(ParentQuest) &&
+        !privateQuestBinding;
 
     if (suppressQuestLinkForMP && Debug.isDebugBuild)
         LogDbg("local-only-createfoe", $"foeSymbol='{foeSymbol.Name}' questName='{(ParentQuest != null ? ParentQuest.QuestName : "<null>")}' will spawn without quest resource link");
+    else if (privateQuestBinding && Debug.isDebugBuild)
+        LogDbg("private-createfoe", $"foeSymbol='{foeSymbol.Name}' questName='{(ParentQuest != null ? ParentQuest.QuestName : "<null>")}' will bind only on the requester");
 
     LogDbg("wave-ready", $"foeSymbol='{foeSymbol.Name}' foeResSymbol='{foe.Symbol.Name}' foeType='{foe.FoeType}' spawnCounter={spawnCounter} spawnMaxTimes={spawnMaxTimes} lastSpawnTime={lastSpawnTime} gameSeconds={gameSeconds} caller='{(caller != null ? caller.Symbol.Name : "<null>")}' inBuilding={GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideBuilding == true} inDungeon={GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true} interior='{(GameManager.Instance?.PlayerEnterExit?.Interior ? GameManager.Instance.PlayerEnterExit.Interior.name : "<none>")}' dungeon='{(GameManager.Instance?.PlayerEnterExit?.Dungeon ? GameManager.Instance.PlayerEnterExit.Dungeon.name : "<none>")}'");
 
@@ -449,9 +458,9 @@ public override void Update(Task caller)
     }
 
 
-    // Quest context (so server marks QuestSpawn & attaches QuestResourceBehaviour).
-    // For local-only blacklisted quests, keep questUID=0 and foeSymbolName empty so
-    // the host creates normal enemies instead of quest-linked shared foes.
+    // Quest context. Full/shared quests use the historical server quest-resource
+    // path. Private quests still send their local UID+symbol, but only to identify the
+    // requester-side Foe when the host TargetRpc returns; the host never resolves it.
     ulong questUID = 0UL;
     string foeSymbolName = string.Empty;
     if (!suppressQuestLinkForMP && foe.ParentQuest != null)
@@ -460,18 +469,37 @@ public override void Update(Task caller)
         foeSymbolName = foe.Symbol.Name;
     }
 
-    LogDbg("client-send", $"foeSymbol='{foeSymbol.Name}' foeResSymbol='{foeSymbolName}' foeType='{foe.FoeType}' spawnCount={foe.SpawnCount} spawnCounterBefore={spawnCounter} spawnMaxTimes={spawnMaxTimes} lastSpawnTime={lastSpawnTime} positionsCount={(positions != null ? positions.Count : 0)} isInteriorAtRequest={isInteriorAtRequest} inBuilding={GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideBuilding == true} inDungeon={GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true} interior='{(GameManager.Instance?.PlayerEnterExit?.Interior ? GameManager.Instance.PlayerEnterExit.Interior.name : "<none>")}' dungeon='{(GameManager.Instance?.PlayerEnterExit?.Dungeon ? GameManager.Instance.PlayerEnterExit.Dungeon.name : "<none>")}'");
-    // Send to server: spawn directly at provided positions
-    pm.CmdCreateFoesWithPositions(
-        positions.ToArray(),
-        foe.FoeType,
-        foe.SpawnCount,
-        MobileReactions.Hostile,
-        false,                 // alliedToPlayer
-        questUID,
-        foeSymbolName,
-        isInteriorAtRequest
-    );
+    LogDbg("client-send", $"foeSymbol='{foeSymbol.Name}' foeResSymbol='{foeSymbolName}' foeType='{foe.FoeType}' spawnCount={foe.SpawnCount} spawnCounterBefore={spawnCounter} spawnMaxTimes={spawnMaxTimes} lastSpawnTime={lastSpawnTime} positionsCount={(positions != null ? positions.Count : 0)} privateBinding={privateQuestBinding} isInteriorAtRequest={isInteriorAtRequest} inBuilding={GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideBuilding == true} inDungeon={GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true} interior='{(GameManager.Instance?.PlayerEnterExit?.Interior ? GameManager.Instance.PlayerEnterExit.Interior.name : "<none>")}' dungeon='{(GameManager.Instance?.PlayerEnterExit?.Dungeon ? GameManager.Instance.PlayerEnterExit.Dungeon.name : "<none>")}'");
+
+    if (privateQuestBinding)
+    {
+        pm.CmdCreatePrivateQuestFoesWithPositions(
+            positions.ToArray(),
+            foe.FoeType,
+            foe.SpawnCount,
+            MobileReactions.Hostile,
+            false,                 // alliedToPlayer
+            questUID,
+            foeSymbolName,
+            isInteriorAtRequest,
+            GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true,
+            0
+        );
+    }
+    else
+    {
+        // Existing Full/shared path.
+        pm.CmdCreateFoesWithPositions(
+            positions.ToArray(),
+            foe.FoeType,
+            foe.SpawnCount,
+            MobileReactions.Hostile,
+            false,                 // alliedToPlayer
+            questUID,
+            foeSymbolName,
+            isInteriorAtRequest
+        );
+    }
 
     // Show the "msg" text on client just like vanilla
     if (msgMessageID != -1)

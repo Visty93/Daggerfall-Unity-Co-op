@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -12,6 +12,8 @@ using UnityEngine;
 using DaggerfallWorkshop;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.Questing;
+using DaggerfallWorkshop.Game.Questing.Actions;
+using DaggerfallWorkshop.Game.Utility.ModSupport;
 using DaggerfallWorkshop.Game.Entity; // Races, Genders
 using DaggerfallWorkshop.Game.Items;
 using DaggerfallWorkshop.Game.Serialization;
@@ -20,6 +22,142 @@ using FullSerializer;
 
 public class QuestNetSync : NetworkBehaviour
 {
+    // =========================================================================
+    // PARTY VIRTUAL SERVER FACADE
+    //
+    // Everything below this block is the original QuestNetSync implementation.
+    // Do not make individual quest paths party-aware.  Instead, make the original
+    // code see the local party leader as its logical server and expose only that
+    // leader's PartyId as "NetworkServer.connections".
+    // =========================================================================
+    public new bool isServer => PartyQuestVirtualAuthority.IsVirtualServer(this);
+    public new bool isClientOnly => PartyQuestVirtualAuthority.IsVirtualClientOnly(this);
+    public new NetworkConnectionToClient connectionToClient =>
+        PartyQuestVirtualAuthority.GetVirtualConnectionToClient(this);
+
+    // Shadows Mirror.NetworkServer only inside QuestNetSync.  The physical Mirror
+    // server remains active underneath as the transport/router.
+    private static class NetworkServer
+    {
+        public static bool active => PartyQuestVirtualAuthority.VirtualServerActive;
+        // VirtualLocalConnection and nested RPC routing can rebuild the backing
+        // party table during a broadcast. Enumerate a snapshot so that those
+        // lookups cannot invalidate any active quest broadcast enumerator.
+        // Preserve the connection objects themselves for identity comparisons.
+        public static Dictionary<int, NetworkConnectionToClient> connections =>
+            new Dictionary<int, NetworkConnectionToClient>(
+                PartyQuestVirtualAuthority.VirtualConnections);
+        public static NetworkConnectionToClient localConnection =>
+            PartyQuestVirtualAuthority.VirtualLocalConnection;
+    }
+
+    // Small read-only bridge used by the separate party quest-loot overlay.  These
+    // helpers expose the original QNS instance mapping/item serializer without changing
+    // any of the existing quest synchronization paths below.
+    public static bool PartyVirtualShouldPublishQuestLoot(ulong questUID)
+    {
+        if (questUID == 0UL || !PartyQuestVirtualAuthority.QuestVirtualizationActive)
+            return false;
+
+        if (GetQuestParticipationMode(questUID) == OptionsMultiplayer.QuestSyncMode.Off ||
+            IsQuestSharingBlacklistedUid(questUID))
+            return false;
+
+        if (GetQuestParticipationMode(questUID) == OptionsMultiplayer.QuestSyncMode.SharedOnly)
+            return HasNetworkMappingForQuestUid(questUID);
+
+        return true;
+    }
+
+    public static bool PartyVirtualTryGetNetworkInstance(ulong questUID, out string instanceId)
+    {
+        instanceId = null;
+        if (questUID == 0UL)
+            return false;
+
+        if (PartyQuestVirtualAuthority.VirtualServerActive &&
+            _srvUid2Inst.TryGetValue(questUID, out instanceId) && !string.IsNullOrEmpty(instanceId))
+            return true;
+        if (_cliUid2Inst.TryGetValue(questUID, out instanceId) && !string.IsNullOrEmpty(instanceId))
+            return true;
+        if (_srvUid2Inst.TryGetValue(questUID, out instanceId) && !string.IsNullOrEmpty(instanceId))
+            return true;
+
+        instanceId = null;
+        return false;
+    }
+
+    public static bool PartyVirtualTryGetLocalQuestUid(string instanceId, out ulong questUID)
+    {
+        questUID = 0UL;
+        if (string.IsNullOrEmpty(instanceId))
+            return false;
+
+        if (PartyQuestVirtualAuthority.VirtualServerActive &&
+            _srvInst2Uid.TryGetValue(instanceId, out questUID) && questUID != 0UL)
+            return true;
+        if (_cliInst2Uid.TryGetValue(instanceId, out questUID) && questUID != 0UL)
+            return true;
+        if (_srvInst2Uid.TryGetValue(instanceId, out questUID) && questUID != 0UL)
+            return true;
+
+        questUID = 0UL;
+        return false;
+    }
+
+    public void PartyVirtualEnsureSpawnMapping(ulong questUID)
+    {
+        if (!isLocalPlayer || GetQuestParticipationMode(questUID) != OptionsMultiplayer.QuestSyncMode.Full ||
+            HasNetworkMappingForQuestUid(questUID) || IsQuestSharingBlacklistedUid(questUID))
+            return;
+        if (isServer)
+        {
+            string status;
+            ShareQuestFromJournalInternal(questUID, out status);
+        }
+        else
+            RespondToQuestStartRequest(questUID);
+    }
+
+    public static string PartyVirtualSerializeQuestItem(DaggerfallUnityItem item)
+    {
+        return BuildQuestItemDataJson(item);
+    }
+
+    public static DaggerfallUnityItem PartyVirtualDeserializeQuestItem(
+        string itemDataJson,
+        ulong localQuestUID,
+        string itemSymbol)
+    {
+        if (string.IsNullOrEmpty(itemDataJson) || localQuestUID == 0UL ||
+            string.IsNullOrEmpty(itemSymbol))
+            return null;
+
+        ItemData_v1 data;
+        if (!FromJson<ItemData_v1>(itemDataJson, out data))
+            return null;
+
+        try
+        {
+            DaggerfallUnityItem item = new DaggerfallUnityItem(data);
+            item.LinkQuestItem(localQuestUID, new Symbol(itemSymbol));
+            TryAssignFreshItemUid(item);
+            return item;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning("[PartyQuestVirtual] Failed to rebuild party quest item: " + ex.Message);
+            return null;
+        }
+    }
+    // vExternalDispatcher7: keep the known-good v4 sharing path. External dispatcher
+    // StartQuest source names are dynamically aliased to the child's actual runtime
+    // QuestName, preventing false "missing child" repair without suppressing networking.
+    // Alias learning is impossible for built-in/vanilla quests.
+    // External mod dispatcher compatibility: mod quest text is pre-scanned when possible
+    // and classified on demand at OnQuestStarted as a lifecycle-safe fallback. Prompt-led
+    // chooser intros using PickOneOf -> nested StartQuest are local-only. Built-in
+    // StreamingAssets/Quests templates are hard-excluded and never structurally inspected.
     // v40: Replicates ItemUsedDo as an exact quest event so a pure client using a
     // watched quest item advances the same target task on host/other participants.
     // Also protects the exact shared-NPC-click task from a stale routine snapshot
@@ -274,14 +412,688 @@ private static readonly System.Collections.Generic.Dictionary<ulong, string> _ra
         "The Qualifying Examination",
     };
 
+    // Generic external-mod dispatcher compatibility.
+    //
+    // IMPORTANT: this is pre-classified from raw mod quest text BEFORE QuestNetSync
+    // subscribes to quest runtime events. That preserves the key property of the old
+    // compatibility helper: the disposable intro quest is already known to be local-only
+    // before any of its prompt/click/task events can enter multiplayer synchronization.
+    //
+    // Built-in StreamingAssets/Quests templates are hard-excluded first and are never
+    // structurally inspected by this system.
+    private static readonly Dictionary<string, bool> _externalDispatcherTemplateCache =
+        new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, string> _externalDispatcherTaskByTemplate =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class ExternalDispatcherPendingChildAlias
+    {
+        public ulong parentUid;
+        public string sourceTarget;
+        public float recordedAtRealtime;
+    }
+
+    // These structures are populated ONLY from positively classified external
+    // disposable dispatchers. Built-in/vanilla quests can never write to them.
+    private static readonly List<ExternalDispatcherPendingChildAlias> _externalDispatcherPendingChildAliases =
+        new List<ExternalDispatcherPendingChildAlias>();
+    private static readonly Dictionary<string, string> _externalDispatcherChildRuntimeAliasByTarget =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    private static bool _externalDispatcherTemplatesScanned = false;
+
+    private static bool IsBuiltInQuestTemplate(string questName)
+    {
+        string normalized = NormalizeQuestTemplateName(questName);
+        if (string.IsNullOrEmpty(normalized))
+            return false;
+
+        try
+        {
+            string builtInPath = Path.Combine(
+                QuestMachine.QuestSourceFolder,
+                normalized + ".txt");
+
+            return File.Exists(builtInPath);
+        }
+        catch
+        {
+            // Fail closed: if source identity cannot be established, never classify
+            // the quest as an external dispatcher.
+            return true;
+        }
+    }
+
+    private static bool IsQuestTaskHeader(string trimmed, out string taskSymbol)
+    {
+        taskSymbol = string.Empty;
+        if (string.IsNullOrEmpty(trimmed))
+            return false;
+
+        const string suffix = " task:";
+        if (!trimmed.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        string candidate = trimmed.Substring(0, trimmed.Length - suffix.Length).Trim();
+        if (string.IsNullOrEmpty(candidate) ||
+            candidate.StartsWith("--", StringComparison.Ordinal))
+            return false;
+
+        taskSymbol = candidate;
+        return true;
+    }
+
+    private static string NormalizeQuestSourceLine(string line)
+    {
+        if (string.IsNullOrEmpty(line))
+            return string.Empty;
+
+        string trimmed = line.Trim();
+        if (string.IsNullOrEmpty(trimmed) ||
+            trimmed.StartsWith("--", StringComparison.Ordinal))
+            return string.Empty;
+
+        return trimmed;
+    }
+
+    private static void AddPromptTaskTargets(
+        string line,
+        HashSet<string> promptTargets)
+    {
+        if (promptTargets == null)
+            return;
+
+        string normalized = NormalizeQuestSourceLine(line);
+        if (string.IsNullOrEmpty(normalized) ||
+            !normalized.StartsWith("prompt ", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        string[] parts =
+            normalized.Split(
+                new char[] { ' ', '\t' },
+                StringSplitOptions.RemoveEmptyEntries);
+
+        // Standard DFU prompt syntax names the destination task immediately after
+        // "yes" and "no". The prompt does not have to live in the quest start-up
+        // block; external intro quests can route start-up -> askplayer -> Prompt.
+        for (int i = 0; i + 1 < parts.Length; i++)
+        {
+            if (string.Equals(parts[i], "yes", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(parts[i], "no", StringComparison.OrdinalIgnoreCase))
+            {
+                string target = parts[i + 1].Trim();
+                if (!string.IsNullOrEmpty(target))
+                    promptTargets.Add(target);
+                i++;
+            }
+        }
+    }
+
+    private static bool TryClassifyExternalDispatcherSource(
+        string questName,
+        string[] sourceLines,
+        out string dispatcherTaskSymbol)
+    {
+        dispatcherTaskSymbol = string.Empty;
+
+        string normalizedQuestName = NormalizeQuestTemplateName(questName);
+        if (string.IsNullOrEmpty(normalizedQuestName) ||
+            sourceLines == null ||
+            sourceLines.Length == 0 ||
+            IsBuiltInQuestTemplate(normalizedQuestName))
+            return false;
+
+        Dictionary<string, List<string>> taskActions =
+            new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        HashSet<string> promptTargets =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        bool inQbn = false;
+        string currentTask = string.Empty;
+
+        for (int i = 0; i < sourceLines.Length; i++)
+        {
+            string raw = sourceLines[i] ?? string.Empty;
+            string trimmed = raw.Trim();
+
+            if (!inQbn)
+            {
+                if (string.Equals(trimmed, "QBN:", StringComparison.OrdinalIgnoreCase))
+                    inQbn = true;
+                continue;
+            }
+
+            string taskSymbol;
+            if (IsQuestTaskHeader(trimmed, out taskSymbol))
+            {
+                currentTask = taskSymbol;
+
+                if (!taskActions.ContainsKey(currentTask))
+                    taskActions[currentTask] = new List<string>();
+
+                continue;
+            }
+
+            string actionLine = NormalizeQuestSourceLine(raw);
+            if (string.IsNullOrEmpty(actionLine))
+                continue;
+
+            // Search prompts anywhere in QBN, not only in the literal start-up block.
+            // Warm-Ashes-style intros reach their chooser through an intermediate
+            // askplayer task.
+            AddPromptTaskTargets(actionLine, promptTargets);
+
+            if (!string.IsNullOrEmpty(currentTask))
+                taskActions[currentTask].Add(actionLine);
+        }
+
+        foreach (string candidate in promptTargets)
+        {
+            List<string> actions;
+            if (!taskActions.TryGetValue(candidate, out actions) ||
+                actions == null ||
+                actions.Count != 2)
+                continue;
+
+            string choiceLine = actions[0];
+            string endLine = actions[1];
+
+            if (!choiceLine.StartsWith("pick one of ", StringComparison.OrdinalIgnoreCase) ||
+                !endLine.StartsWith("end quest", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string[] choiceParts =
+                choiceLine.Split(
+                    new char[] { ' ', '\t' },
+                    StringSplitOptions.RemoveEmptyEntries);
+            if (choiceParts.Length < 4 ||
+                !string.Equals(choiceParts[0], "pick", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(choiceParts[1], "one", StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(choiceParts[2], "of", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            HashSet<string> branchTasks =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool allBranchesMatch = true;
+
+            for (int p = 3; p < choiceParts.Length; p++)
+            {
+                string branchSymbol = choiceParts[p].Trim();
+                if (string.IsNullOrEmpty(branchSymbol) ||
+                    !branchTasks.Add(branchSymbol))
+                    continue;
+
+                List<string> branchActions;
+                if (!taskActions.TryGetValue(branchSymbol, out branchActions) ||
+                    branchActions == null ||
+                    branchActions.Count != 2 ||
+                    !branchActions[0].StartsWith("start quest ", StringComparison.OrdinalIgnoreCase) ||
+                    !branchActions[1].StartsWith("end quest", StringComparison.OrdinalIgnoreCase))
+                {
+                    allBranchesMatch = false;
+                    break;
+                }
+            }
+
+            if (!allBranchesMatch || branchTasks.Count == 0)
+                continue;
+
+            // Whole-quest safety check: every StartQuest in this external intro must
+            // belong to one of the PickOneOf branch tasks above. This prevents a
+            // larger normal mod quest from becoming local-only merely because some
+            // later prompt happens to contain a similar nested-quest chooser.
+            bool hasForeignStartQuest = false;
+            foreach (KeyValuePair<string, List<string>> pair in taskActions)
+            {
+                List<string> lines = pair.Value;
+                if (lines == null)
+                    continue;
+
+                for (int a = 0; a < lines.Count; a++)
+                {
+                    if (!lines[a].StartsWith("start quest ", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (!branchTasks.Contains(pair.Key))
+                    {
+                        hasForeignStartQuest = true;
+                        break;
+                    }
+                }
+
+                if (hasForeignStartQuest)
+                    break;
+            }
+
+            if (hasForeignStartQuest)
+                continue;
+
+            dispatcherTaskSymbol = candidate;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void EnsureExternalDispatcherTemplatesScanned()
+    {
+        if (_externalDispatcherTemplatesScanned)
+            return;
+
+        // Do not latch an empty scan before DFU's mod system is ready.
+        if (ModManager.Instance == null)
+            return;
+
+        Mod[] mods = ModManager.Instance.GetAllMods();
+        if (mods == null || mods.Length == 0)
+            return;
+
+        _externalDispatcherTemplateCache.Clear();
+        _externalDispatcherTaskByTemplate.Clear();
+
+        try
+        {
+            _externalDispatcherTemplatesScanned = true;
+
+            HashSet<string> visitedQuestNames =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            for (int m = 0; m < mods.Length; m++)
+            {
+                Mod mod = mods[m];
+                if (mod == null ||
+                    !mod.Enabled ||
+                    mod.ModInfo == null ||
+                    mod.ModInfo.Contributes == null ||
+                    mod.ModInfo.Contributes.LooseQuestsList == null)
+                    continue;
+
+                string[] questNames = mod.ModInfo.Contributes.LooseQuestsList;
+                for (int q = 0; q < questNames.Length; q++)
+                {
+                    string questName = NormalizeQuestTemplateName(questNames[q]);
+                    if (string.IsNullOrEmpty(questName) ||
+                        !visitedQuestNames.Add(questName))
+                        continue;
+
+                    // Hard wall: DFU itself resolves built-in files before mod quests,
+                    // so a built-in name is never eligible for dispatcher compatibility.
+                    if (IsBuiltInQuestTemplate(questName))
+                    {
+                        _externalDispatcherTemplateCache[questName] = false;
+                        continue;
+                    }
+
+                    TextAsset questAsset;
+                    if (!ModManager.Instance.TryGetAsset(
+                            questName + ".txt",
+                            false,
+                            out questAsset) ||
+                        questAsset == null)
+                    {
+                        _externalDispatcherTemplateCache[questName] = false;
+                        continue;
+                    }
+
+                    string dispatcherTask;
+                    bool isDispatcher =
+                        TryClassifyExternalDispatcherSource(
+                            questName,
+                            ModManager.GetTextAssetLines(questAsset).ToArray(),
+                            out dispatcherTask);
+
+                    _externalDispatcherTemplateCache[questName] = isDispatcher;
+
+                    if (isDispatcher)
+                    {
+                        _externalDispatcherTaskByTemplate[questName] = dispatcherTask;
+
+                        Debug.Log(
+                            $"[QuestNetSync][ExternalDispatcher] Pre-classified external " +
+                            $"quest='{questName}' dispatcherTask='{dispatcherTask}' as local-only.");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Fail closed. A scan problem must never broaden the local-only policy.
+            Debug.LogWarning(
+                "[QuestNetSync][ExternalDispatcher] Pre-scan failed; external dispatcher " +
+                "compatibility disabled for unclassified quests: " + ex.Message);
+        }
+    }
+
+    private static bool TryClassifyExternalDispatcherTemplateOnDemand(
+        string questName,
+        out bool isDispatcher)
+    {
+        isDispatcher = false;
+
+        string normalized = NormalizeQuestTemplateName(questName);
+        if (string.IsNullOrEmpty(normalized))
+            return false;
+
+        // Absolute vanilla wall. Never inspect a built-in quest's structure.
+        if (IsBuiltInQuestTemplate(normalized))
+        {
+            _externalDispatcherTemplateCache[normalized] = false;
+            return true;
+        }
+
+        if (ModManager.Instance == null)
+            return false;
+
+        try
+        {
+            // Read only from installed mod assets. This does not depend on the timing
+            // of GetAllMods()/LooseQuestsList pre-scan and therefore still works when
+            // Mirror starts before ModManager has finished exposing its mod collection.
+            TextAsset questAsset;
+            if (!ModManager.Instance.TryGetAsset(
+                    normalized + ".txt",
+                    false,
+                    out questAsset) ||
+                questAsset == null)
+            {
+                return false;
+            }
+
+            string dispatcherTask;
+            isDispatcher =
+                TryClassifyExternalDispatcherSource(
+                    normalized,
+                    ModManager.GetTextAssetLines(questAsset).ToArray(),
+                    out dispatcherTask);
+
+            _externalDispatcherTemplateCache[normalized] = isDispatcher;
+
+            if (isDispatcher)
+            {
+                _externalDispatcherTaskByTemplate[normalized] = dispatcherTask;
+
+                Debug.Log(
+                    $"[QuestNetSync][ExternalDispatcher] On-demand classified external " +
+                    $"quest='{normalized}' dispatcherTask='{dispatcherTask}' as local-only.");
+            }
+            else if (Debug.isDebugBuild)
+            {
+                Debug.Log(
+                    $"[QuestNetSync][ExternalDispatcher] External quest='{normalized}' " +
+                    $"did not match dispatcher topology (searched Prompt targets anywhere in QBN).");
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning(
+                $"[QuestNetSync][ExternalDispatcher] On-demand classification failed " +
+                $"quest='{normalized}': {ex.Message}");
+            return false;
+        }
+    }
+
+    private static bool IsExternalModDispatcherQuestName(string questName)
+    {
+        string normalized = NormalizeQuestTemplateName(questName);
+        if (string.IsNullOrEmpty(normalized))
+            return false;
+
+        bool classified;
+        if (_externalDispatcherTemplateCache.TryGetValue(
+                normalized,
+                out classified))
+            return classified;
+
+        // Pre-scan is only an optimization. Never rely on its lifecycle timing.
+        EnsureExternalDispatcherTemplatesScanned();
+
+        if (_externalDispatcherTemplateCache.TryGetValue(
+                normalized,
+                out classified))
+            return classified;
+
+        // Exact started-quest fallback. QuestMachine raises OnQuestStarted before the
+        // new quest receives its first Quest.Update(), so classification here still
+        // happens before startup prompt/task actions can execute or be synchronized.
+        bool result;
+        if (TryClassifyExternalDispatcherTemplateOnDemand(
+                normalized,
+                out result))
+            return result;
+
+        return false;
+    }
+
+    private static void RecordExternalDispatcherPendingChildTarget(
+        Quest parentQuest,
+        string sourceTarget)
+    {
+        if (parentQuest == null ||
+            string.IsNullOrEmpty(sourceTarget) ||
+            !IsExternalModDispatcherQuestName(parentQuest.QuestName))
+            return;
+
+        string normalizedTarget = NormalizeQuestTemplateName(sourceTarget);
+        if (string.IsNullOrEmpty(normalizedTarget))
+            return;
+
+        float now = Time.realtimeSinceStartup;
+
+        for (int i = _externalDispatcherPendingChildAliases.Count - 1; i >= 0; i--)
+        {
+            ExternalDispatcherPendingChildAlias pending =
+                _externalDispatcherPendingChildAliases[i];
+
+            if (pending == null ||
+                now - pending.recordedAtRealtime > 8f ||
+                pending.parentUid == parentQuest.UID)
+            {
+                _externalDispatcherPendingChildAliases.RemoveAt(i);
+            }
+        }
+
+        _externalDispatcherPendingChildAliases.Add(
+            new ExternalDispatcherPendingChildAlias
+            {
+                parentUid = parentQuest.UID,
+                sourceTarget = normalizedTarget,
+                recordedAtRealtime = now,
+            });
+
+        if (Debug.isDebugBuild)
+        {
+            Debug.Log(
+                $"[QuestNetSync][ExternalDispatcher] Recorded pending child target " +
+                $"parentUid={parentQuest.UID} parent='{parentQuest.QuestName}' " +
+                $"target='{normalizedTarget}'.");
+        }
+    }
+
+    private static bool ExternalDispatcherBranchHasCompletedStartTarget(
+        Quest parentQuest,
+        string sourceTarget)
+    {
+        if (parentQuest == null || string.IsNullOrEmpty(sourceTarget))
+            return false;
+
+        List<DaggerfallWorkshop.Game.Questing.Task> tasks =
+            GetQuestTasksForActionScan(parentQuest);
+
+        for (int t = 0; t < tasks.Count; t++)
+        {
+            DaggerfallWorkshop.Game.Questing.Task task = tasks[t];
+            if (task == null || !task.IsTriggered || task.Actions == null)
+                continue;
+
+            foreach (IQuestAction action in task.Actions)
+            {
+                string targetName;
+                if (!TryGetStartQuestTargetName(action, out targetName))
+                    continue;
+
+                if (string.Equals(
+                        NormalizeQuestTemplateName(targetName),
+                        NormalizeQuestTemplateName(sourceTarget),
+                        StringComparison.OrdinalIgnoreCase) &&
+                    action.IsComplete)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static void RegisterExternalDispatcherChildRuntimeAlias(Quest startedQuest)
+    {
+        if (startedQuest == null ||
+            string.IsNullOrEmpty(startedQuest.QuestName) ||
+            _externalDispatcherPendingChildAliases.Count == 0)
+            return;
+
+        // A dispatcher itself is not its child.
+        if (IsExternalModDispatcherQuestName(startedQuest.QuestName))
+            return;
+
+        string runtimeName = NormalizeQuestTemplateName(startedQuest.QuestName);
+        if (string.IsNullOrEmpty(runtimeName))
+            return;
+
+        float now = Time.realtimeSinceStartup;
+
+        for (int i = _externalDispatcherPendingChildAliases.Count - 1; i >= 0; i--)
+        {
+            ExternalDispatcherPendingChildAlias pending =
+                _externalDispatcherPendingChildAliases[i];
+
+            if (pending == null || now - pending.recordedAtRealtime > 8f)
+            {
+                _externalDispatcherPendingChildAliases.RemoveAt(i);
+                continue;
+            }
+
+            Quest parentQuest =
+                QuestMachine.Instance != null
+                    ? QuestMachine.Instance.GetQuest(pending.parentUid)
+                    : null;
+
+            if (parentQuest == null ||
+                !IsExternalModDispatcherQuestName(parentQuest.QuestName) ||
+                !ExternalDispatcherBranchHasCompletedStartTarget(
+                    parentQuest,
+                    pending.sourceTarget))
+            {
+                continue;
+            }
+
+            string sourceTarget = NormalizeQuestTemplateName(pending.sourceTarget);
+            if (!string.IsNullOrEmpty(sourceTarget))
+            {
+                _externalDispatcherChildRuntimeAliasByTarget[sourceTarget] =
+                    runtimeName;
+
+                if (Debug.isDebugBuild)
+                {
+                    Debug.Log(
+                        $"[QuestNetSync][ExternalDispatcher] Learned child alias " +
+                        $"sourceTarget='{sourceTarget}' runtimeQuest='{runtimeName}' " +
+                        $"parentUid={pending.parentUid}.");
+                }
+            }
+
+            _externalDispatcherPendingChildAliases.RemoveAt(i);
+            return;
+        }
+    }
+
+    private static bool ExternalDispatcherQuestNamesEquivalent(
+        string left,
+        string right)
+    {
+        string a = NormalizeQuestTemplateName(left);
+        string b = NormalizeQuestTemplateName(right);
+
+        if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
+            return false;
+
+        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        string alias;
+        if (_externalDispatcherChildRuntimeAliasByTarget.TryGetValue(a, out alias) &&
+            string.Equals(
+                NormalizeQuestTemplateName(alias),
+                b,
+                StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (_externalDispatcherChildRuntimeAliasByTarget.TryGetValue(b, out alias) &&
+            string.Equals(
+                NormalizeQuestTemplateName(alias),
+                a,
+                StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
+    }
+
+    private static void PrepareExternalModDispatcherQuest(Quest q)
+    {
+        if (q == null ||
+            !IsExternalModDispatcherQuestName(q.QuestName))
+            return;
+
+        string normalized = NormalizeQuestTemplateName(q.QuestName);
+        string dispatcherTaskSymbol;
+        if (!_externalDispatcherTaskByTemplate.TryGetValue(
+                normalized,
+                out dispatcherTaskSymbol) ||
+            string.IsNullOrEmpty(dispatcherTaskSymbol))
+            return;
+
+        DaggerfallWorkshop.Game.Questing.Task dispatcherTask =
+            q.GetTask(new Symbol(dispatcherTaskSymbol));
+        if (dispatcherTask == null || dispatcherTask.Actions == null)
+            return;
+
+        IQuestAction[] actions = dispatcherTask.Actions.ToArray();
+        if (actions.Length != 2 ||
+            !(actions[0] is PickOneOf))
+            return;
+
+        EndQuest redundantEarlyEnd = actions[1] as EndQuest;
+        if (redundantEarlyEnd == null || redundantEarlyEnd.IsComplete)
+            return;
+
+        // Match the original compatibility behavior exactly: the startup dispatcher
+        // remains local, PickOneOf selects its native child branch, and only the
+        // redundant OUTER EndQuest is consumed. The selected branch's own
+        // StartQuest -> EndQuest pair remains untouched.
+        redundantEarlyEnd.SetComplete();
+
+        Debug.Log(
+            $"[QuestNetSync][ExternalDispatcher] Prepared local dispatcher " +
+            $"uid={q.UID} name='{q.QuestName}' task='{dispatcherTaskSymbol}'.");
+    }
+
     public static bool IsQuestSharingBlacklistedName(string questName)
     {
-        return !string.IsNullOrEmpty(questName) && _questSharingBlacklist.Contains(questName);
+        if (string.IsNullOrEmpty(questName))
+            return false;
+
+        if (_questSharingBlacklist.Contains(questName))
+            return true;
+
+        return IsExternalModDispatcherQuestName(questName);
     }
 
     public static bool IsQuestSharingBlacklisted(Quest q)
     {
-        return q != null && IsQuestSharingBlacklistedName(q.QuestName);
+        return q != null &&
+               (IsQuestSharingBlacklistedName(q.QuestName));
     }
 
     private static bool IsQuestSharingBlacklistedUid(ulong questUID)
@@ -304,6 +1116,239 @@ private static readonly System.Collections.Generic.Dictionary<ulong, string> _ra
 
         if (Debug.isDebugBuild)
             Debug.Log($"[QuestNetSync][LocalOnly] Suppressed multiplayer quest sync source={source} uid={q.UID} name='{q.QuestName}'");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Quest synchronization policy.
+    // Full preserves the historical automatic behaviour. SharedOnly leaves new root
+    // quests private until journal Share promotes them, while children scheduled from
+    // an already-networked parent inherit that network participation. Off never creates
+    // new quest mappings from local quest starts.
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Keep an existing quest's participation when its party changes the mode for new quests.
+    // Session-only, like the existing shared-quest resume ledger; retained across save loads.
+    private static readonly Dictionary<string, OptionsMultiplayer.QuestSyncMode> _questParticipationModes =
+        new Dictionary<string, OptionsMultiplayer.QuestSyncMode>(StringComparer.OrdinalIgnoreCase);
+
+    public static void CaptureExistingQuestPolicies(OptionsMultiplayer.QuestSyncMode previousMode)
+    {
+        if (QuestMachine.Instance == null) return;
+        foreach (ulong uid in QuestMachine.Instance.GetAllActiveQuests() ?? new ulong[0])
+        {
+            Quest q = QuestMachine.Instance.GetQuest(uid);
+            if (q == null || q.QuestComplete || q.QuestTombstoned) continue;
+            string key = MakeSharedOnlyNetworkedQuestKey(q);
+            if (!_questParticipationModes.ContainsKey(key)) _questParticipationModes[key] = previousMode;
+            if (HasNetworkMappingForQuestUid(uid)) MarkSharedOnlyNetworkedQuest(q);
+        }
+    }
+
+    private static OptionsMultiplayer.QuestSyncMode GetQuestParticipationMode(ulong uid)
+    {
+        return GetQuestParticipationMode(QuestMachine.Instance != null ? QuestMachine.Instance.GetQuest(uid) : null);
+    }
+
+    private static OptionsMultiplayer.QuestSyncMode GetQuestParticipationMode(Quest q)
+    {
+        if (q == null) return OptionsMultiplayer.questSyncMode;
+        // Explicit Share promotes a previously private quest regardless of its original mode.
+        if (HasNetworkMappingForQuestUid(q.UID) || WasSharedOnlyNetworkedQuest(q))
+            return OptionsMultiplayer.QuestSyncMode.Full;
+        string key = MakeSharedOnlyNetworkedQuestKey(q);
+        OptionsMultiplayer.QuestSyncMode mode;
+        if (!_questParticipationModes.TryGetValue(key, out mode))
+            _questParticipationModes[key] = mode = OptionsMultiplayer.questSyncMode;
+        return mode;
+    }
+
+    private sealed class PendingSharedOnlyChildStart
+    {
+        public int count;
+        public float expiresAtRealtime;
+    }
+
+    private static readonly Dictionary<string, PendingSharedOnlyChildStart>
+        _pendingSharedOnlyChildStarts =
+            new Dictionary<string, PendingSharedOnlyChildStart>(StringComparer.OrdinalIgnoreCase);
+
+    // SharedOnly save/load resume needs to remember which local quest copies were
+    // deliberately promoted before load hygiene drops the runtime instance mappings.
+    // This set is runtime/session-only and is cleared when multiplayer stops.
+    private static readonly HashSet<string> _sharedOnlyNetworkedQuestKeys =
+        new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    private static string MakeSharedOnlyNetworkedQuestKey(Quest q)
+    {
+        if (q == null)
+            return string.Empty;
+
+        return q.UID.ToString() + "|" + NormalizeQuestTemplateName(q.QuestName);
+    }
+
+    private static void MarkSharedOnlyNetworkedQuest(Quest q)
+    {
+        if (q == null)
+            return;
+
+        string key = MakeSharedOnlyNetworkedQuestKey(q);
+        if (!string.IsNullOrEmpty(key))
+            _sharedOnlyNetworkedQuestKeys.Add(key);
+    }
+
+    private static bool WasSharedOnlyNetworkedQuest(Quest q)
+    {
+        if (q == null)
+            return false;
+
+        return _sharedOnlyNetworkedQuestKeys.Contains(MakeSharedOnlyNetworkedQuestKey(q));
+    }
+
+    public static bool HasNetworkMappingForQuestUid(ulong questUID)
+    {
+        if (questUID == 0UL)
+            return false;
+
+        return _srvUid2Inst.ContainsKey(questUID) || _cliUid2Inst.ContainsKey(questUID);
+    }
+
+    public static bool IsQuestMappedForLocalNetworkSync(Quest q)
+    {
+        return q != null && HasNetworkMappingForQuestUid(q.UID);
+    }
+
+    public static bool ShouldUsePrivateQuestFoeBinding(Quest q)
+    {
+        if (q == null || GetQuestParticipationMode(q) == OptionsMultiplayer.QuestSyncMode.Full)
+            return false;
+
+        if (GetQuestParticipationMode(q) == OptionsMultiplayer.QuestSyncMode.Off)
+            return true;
+
+        return !HasNetworkMappingForQuestUid(q.UID);
+    }
+
+    public static bool ShouldBroadcastQuestFoeBinding(Quest q)
+    {
+        // Full must retain the old behaviour exactly, including the existing quest-foe
+        // broadcast decisions made by GameObjectHelper/PlayerMultiplayer.
+        if (GetQuestParticipationMode(q) == OptionsMultiplayer.QuestSyncMode.Full)
+            return true;
+        if (GetQuestParticipationMode(q) == OptionsMultiplayer.QuestSyncMode.Off)
+            return false;
+
+        return q != null &&
+               !IsQuestSharingBlacklisted(q) &&
+               HasNetworkMappingForQuestUid(q.UID);
+    }
+
+    // Private quest loot must remain local to the player who owns the private quest.
+    // Full mode is intentionally an unconditional false so the established shared
+    // quest-item/corpse-loot pipeline is unaffected by this decision.
+    public static bool ShouldKeepQuestLootLocalOnly(ulong questUID)
+    {
+        if (questUID == 0UL)
+            return false;
+
+        // Never alter ordinary single-player item behavior just because the saved MP
+        // preference happens to be SharedOnly/Off.
+        if (!Mirror.NetworkClient.active && !Mirror.NetworkServer.active)
+            return false;
+
+        if (GetQuestParticipationMode(questUID) == OptionsMultiplayer.QuestSyncMode.Full)
+            return false;
+
+        if (GetQuestParticipationMode(questUID) == OptionsMultiplayer.QuestSyncMode.Off)
+            return true;
+
+        // SharedOnly: the mapping is the promotion boundary. Before manual Share the
+        // item stays requester-local; after Share it uses normal shared quest loot.
+        return !HasNetworkMappingForQuestUid(questUID);
+    }
+
+    private static bool ShouldNetworkQuestEvent(ulong questUID)
+    {
+        // Full deliberately keeps the historical event paths untouched. In the two
+        // opt-in private modes, only a quest that has an actual network mapping may
+        // emit quest interaction Commands/RPCs. This prevents a private quest UID from
+        // being interpreted against another player's QuestMachine by the host.
+        if (GetQuestParticipationMode(questUID) == OptionsMultiplayer.QuestSyncMode.Full)
+            return true;
+        if (GetQuestParticipationMode(questUID) == OptionsMultiplayer.QuestSyncMode.Off)
+            return false;
+
+        return HasNetworkMappingForQuestUid(questUID);
+    }
+
+    private static void QueueSharedOnlyChildStart(string childQuestName)
+    {
+        string key = NormalizeQuestTemplateName(childQuestName);
+        if (string.IsNullOrEmpty(key))
+            return;
+
+        float now = Time.realtimeSinceStartup;
+        PendingSharedOnlyChildStart pending;
+        if (!_pendingSharedOnlyChildStarts.TryGetValue(key, out pending) ||
+            pending == null || pending.expiresAtRealtime < now)
+        {
+            pending = new PendingSharedOnlyChildStart();
+            _pendingSharedOnlyChildStarts[key] = pending;
+        }
+
+        pending.count++;
+        pending.expiresAtRealtime = now + 5f;
+    }
+
+    public static void NotifyNestedQuestScheduled(Quest parentQuest, string childQuestName)
+    {
+        if (parentQuest == null ||
+            !HasNetworkMappingForQuestUid(parentQuest.UID))
+            return;
+
+        QueueSharedOnlyChildStart(childQuestName);
+
+        if (Debug.isDebugBuild)
+            Debug.Log($"[QuestNetSync][SharedOnly] Child '{NormalizeQuestTemplateName(childQuestName)}' inherits sync from mapped parent uid={parentQuest.UID} name='{parentQuest.QuestName}'.");
+    }
+
+    private static bool ConsumeSharedOnlyChildStart(Quest q)
+    {
+        if (q == null)
+            return false;
+
+        string key = NormalizeQuestTemplateName(q.QuestName);
+        PendingSharedOnlyChildStart pending;
+        if (string.IsNullOrEmpty(key) || !_pendingSharedOnlyChildStarts.TryGetValue(key, out pending) || pending == null)
+            return false;
+
+        if (pending.expiresAtRealtime < Time.realtimeSinceStartup || pending.count <= 0)
+        {
+            _pendingSharedOnlyChildStarts.Remove(key);
+            return false;
+        }
+
+        pending.count--;
+        if (pending.count <= 0)
+            _pendingSharedOnlyChildStarts.Remove(key);
+
+        return true;
+    }
+
+    private static bool ShouldAutomaticallyNetworkStartedQuest(Quest q)
+    {
+        if (ConsumeSharedOnlyChildStart(q)) return true;
+        switch (GetQuestParticipationMode(q))
+        {
+            case OptionsMultiplayer.QuestSyncMode.Full:
+                return true;
+            case OptionsMultiplayer.QuestSyncMode.Off:
+                return false;
+            case OptionsMultiplayer.QuestSyncMode.SharedOnly:
+                if (q != null && HasNetworkMappingForQuestUid(q.UID))
+                    return true;
+                return false;
+            default:
+                return true;
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -511,6 +1556,12 @@ private static readonly System.Collections.Generic.Dictionary<ulong, string> _ra
     // Server state
     // ─────────────────────────────────────────────────────────────────────────────
     private static int serverHookRefs = 0;
+    // Server QuestMachine events are process-static, while QuestNetSync lives on each
+    // network player object. Never subscribe an instance method directly here: the
+    // first player object can be destroyed before the last server-side player object,
+    // leaving QuestMachine with a delegate to a destroyed MonoBehaviour. Static relays
+    // keep the event delegate stable and resolve a live server QuestNetSync at call time.
+    private static QuestNetSync serverHookOwner = null;
     private static int _srvSuppressStartDepth = 0; // suppress Srv_OnQuestStarted while reconstructing from client packet
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -1037,11 +2088,16 @@ private static readonly System.Collections.Generic.Dictionary<ulong, string> _ra
 
 public override void OnStartServer()
     {
+        EnsureExternalDispatcherTemplatesScanned();
+
+        if (serverHookOwner == null || !serverHookOwner || !serverHookOwner.isServer)
+            serverHookOwner = this;
+
         if (serverHookRefs++ == 0)
         {
-            QuestMachine.OnQuestStarted += Srv_OnQuestStarted;
-            QuestMachine.OnQuestEnded   += Srv_OnQuestEnded;
-            QuestMachine.OnTick         += Srv_OnTick;
+            QuestMachine.OnQuestStarted += Srv_OnQuestStartedRelay;
+            QuestMachine.OnQuestEnded   += Srv_OnQuestEndedRelay;
+            QuestMachine.OnTick         += Srv_OnTickRelay;
         }
 
         ScheduleLegacyQuestChainSaveRepair("server-start");
@@ -1051,11 +2107,22 @@ public override void OnStartServer()
     {
         _serverStartPacketAssemblies.Clear();
 
-        if (--serverHookRefs == 0)
+        if (object.ReferenceEquals(serverHookOwner, this))
+            serverHookOwner = null;
+
+        // Be defensive against duplicate/late Mirror stop callbacks. A negative refcount
+        // would prevent a later re-host from ever reinstalling the server hooks.
+        if (serverHookRefs > 0)
+            serverHookRefs--;
+
+        if (serverHookRefs == 0)
         {
-            QuestMachine.OnQuestStarted -= Srv_OnQuestStarted;
-            QuestMachine.OnQuestEnded   -= Srv_OnQuestEnded;
-            QuestMachine.OnTick         -= Srv_OnTick;
+            // These are static relay delegates, so the final server object can always
+            // remove the exact delegates that were installed by the first server object.
+            QuestMachine.OnQuestStarted -= Srv_OnQuestStartedRelay;
+            QuestMachine.OnQuestEnded   -= Srv_OnQuestEndedRelay;
+            QuestMachine.OnTick         -= Srv_OnTickRelay;
+            serverHookOwner = null;
 
             _srvUid2Inst.Clear();
             _srvInst2Uid.Clear();
@@ -1091,6 +2158,9 @@ public override void OnStartServer()
             _promptChoiceSayBypassTasks.Clear();
             _clientDeferredNestedStarts.Clear();
             _clientApprovedNestedStarts.Clear();
+            _pendingSharedOnlyChildStarts.Clear();
+            _sharedOnlyNetworkedQuestKeys.Clear();
+            _questParticipationModes.Clear();
             _pendingScenePersonHandoffsByChild.Clear();
             _suppressedScenePersonHandoffBehaviours.Clear();
             _promptChoiceBranchExecutionDepth = 0;
@@ -1107,12 +2177,19 @@ public override void OnStartServer()
             _reportedLocalFoeLootKeys.Clear();
             _localInventoryUidBaselineReady = false;
             _consumedTotingQuestItemKeys.Clear();
+            _externalDispatcherTemplateCache.Clear();
+            _externalDispatcherTaskByTemplate.Clear();
+            _externalDispatcherPendingChildAliases.Clear();
+            _externalDispatcherChildRuntimeAliasByTarget.Clear();
+            _externalDispatcherTemplatesScanned = false;
             _nextCurrentSiteQuestResourceRefreshTime = 0f;
         }
     }
 
     public override void OnStartLocalPlayer()
     {
+        EnsureExternalDispatcherTemplatesScanned();
+
         _localNetId = netId;
         LocalInstance = this;
         if (Debug.isDebugBuild) Debug.Log($"[QuestNetSync] Local player netId={_localNetId}");
@@ -1154,6 +2231,9 @@ public override void OnStartServer()
             _promptChoiceSayBypassTasks.Clear();
             _clientDeferredNestedStarts.Clear();
             _clientApprovedNestedStarts.Clear();
+            _pendingSharedOnlyChildStarts.Clear();
+            _sharedOnlyNetworkedQuestKeys.Clear();
+            _questParticipationModes.Clear();
             _pendingScenePersonHandoffsByChild.Clear();
             _suppressedScenePersonHandoffBehaviours.Clear();
             _promptChoiceBranchExecutionDepth = 0;
@@ -1170,6 +2250,11 @@ public override void OnStartServer()
             _consumedTotingQuestItemKeys.Clear();
             _physicalQuestInventoryItemByKey.Clear();
             _permanentQuestItemKeys.Clear();
+            _externalDispatcherTemplateCache.Clear();
+            _externalDispatcherTaskByTemplate.Clear();
+            _externalDispatcherPendingChildAliases.Clear();
+            _externalDispatcherChildRuntimeAliasByTarget.Clear();
+            _externalDispatcherTemplatesScanned = false;
 
             if (object.ReferenceEquals(LocalInstance, this))
                 LocalInstance = null;
@@ -1358,6 +2443,7 @@ public override void OnStartServer()
         _promptChoiceSayBypassTasks.Clear();
         _clientDeferredNestedStarts.Clear();
         _clientApprovedNestedStarts.Clear();
+        _pendingSharedOnlyChildStarts.Clear();
         _pendingScenePersonHandoffsByChild.Clear();
         _suppressedScenePersonHandoffBehaviours.Clear();
         _promptChoiceBranchExecutionDepth = 0;
@@ -1466,6 +2552,9 @@ public override void OnStartServer()
                 continue;
             if (IsQuestSharingBlacklisted(q))
                 continue;
+            if (GetQuestParticipationMode(q) != OptionsMultiplayer.QuestSyncMode.Full &&
+                !WasSharedOnlyNetworkedQuest(q))
+                continue;
 
             result.Add(new ActiveQuestSummaryDTO
             {
@@ -1499,6 +2588,9 @@ public override void OnStartServer()
                 continue;
             if (IsQuestSharingBlacklisted(serverQuest))
                 continue;
+            if (GetQuestParticipationMode(serverQuest) != OptionsMultiplayer.QuestSyncMode.Full &&
+                !WasSharedOnlyNetworkedQuest(serverQuest))
+                continue;
 
             if (!string.Equals(serverQuest.QuestName, summary.questName, StringComparison.Ordinal))
                 continue;
@@ -1514,6 +2606,7 @@ public override void OnStartServer()
                 _srvUid2Inst[summary.uid] = inst;
                 _srvInst2Uid[inst] = summary.uid;
                 _srvQuestObjectByUid[summary.uid] = serverQuest;
+                MarkSharedOnlyNetworkedQuest(serverQuest);
 
                 _srvLastTasks[inst] = serverQuest.GetTaskStates();
                 _srvLastLogs[inst] = new HashSet<int>((serverQuest.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
@@ -1572,6 +2665,9 @@ public override void OnStartServer()
             return;
         if (IsQuestSharingBlacklisted(localQuest))
             return;
+        if (GetQuestParticipationMode(localQuest) != OptionsMultiplayer.QuestSyncMode.Full &&
+            !WasSharedOnlyNetworkedQuest(localQuest))
+            return;
 
         if (!string.Equals(localQuest.QuestName, questName, StringComparison.Ordinal))
             return;
@@ -1579,6 +2675,7 @@ public override void OnStartServer()
         _cliInst2Uid[instanceId] = uid;
         _cliUid2Inst[uid] = instanceId;
         _cliQuestObjectByUid[uid] = localQuest;
+        MarkSharedOnlyNetworkedQuest(localQuest);
         _startedInst.Add(instanceId);
 
         _cliLastTasks[instanceId] = localQuest.GetTaskStates();
@@ -1596,6 +2693,48 @@ public override void OnStartServer()
 
         if (Debug.isDebugBuild)
             Debug.Log($"[QuestNetSync] Resumed loaded quest mapping on client uid={uid} name={questName} inst={instanceId}");
+    }
+
+    private static QuestNetSync ResolveLiveServerHookOwner()
+    {
+        if (serverHookOwner != null && serverHookOwner && serverHookOwner.isServer &&
+            serverHookOwner.isActiveAndEnabled)
+            return serverHookOwner;
+
+        serverHookOwner = null;
+        QuestNetSync[] instances = UnityEngine.Object.FindObjectsOfType<QuestNetSync>();
+        for (int i = 0; i < instances.Length; i++)
+        {
+            QuestNetSync candidate = instances[i];
+            if (candidate != null && candidate && candidate.isServer && candidate.isActiveAndEnabled)
+            {
+                serverHookOwner = candidate;
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static void Srv_OnQuestStartedRelay(Quest q)
+    {
+        QuestNetSync owner = ResolveLiveServerHookOwner();
+        if (owner != null)
+            owner.Srv_OnQuestStarted(q);
+    }
+
+    private static void Srv_OnQuestEndedRelay(Quest q)
+    {
+        QuestNetSync owner = ResolveLiveServerHookOwner();
+        if (owner != null)
+            owner.Srv_OnQuestEnded(q);
+    }
+
+    private static void Srv_OnTickRelay()
+    {
+        QuestNetSync owner = ResolveLiveServerHookOwner();
+        if (owner != null)
+            owner.Srv_OnTick();
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -1663,6 +2802,9 @@ private void Srv_OnQuestStarted(Quest q)
         if (IsQuestNetSyncPausedForLoad()) return;
         if (q == null) return;
 
+        RegisterExternalDispatcherChildRuntimeAlias(q);
+        PrepareExternalModDispatcherQuest(q);
+
         if (IsQuestSharingBlacklisted(q))
         {
             LogQuestSharingBlacklisted(q, "Srv_OnQuestStarted");
@@ -1677,27 +2819,75 @@ private void Srv_OnQuestStarted(Quest q)
         _suppressClientQuestEndReportUids.Remove(q.UID);
 
 if (!isServer) return;
+
+        // Keep Full mode on the historical code path verbatim. The opt-in modes below
+        // are deliberately separated so their private-quest policy cannot subtly change
+        // the existing automatic quest synchronization behaviour.
+        if (GetQuestParticipationMode(q) == OptionsMultiplayer.QuestSyncMode.Full)
+        {
+            MarkQuestLocalStarted(q.UID);
+            // Capture the actual reached parent branch before acknowledgement marks other
+            // possible StartQuest actions complete. Imported starts keep their existing path.
+            if (_srvSuppressStartDepth == 0)
+                BeginHostScenePersonHandoff(q);
+            AcknowledgeNetworkQuestStartInLocalParents(q, "server-quest-start");
+            if (_srvSuppressStartDepth > 0) return; // reconstructing from client packet
+            Srv_PruneToActive();
+            if (_srvUid2Inst.ContainsKey(q.UID))
+            {
+                // UID can be reused after loading an earlier save; drop stale mapping and continue.
+                Srv_RemoveMappingByUid(q.UID);
+            }
+
+            string fullInst = Guid.NewGuid().ToString("N");
+            _srvUid2Inst[q.UID] = fullInst;
+            _srvInst2Uid[fullInst] = q.UID;
+            _srvQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
+
+            _srvLastTasks[fullInst] = q.GetTaskStates();
+            _srvLastLogs[fullInst] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
+            _srvLastItems[fullInst] = CaptureItemStates(q);
+            _srvLastPersons[fullInst] = BuildPersons(q);
+            _srvLastPlaces[fullInst] = BuildPlaces(q);
+            _srvLastFoes[fullInst] = BuildFoes(q);
+
+            StartCoroutine(Srv_SendStartPacketAfterDelay(q, fullInst));
+            return;
+        }
+
         MarkQuestLocalStarted(q.UID);
-        // Capture the actual reached parent branch before acknowledgement marks other
-        // possible StartQuest actions complete. Imported starts keep their existing path.
-        if (_srvSuppressStartDepth == 0)
-            BeginHostScenePersonHandoff(q);
+
+        // Reconstructed/imported starts already have an authoritative network packet.
+        // Their mapping is registered by the packet receiver after this callback.
+        if (_srvSuppressStartDepth > 0)
+        {
+            AcknowledgeNetworkQuestStartInLocalParents(q, "server-quest-start");
+            return;
+        }
+
+        if (!ShouldAutomaticallyNetworkStartedQuest(q))
+        {
+            if (Debug.isDebugBuild)
+                Debug.Log($"[QuestNetSync][Private] Server left local quest unmapped uid={q.UID} name='{q.QuestName}' mode={GetQuestParticipationMode(q)}");
+            return;
+        }
+
+        BeginHostScenePersonHandoff(q);
         AcknowledgeNetworkQuestStartInLocalParents(q, "server-quest-start");
-        if (_srvSuppressStartDepth > 0) return; // reconstructing from client packet
         Srv_PruneToActive();
         if (_srvUid2Inst.ContainsKey(q.UID))
-        {
-            // UID can be reused after loading an earlier save; drop stale mapping and continue.
             Srv_RemoveMappingByUid(q.UID);
-        }
 
         string inst = Guid.NewGuid().ToString("N");
         _srvUid2Inst[q.UID] = inst;
-        _srvInst2Uid[inst]  = q.UID;
+        _srvInst2Uid[inst] = q.UID;
         _srvQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
+        MarkSharedOnlyNetworkedQuest(q);
 
         _srvLastTasks[inst] = q.GetTaskStates();
-        _srvLastLogs[inst]  = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
+        _srvLastLogs[inst] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
         _srvLastItems[inst] = CaptureItemStates(q);
         _srvLastPersons[inst] = BuildPersons(q);
         _srvLastPlaces[inst] = BuildPlaces(q);
@@ -2154,6 +3344,9 @@ if (!isServer) return;
         if (IsQuestNetSyncPausedForLoad()) return;
         if (!isServer || q == null) return;
         if (IsQuestSharingBlacklisted(q)) return;
+        if (GetQuestParticipationMode(q) != OptionsMultiplayer.QuestSyncMode.Full &&
+            !_srvUid2Inst.ContainsKey(q.UID))
+            return;
         MarkQuestLocalStarted(q.UID);
 
         // A final "when ..." task can already be true while its MakePermanent action
@@ -2494,19 +3687,23 @@ if (!isServer) return;
                 bool mappedElsewhere = _cliUid2Inst.TryGetValue(existingLocalQuest.UID, out otherInstance) &&
                     !string.Equals(otherInstance, pkt.instanceId, StringComparison.Ordinal);
 
-                // If this local quest was not already attached to another network
-                // instance, bind it so future sparse progress works normally. Either
-                // way, never apply this one-time snapshot to an existing quest.
+                // A quest already bound to THIS network instance is the same shared quest.
+                // An unmapped matching local quest can also be rebound after load/reconnect.
+                // But a matching quest bound to a DIFFERENT live instance is a separate
+                // repeated quest of the same template and must not suppress this new share.
                 if (!mappedElsewhere)
                 {
                     RegisterClientQuestMapping(pkt.instanceId, existingLocalQuest);
                     if (pkt.takerNetId != 0U)
                         _questTakerByUid[existingLocalQuest.UID] = pkt.takerNetId;
+
+                    if (Debug.isDebugBuild)
+                        Debug.Log($"[QuestNetSync][MissingOnlyShare] Existing local quest rejected catch-up state localUid={existingLocalQuest.UID} inst={pkt.instanceId} previousInst='{otherInstance ?? "<none>"}' quest='{pkt.questName}'");
+                    return;
                 }
 
                 if (Debug.isDebugBuild)
-                    Debug.Log($"[QuestNetSync][MissingOnlyShare] Existing local quest rejected catch-up state localUid={existingLocalQuest.UID} inst={pkt.instanceId} previousInst='{otherInstance ?? "<none>"}' quest='{pkt.questName}'");
-                return;
+                    Debug.Log($"[QuestNetSync][RepeatedManualShare] Similar local quest uid={existingLocalQuest.UID} is already mapped to different inst='{otherInstance}'. Allowing new inst={pkt.instanceId} quest='{pkt.questName}'.");
             }
         }
 
@@ -2585,12 +3782,11 @@ if (!isServer) return;
                      TryFindAnyLocalQuestByFingerprint(pkt, out sameGeneratedQuest)) &&
                     sameGeneratedQuest != null &&
                     (!_cliUid2Inst.TryGetValue(sameGeneratedQuest.UID, out sameGeneratedMappedInst) ||
-                     string.Equals(sameGeneratedMappedInst, pkt.instanceId, StringComparison.Ordinal) ||
-                     IsManualShareInstanceId(sameGeneratedMappedInst)))
+                     string.Equals(sameGeneratedMappedInst, pkt.instanceId, StringComparison.Ordinal)))
                 {
-                    // Runtime mapping was lost by disconnect/load, or a new manual share
-                    // instanceId was generated after load. The same generated quest is already
-                    // present locally. Bind only and stop here: do not import a duplicate, do not
+                    // Runtime mapping was lost by disconnect/load and this same generated quest is
+                    // currently unmapped (or already belongs to this exact instance). Bind only
+                    // and stop here: do not import a duplicate, do not
                     // grant delivery/fake-gold items again, and do not overwrite local progress.
                     RegisterClientQuestMapping(pkt.instanceId, sameGeneratedQuest);
                     if (Debug.isDebugBuild)
@@ -5013,6 +6209,8 @@ if (!isServer) return;
             return;
         if (IsQuestSharingBlacklistedUid(questUID))
             return;
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
 
         // If this local ClickedNpc was caused by a remote SetPlayerClicked() replay,
         // do not echo the click back to the network.
@@ -5567,14 +6765,19 @@ if (!isServer) return;
             return;
         }
 
-        inst.CmdPromptChoice(
-            instanceId,
-            questUID,
-            ownerTaskSymbol,
-            promptMessageId,
-            selectedTaskSymbol,
-            _localNetId);
+        if (ShouldNetworkQuestEvent(questUID))
+        {
+            inst.CmdPromptChoice(
+                instanceId,
+                questUID,
+                ownerTaskSymbol,
+                promptMessageId,
+                selectedTaskSymbol,
+                _localNetId);
+        }
 
+        // This is local post-choice repair as well as a shared-quest helper, so keep it
+        // for private quests even when no network event is emitted.
         inst.StartCoroutine(
             inst.CoRefreshPromptChoicePlacedItems(questUID));
     }
@@ -6458,6 +7661,9 @@ if (!isServer) return;
         // real clicked world item, not from taking reward loot out of the reward window.
         MarkQuestItemClickPickupAllowed(questUID, itemSymbol);
 
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
+
         QuestNetSync inst = LocalInstance;
         if (inst == null || !inst.isLocalPlayer || !inst.isClient)
             return;
@@ -6626,6 +7832,9 @@ if (!isServer) return;
         {
             QueuePendingQuestInventoryChange(questUID, itemSymbol, inInventory, itemDataJson, "local-source-quest-not-ready");
         }
+
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
 
         QuestNetSync inst = LocalInstance;
         if (inst == null || !inst.isLocalPlayer || !inst.isClient)
@@ -6810,6 +8019,8 @@ if (!isServer) return;
             string.IsNullOrEmpty(itemSymbol) ||
             string.IsNullOrEmpty(targetTaskSymbol) ||
             IsQuestSharingBlacklistedUid(questUID))
+            return;
+        if (!ShouldNetworkQuestEvent(questUID))
             return;
 
         QuestNetSync inst = GetActualLocalQuestSync();
@@ -7729,6 +8940,9 @@ if (!isServer) return;
         // this inventory entry and send a dedicated quest-drop side-effect to the others.
         RemovePickedQuestItemKey(MakeQuestItemInventoryKey(questUID, itemSymbol));
 
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
+
         QuestNetSync inst = LocalInstance;
         if (inst == null || !inst.isLocalPlayer || !inst.isClient)
             return;
@@ -8245,6 +9459,9 @@ if (!isServer) return;
         // from the previously completed run.
         string appliedKey = MakeTotingClickApplyKey(questUID, itemSymbol, personSymbol);
         _remotePersonClicksApplied.Remove(appliedKey);
+
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
 
         QuestNetSync inst = LocalInstance;
         if (inst == null || !inst.isLocalPlayer || !inst.isClient)
@@ -8803,6 +10020,9 @@ if (!isServer) return;
         string key = MakeLocationRevealKey(questUID, placeSymbol);
         _remoteLocationRevealsApplied.Remove(key);
 
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
+
         QuestNetSync inst = LocalInstance;
         if (inst == null || !inst.isLocalPlayer || !inst.isClient)
             return;
@@ -8895,6 +10115,9 @@ if (!isServer) return;
             }
             return;
         }
+
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
 
         // Do not suppress local PcAt reports based on previous remote PcAt state.
         // PcAt is player-position driven and save/load can roll the quest back to
@@ -9051,6 +10274,8 @@ if (!isServer) return;
             return;
         if (IsQuestSharingBlacklistedUid(questUID))
             return;
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
 
         string key = MakeEscortFaceKey(questUID, personSymbol, foeSymbol);
         if (_remoteEscortFacesApplied.Contains(key))
@@ -9132,6 +10357,9 @@ if (!isServer) return;
         if (IsQuestNetSyncPausedForLoad()) return;
         if (q == null) return;
 
+        RegisterExternalDispatcherChildRuntimeAlias(q);
+        PrepareExternalModDispatcherQuest(q);
+
         if (IsQuestSharingBlacklisted(q))
         {
             LogQuestSharingBlacklisted(q, "Cli_OnQuestStarted");
@@ -9143,32 +10371,80 @@ if (!isServer) return;
         _suppressClientQuestEndReportUids.Remove(q.UID);
         _clientQuestEndReportedUids.Remove(q.UID);
 
-        // Even when this quest was started by a local DFU parent action, every other
-        // matching parent branch must now regard the child as already started.
-        AcknowledgeNetworkQuestStartInLocalParents(q, "client-quest-start");
+        // Keep Full mode on the historical code path. This ordering intentionally
+        // matches the previous implementation, including parent acknowledgement before
+        // the pure-client check and before MarkQuestLocalStarted().
+        if (GetQuestParticipationMode(q) == OptionsMultiplayer.QuestSyncMode.Full)
+        {
+            // Even when this quest was started by a local DFU parent action, every other
+            // matching parent branch must now regard the child as already started.
+            AcknowledgeNetworkQuestStartInLocalParents(q, "client-quest-start");
 
 if (!isClientOnly) return;
+            MarkQuestLocalStarted(q.UID);
+
+            // hard echo suppression while applying network start
+            if (_suppressStartDepth > 0) return;
+
+            // legacy one-shot by name
+            if (_suppressStartByName.Remove(q.QuestName)) return;
+
+            // Client generates quest locally (correct area/context) and sends the full start state to the server.
+            // Server will reconstruct and rebroadcast to everyone, including this client (which will just bind).
+            string fullInst = Guid.NewGuid().ToString("N");
+
+            // Pre-register mapping so our own RpcStart echo never triggers a local StartQuest.
+            _cliInst2Uid[fullInst] = q.UID;
+            _cliUid2Inst[q.UID] = fullInst;
+            _cliLastTasks[fullInst] = q.GetTaskStates();
+            _cliLastLogs[fullInst] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
+            _cliLastItems[fullInst] = CaptureItemStates(q);
+            _cliLastPersons[fullInst] = BuildPersons(q);
+            _cliLastFoes[fullInst] = BuildFoes(q);
+            _cliQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
+
+            StartCoroutine(Cli_SendStartPacketAfterDelay(q, fullInst));
+            return;
+        }
+
+        // Listen-host quest starts are handled by the server hook above in the new modes.
+        if (!isClientOnly) return;
         MarkQuestLocalStarted(q.UID);
 
-        // hard echo suppression while applying network start
-        if (_suppressStartDepth > 0) return;
+        // Network-applied starts keep parent acknowledgement but do not echo a new start.
+        if (_suppressStartDepth > 0)
+        {
+            AcknowledgeNetworkQuestStartInLocalParents(q, "client-quest-start");
+            return;
+        }
 
-        // legacy one-shot by name
-        if (_suppressStartByName.Remove(q.QuestName)) return;
+        if (_suppressStartByName.Remove(q.QuestName))
+        {
+            AcknowledgeNetworkQuestStartInLocalParents(q, "client-quest-start");
+            return;
+        }
 
-        // NEW: client generates quest locally (correct area/context) and sends the full start state to the server.
-        // Server will reconstruct and rebroadcast to everyone, including this client (which will just bind).
+        if (!ShouldAutomaticallyNetworkStartedQuest(q))
+        {
+            if (Debug.isDebugBuild)
+                Debug.Log($"[QuestNetSync][Private] Client left local quest unmapped uid={q.UID} name='{q.QuestName}' mode={GetQuestParticipationMode(q)}");
+            return;
+        }
+
+        AcknowledgeNetworkQuestStartInLocalParents(q, "client-quest-start");
+
         string inst = Guid.NewGuid().ToString("N");
-
-        // Pre-register mapping so our own RpcStart echo never triggers a local StartQuest.
         _cliInst2Uid[inst] = q.UID;
         _cliUid2Inst[q.UID] = inst;
+        MarkSharedOnlyNetworkedQuest(q);
         _cliLastTasks[inst] = q.GetTaskStates();
-        _cliLastLogs[inst]  = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
+        _cliLastLogs[inst] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
         _cliLastItems[inst] = CaptureItemStates(q);
         _cliLastPersons[inst] = BuildPersons(q);
         _cliLastFoes[inst] = BuildFoes(q);
         _cliQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
 
         StartCoroutine(Cli_SendStartPacketAfterDelay(q, inst));
     }
@@ -9178,6 +10454,9 @@ private void Cli_OnQuestEnded(Quest q)
         if (IsQuestNetSyncPausedForLoad()) return;
         if (!isClientOnly || q == null) return;
         if (IsQuestSharingBlacklisted(q)) return;
+        if (GetQuestParticipationMode(q) != OptionsMultiplayer.QuestSyncMode.Full &&
+            !_cliUid2Inst.ContainsKey(q.UID))
+            return;
 
         // The local client can finish a quest on the same tick that a triggered
         // MakePermanent owner task becomes true. Complete that durable side effect
@@ -9475,12 +10754,30 @@ private void Cli_OnQuestEnded(Quest q)
             return false;
 
         string wanted = NormalizeQuestTemplateName(questName);
+        string runtimeAlias = string.Empty;
+        _externalDispatcherChildRuntimeAliasByTarget.TryGetValue(
+            wanted,
+            out runtimeAlias);
+
         ulong[] all = QuestMachine.Instance.GetAllQuests() ?? new ulong[0];
         for (int i = 0; i < all.Length; i++)
         {
             Quest q = QuestMachine.Instance.GetQuest(all[i]);
-            if (q != null &&
-                string.Equals(NormalizeQuestTemplateName(q.QuestName), wanted, StringComparison.OrdinalIgnoreCase))
+            if (q == null)
+                continue;
+
+            string existingName = NormalizeQuestTemplateName(q.QuestName);
+            if (string.Equals(
+                    existingName,
+                    wanted,
+                    StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrEmpty(runtimeAlias) &&
+                string.Equals(
+                    existingName,
+                    NormalizeQuestTemplateName(runtimeAlias),
+                    StringComparison.OrdinalIgnoreCase))
                 return true;
         }
 
@@ -9501,6 +10798,16 @@ private void Cli_OnQuestEnded(Quest q)
         if (parentQuest == null || action == null ||
             !TryGetStartQuestTargetName(action, out targetName))
             return false;
+
+        // External disposable dispatchers remain entirely local, but remember the exact
+        // StartQuest source filename immediately before DFU executes it. When the
+        // scheduled child starts on the next quest tick, this lets us learn mods where
+        // the file target and the child's internal QuestName differ.
+        if (IsExternalModDispatcherQuestName(parentQuest.QuestName))
+        {
+            RecordExternalDispatcherPendingChildTarget(parentQuest, targetName);
+            return false;
+        }
 
         // DFU's hidden backbone was already intentionally client-originatable. Keep
         // that behaviour; the server-side name/UID duplicate guard remains in charge.
@@ -9772,7 +11079,9 @@ private void Cli_OnQuestEnded(Quest q)
                 {
                     string targetName;
                     if (!TryGetStartQuestTargetName(action, out targetName) ||
-                        !string.Equals(targetName, startedName, StringComparison.OrdinalIgnoreCase))
+                        !ExternalDispatcherQuestNamesEquivalent(
+                            targetName,
+                            startedName))
                         continue;
 
                     // The child already exists through multiplayer. Consume every local
@@ -10159,6 +11468,11 @@ private void Cli_OnQuestEnded(Quest q)
 
         try
         {
+            // This fallback is only reached from an already-networked parent. Preserve
+            // SharedOnly inheritance even though parentQuestUid is the server-side UID
+            // and might not match this client's remapped local UID.
+            QueueSharedOnlyChildStart(targetQuestName);
+
             // This TargetRpc is not running inside QuestMachine's quest iteration, so start
             // the already-parsed child immediately rather than enqueueing it and losing any
             // exception inside QuestMachine.Tick(). Cli_OnQuestStarted will send the full
@@ -10176,6 +11490,7 @@ private void Cli_OnQuestEnded(Quest q)
 
                 _cliInst2Uid[mappedChildInstance] = childQuest.UID;
                 _cliUid2Inst[childQuest.UID] = mappedChildInstance;
+                MarkSharedOnlyNetworkedQuest(childQuest);
                 _cliLastTasks[mappedChildInstance] = childQuest.GetTaskStates();
                 _cliLastLogs[mappedChildInstance] =
                     new HashSet<int>((childQuest.GetLogMessages() ?? new Quest.LogEntry[0])
@@ -10472,6 +11787,7 @@ private void Cli_OnQuestEnded(Quest q)
 
         _cliInst2Uid[instanceId] = q.UID;
         _cliUid2Inst[q.UID] = instanceId;
+        MarkSharedOnlyNetworkedQuest(q);
         _startedInst.Add(instanceId);
         _cliLastTasks[instanceId] = q.GetTaskStates();
         _cliLastLogs[instanceId] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
@@ -10479,6 +11795,7 @@ private void Cli_OnQuestEnded(Quest q)
         _cliLastPersons[instanceId] = BuildPersons(q);
         _cliLastFoes[instanceId] = BuildFoes(q);
         _cliQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
 
         ApplyClientQuestChainAuthority(q, "client-mapping");
     }
@@ -10491,6 +11808,8 @@ private void Cli_OnQuestEnded(Quest q)
         _srvUid2Inst[q.UID] = instanceId;
         _srvInst2Uid[instanceId] = q.UID;
         _srvQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
+        MarkSharedOnlyNetworkedQuest(q);
         _srvLastTasks[instanceId] = q.GetTaskStates();
         _srvLastLogs[instanceId] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
         _srvLastItems[instanceId] = CaptureItemStates(q);
@@ -11783,6 +13102,11 @@ private void Cli_OnQuestEnded(Quest q)
     [TargetRpc]
     public void TargetRequestQuestStartPacket(NetworkConnection conn, ulong questUID)
     {
+        RespondToQuestStartRequest(questUID);
+    }
+
+    private void RespondToQuestStartRequest(ulong questUID)
+    {
         if (!isClient) return;
 
         Quest q = QuestMachine.Instance != null ? QuestMachine.Instance.GetQuest(questUID) : null;
@@ -11793,6 +13117,16 @@ private void Cli_OnQuestEnded(Quest q)
             return;
         }
 
+        // In SharedOnly/Off an unmapped quest is intentionally private. A server-side
+        // enemy spawn request must never promote it by asking for a full StartPacket.
+        if (GetQuestParticipationMode(q) != OptionsMultiplayer.QuestSyncMode.Full &&
+            !HasNetworkMappingForQuestUid(questUID))
+        {
+            if (Debug.isDebugBuild)
+                Debug.Log($"[QuestNetSync][Private] Ignored StartPacket request for unmapped quest uid={questUID} name='{q.QuestName}' mode={GetQuestParticipationMode(q)}");
+            return;
+        }
+
         // Ensure we have an instanceId mapping for this already-running quest so our own RpcStart echo won't re-StartQuest locally.
         string inst;
         if (!_cliUid2Inst.TryGetValue(questUID, out inst) || string.IsNullOrEmpty(inst))
@@ -11800,6 +13134,7 @@ private void Cli_OnQuestEnded(Quest q)
             inst = Guid.NewGuid().ToString("N");
             _cliInst2Uid[inst] = questUID;
             _cliUid2Inst[questUID] = inst;
+            MarkSharedOnlyNetworkedQuest(q);
             _cliLastTasks[inst] = q.GetTaskStates();
             _cliLastLogs[inst]  = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
             _cliLastItems[inst] = CaptureItemStates(q);
@@ -11836,7 +13171,8 @@ private void Cli_OnQuestEnded(Quest q)
         if (local == null)
             return false;
 
-        return local.isLocalPlayer && (local.isServer || local.isClient) &&
+        return OptionsMultiplayer.questSyncMode != OptionsMultiplayer.QuestSyncMode.Off &&
+               local.isLocalPlayer && (local.isServer || local.isClient) &&
                !IsQuestNetSyncPausedForLoad() && IsAuthoritativeTimeReadyForQuestSharing();
     }
 
@@ -11867,6 +13203,12 @@ private void Cli_OnQuestEnded(Quest q)
         if (!isLocalPlayer)
         {
             statusMessage = "Quest sharing must be started by the local player.";
+            return false;
+        }
+
+        if (OptionsMultiplayer.questSyncMode == OptionsMultiplayer.QuestSyncMode.Off)
+        {
+            statusMessage = "Quest sharing is disabled by the multiplayer quest-sync setting.";
             return false;
         }
 
@@ -11958,6 +13300,8 @@ private void Cli_OnQuestEnded(Quest q)
         _srvUid2Inst[q.UID] = inst;
         _srvInst2Uid[inst] = q.UID;
         _srvQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
+        MarkSharedOnlyNetworkedQuest(q);
 
         _srvLastTasks[inst] = q.GetTaskStates();
         _srvLastLogs[inst] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
@@ -11972,12 +13316,14 @@ private void Cli_OnQuestEnded(Quest q)
         {
             _cliInst2Uid[inst] = q.UID;
             _cliUid2Inst[q.UID] = inst;
+            MarkSharedOnlyNetworkedQuest(q);
             _cliLastTasks[inst] = q.GetTaskStates();
             _cliLastLogs[inst] = new HashSet<int>((q.GetLogMessages() ?? new Quest.LogEntry[0]).Select(l => l.stepID));
             _cliLastItems[inst] = CaptureItemStates(q);
             _cliLastPersons[inst] = BuildPersons(q);
             _cliLastFoes[inst] = BuildFoes(q);
             _cliQuestObjectByUid[q.UID] = q;
+            MarkSharedOnlyNetworkedQuest(q);
             _startedInst.Add(inst);
         }
 
@@ -12042,6 +13388,7 @@ private void Cli_OnQuestEnded(Quest q)
             return false;
         }
 
+        MarkSharedOnlyNetworkedQuest(q);
         ApplyClientQuestChainAuthority(q, "manual-share-packet-sent");
 
         statusMessage = alreadyMapped
@@ -15093,6 +16440,9 @@ public static void ReportLocalFoePopupMessage(
             "local-foe-trigger");
     }
 
+    if (!ShouldNetworkQuestEvent(questUID))
+        return;
+
     // If this local popup was produced while applying a remote quest state packet,
     // do not report it back. The original machine already sent/owns the side-effect,
     // and echoing it is what caused double popups.
@@ -16338,6 +17688,7 @@ private static bool SamePersons(PersonDTO[] a, PersonDTO[] b)
         {
             _cliInst2Uid[instanceId] = best.UID;
             _cliUid2Inst[best.UID]   = instanceId;
+            MarkSharedOnlyNetworkedQuest(best);
         }
         return best;
     }
@@ -17628,6 +18979,9 @@ private static bool SamePersons(PersonDTO[] a, PersonDTO[] b)
         // quest-linked copy, make that copy permanent too.
         ApplyQuestItemMadePermanent(q, itemSymbol, "local-make-permanent-action");
 
+        if (!ShouldNetworkQuestEvent(questUID))
+            return;
+
         QuestNetSync inst = LocalInstance;
         if (inst == null || !inst.isLocalPlayer || !inst.isClient)
             return;
@@ -18849,6 +20203,9 @@ public static void ResetRandomDeliveryForQuest(ulong questUid)
             }
         }
         catch { }
+
+        if (!ShouldNetworkQuestEvent(questUid))
+            return;
 
         if (Debug.isDebugBuild)
         {

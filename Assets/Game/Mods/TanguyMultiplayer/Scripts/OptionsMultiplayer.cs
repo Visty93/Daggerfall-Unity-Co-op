@@ -4,6 +4,13 @@ using UnityEngine;
 
 public class OptionsMultiplayer : MonoBehaviour
 {
+    public enum QuestSyncMode
+    {
+        Full = 0,
+        SharedOnly = 1,
+        Off = 2,
+    }
+
 
 	public static bool timeHost = true;
 	public static bool displayName = true;
@@ -19,17 +26,36 @@ public class OptionsMultiplayer : MonoBehaviour
     public static int respawnFatiguePercent = 30;
     public static bool respawnOutsideDungeon = false;
     public static bool partyTravelInsideDungeon = true;
+    static QuestSyncMode defaultQuestSyncMode = QuestSyncMode.Full;
+    public static QuestSyncMode DefaultQuestSyncMode { get { return defaultQuestSyncMode; } }
+    public static QuestSyncMode questSyncMode
+    {
+        get
+        {
+            QuestSyncMode mode;
+            if ((Mirror.NetworkServer.active || Mirror.NetworkClient.active) &&
+                MultiplayerPartyManager.TryGetLocalQuestSyncMode(out mode)) return mode;
+            return defaultQuestSyncMode;
+        }
+        set { defaultQuestSyncMode = value; }
+    }
 
     const string RespawnPrefsPrefix = "DFUCoop.RespawnTravel.";
+    const string QuestSyncModePref = "DFUCoop.QuestSync.Mode";
     static bool localRespawnSettingsLoaded;
     static bool usingRemoteRespawnSettings;
+    static bool localQuestSyncSettingsLoaded;
+    static bool usingRemoteQuestSyncSettings;
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void InitializeSavedRespawnSettings()
     {
         localRespawnSettingsLoaded = false;
         usingRemoteRespawnSettings = false;
+        localQuestSyncSettingsLoaded = false;
+        usingRemoteQuestSyncSettings = false;
         LoadLocalRespawnSettings();
+        LoadLocalQuestSyncSettings();
     }
 
     static void LoadLocalRespawnSettings()
@@ -89,6 +115,42 @@ public class OptionsMultiplayer : MonoBehaviour
         partyTravelInsideDungeon = true;
     }
 
+    static void LoadLocalQuestSyncSettings()
+    {
+        int saved = PlayerPrefs.GetInt(QuestSyncModePref, (int)QuestSyncMode.Full);
+        if (saved < (int)QuestSyncMode.Full || saved > (int)QuestSyncMode.Off)
+            saved = (int)QuestSyncMode.Full;
+
+        questSyncMode = (QuestSyncMode)saved;
+        localQuestSyncSettingsLoaded = true;
+        usingRemoteQuestSyncSettings = false;
+    }
+
+    public static void EnsureLocalQuestSyncSettings()
+    {
+        // Local preference/session default is separate from the live party mode.
+        if (Mirror.NetworkClient.active && !Mirror.NetworkServer.active)
+            return;
+
+        if (!localQuestSyncSettingsLoaded || usingRemoteQuestSyncSettings)
+            LoadLocalQuestSyncSettings();
+    }
+
+    public static void SaveLocalQuestSyncSettings()
+    {
+        if (Mirror.NetworkClient.active && !Mirror.NetworkServer.active)
+            return;
+
+        int modeValue = (int)questSyncMode;
+        if (modeValue < (int)QuestSyncMode.Full || modeValue > (int)QuestSyncMode.Off)
+            questSyncMode = QuestSyncMode.Full;
+
+        PlayerPrefs.SetInt(QuestSyncModePref, (int)questSyncMode);
+        PlayerPrefs.Save();
+        localQuestSyncSettingsLoaded = true;
+        usingRemoteQuestSyncSettings = false;
+    }
+
     public static void ClampRespawnSettings()
     {
         reviveHoldSeconds = Mathf.Clamp(reviveHoldSeconds, 1, 10);
@@ -113,6 +175,7 @@ public class OptionsMultiplayer : MonoBehaviour
         if (list.Length < 5) return;
         // Session import deliberately does not write PlayerPrefs.
         usingRemoteRespawnSettings = true;
+        usingRemoteQuestSyncSettings = true;
 		timeHost = list[0] == "True";
 		displayName = list[1] == "True";
 		useHighestLevel = list[2] == "True";
@@ -131,6 +194,11 @@ public class OptionsMultiplayer : MonoBehaviour
         // Backward compatibility: older option strings ended at field 11.
         reviveFatiguePercent = ReadInt(list, 12, 30, 10, 50);
         respawnFatiguePercent = ReadInt(list, 13, 30, 10, 50);
+
+        // Field 14 was added with quest synchronization modes. Older peers default
+        // to Full so the historical automatic quest-sync behaviour is preserved.
+        int importedQuestSyncMode = ReadInt(list, 14, (int)QuestSyncMode.Full, (int)QuestSyncMode.Full, (int)QuestSyncMode.Off);
+        questSyncMode = (QuestSyncMode)importedQuestSyncMode;
 	}
 	
     public static void SetMobileNpcSync(bool enabled)
@@ -146,8 +214,9 @@ public class OptionsMultiplayer : MonoBehaviour
 	public static string Export()
 	{
         EnsureLocalRespawnSettings();
+        EnsureLocalQuestSyncSettings();
         ClampRespawnSettings();
-        return timeHost + "#" + displayName + "#" + useHighestLevel + '#' + sendLocation + '#' + sendMessage + '#' + mobileNpcSync + '#' + reviveHoldSeconds + '#' + manualRespawnSeconds + '#' + reviveHealthPercent + '#' + respawnHealthPercent + '#' + respawnOutsideDungeon + '#' + partyTravelInsideDungeon + '#' + reviveFatiguePercent + '#' + respawnFatiguePercent;
+        return timeHost + "#" + displayName + "#" + useHighestLevel + '#' + sendLocation + '#' + sendMessage + '#' + mobileNpcSync + '#' + reviveHoldSeconds + '#' + manualRespawnSeconds + '#' + reviveHealthPercent + '#' + respawnHealthPercent + '#' + respawnOutsideDungeon + '#' + partyTravelInsideDungeon + '#' + reviveFatiguePercent + '#' + respawnFatiguePercent + '#' + (int)DefaultQuestSyncMode;
 	}
 }
 

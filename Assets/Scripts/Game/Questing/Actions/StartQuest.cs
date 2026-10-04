@@ -65,6 +65,10 @@ namespace DaggerfallWorkshop.Game.Questing
             Quest quest = GameManager.Instance.QuestListsManager.GetQuest(questName);
             if (quest != null)
             {
+                // Shared-only MP needs to remember that this child came from an already
+                // shared parent before the parent can end and lose its network mapping.
+                // Full and Off modes make this helper a no-op.
+                global::QuestNetSync.NotifyNestedQuestScheduled(ParentQuest, quest.QuestName);
                 QuestMachine.Instance.ScheduleQuest(quest);
             }
 

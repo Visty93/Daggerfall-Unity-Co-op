@@ -622,8 +622,7 @@ namespace DaggerfallWorkshop.Game
 
                                 if (KnockbackSpeed < (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10)))
                                     KnockbackSpeed = (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10));
-                                enemyMotor.KnockbackSpeed = KnockbackSpeed;
-                                enemyMotor.KnockbackDirection = direction;
+                                enemyMotor.RequestNetworkKnockback(KnockbackSpeed, direction);
                             }
                         }
 

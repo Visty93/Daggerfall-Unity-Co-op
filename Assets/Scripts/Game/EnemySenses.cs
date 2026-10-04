@@ -87,13 +87,13 @@ namespace DaggerfallWorkshop.Game
         public DaggerfallEntityBehaviour Target
         {
             get { return target; }
-            set { target = value; }
+            set { if (!IsQuestInfightingTargetBlocked(value)) target = value; }
         }
 
         public DaggerfallEntityBehaviour SecondaryTarget
         {
             get { return secondaryTarget; }
-            set { secondaryTarget = value; }
+            set { if (!IsQuestInfightingTargetBlocked(value)) secondaryTarget = value; }
         }
 
         public bool TargetInSight
@@ -229,6 +229,42 @@ private PlayerMultiplayer targetPlayer; // Cached reference
         {
             return NetworkServer.active || NetworkClient.active ||
                    (NetworkManager.singleton != null && NetworkManager.singleton.isNetworkActive);
+        }
+
+        // The physical AI owner may not have this foe's quest. Its spawn flag and
+        // party binding still identify it without attaching a foreign quest resource.
+        private static bool HasQuestInfightingProtection(Component subject)
+        {
+            var resource = subject.GetComponent<QuestResourceBehaviour>();
+            if (resource != null)
+                return !resource.IsAttackableByAI;
+
+            var enemy = subject.GetComponent<DaggerfallEnemy>();
+            if (enemy != null && enemy.QuestSpawn)
+                return true;
+
+            // Remote peers can receive the binding before their local quest resource.
+            var identity = subject.GetComponent<NetworkIdentity>();
+            if (identity == null || identity.netId == 0)
+                return false;
+            PartyQuestFoeBinding.Binding binding;
+            return (NetworkServer.active && PartyQuestFoeBinding.TryGetServer(identity.netId, out binding)) ||
+                   (NetworkClient.active && PartyQuestFoeBinding.TryGetLocal(identity.netId, out binding));
+        }
+
+        // Shared by target selection, direct target assignment, and hit retaliation.
+        // This guard only adds MP enemy-vs-enemy protection; players remain valid.
+        public bool IsQuestInfightingTargetBlocked(DaggerfallEntityBehaviour candidate)
+        {
+            if (!IsMultiplayerActive() || candidate == null ||
+                IsCurrentPlayerTarget(candidate) || IsSinglePlayerAdvanced(candidate) ||
+                IsUnderPlayerMultiplayer(candidate) || candidate.EntityType == EntityTypes.Player)
+                return false;
+
+            if (candidate.EntityType != EntityTypes.EnemyMonster && candidate.EntityType != EntityTypes.EnemyClass)
+                return false;
+
+            return HasQuestInfightingProtection(this) || HasQuestInfightingProtection(candidate);
         }
 
         private bool IsCurrentPlayerTarget(DaggerfallEntityBehaviour candidate)
@@ -892,6 +928,16 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
     ClearPlayerAdvancedTargetInMultiplayer("FixedUpdateStart");
     ClearUntargetableMultiplayerPlayerTargets("FixedUpdateStart");
 
+    // Drop any enemy target acquired before late quest/binding metadata arrived.
+    if (IsQuestInfightingTargetBlocked(target))
+        ClearTargetTracking("quest-foe-infighting");
+    else if (IsQuestInfightingTargetBlocked(secondaryTarget))
+    {
+        secondaryTarget = null;
+        sawSecondaryTarget = false;
+        secondaryTargetPos = ResetPlayerPos;
+    }
+
     // Server-only multiplayer retarget check. This is intentionally throttled and staggered.
     // Do not use enemyUpdateQueue.IndexOf(this) here; that was O(enemy count) per enemy per FixedUpdate.
     if (NetworkServer.active && Time.time >= nextServerRetargetTime && ((Time.frameCount + updateSlot) % serverRetargetSlots == 0))
@@ -1482,6 +1528,9 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
                     continue;
 
                 if (IsUntargetableMultiplayerBehaviour(targetBehaviour))
+                    continue;
+
+                if (IsQuestInfightingTargetBlocked(targetBehaviour))
                     continue;
 
                 // MP player visuals can carry enemy-like components. Never let those enter normal

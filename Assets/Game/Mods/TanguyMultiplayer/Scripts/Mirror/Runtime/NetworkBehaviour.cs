@@ -249,6 +249,12 @@ namespace Mirror
 
         protected void SendRPCInternal(Type invokeClass, string rpcName, NetworkWriter writer, int channelId, bool includeOwner)
         {
+            // QuestNetSync-only virtual server interception. Every other NetworkBehaviour
+            // returns false and follows Mirror's original path unchanged.
+            if (QuestNetVirtualTransport.TryInterceptClientRpc(
+                this, invokeClass, rpcName, writer, channelId, includeOwner))
+                return;
+
             // this was in Weaver before
             if (!NetworkServer.active)
             {
@@ -279,6 +285,11 @@ namespace Mirror
 
         protected void SendTargetRPCInternal(NetworkConnection conn, Type invokeClass, string rpcName, NetworkWriter writer, int channelId)
         {
+            // Same narrow QuestNetSync-only interception point as ClientRpc above.
+            if (QuestNetVirtualTransport.TryInterceptTargetRpc(
+                this, conn, invokeClass, rpcName, writer, channelId))
+                return;
+
             if (!NetworkServer.active)
             {
                 Debug.LogError($"TargetRPC {rpcName} called when server not active");

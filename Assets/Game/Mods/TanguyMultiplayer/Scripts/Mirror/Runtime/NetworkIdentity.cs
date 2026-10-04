@@ -659,7 +659,12 @@ namespace Mirror
                 //    one exception doesn't stop all the other Start() calls!
                 try
                 {
-                    comp.OnStartServer();
+                    // QuestNetSync's physical host lifecycle is virtualized to the local
+                    // party leader. All other components keep the exact original Mirror
+                    // lifecycle. Manual virtual lifecycle calls invoke QNS directly and
+                    // therefore do not pass through this gate.
+                    if (!QuestNetVirtualTransport.TryInterceptServerLifecycle(comp, true))
+                        comp.OnStartServer();
                 }
                 catch (Exception e)
                 {
@@ -679,7 +684,8 @@ namespace Mirror
                 //    one exception doesn't stop all the other Start() calls!
                 try
                 {
-                    comp.OnStopServer();
+                    if (!QuestNetVirtualTransport.TryInterceptServerLifecycle(comp, false))
+                        comp.OnStopServer();
                 }
                 catch (Exception e)
                 {

@@ -3,6 +3,7 @@ using System;
 using System.Collections;
 using Mirror;
 using DaggerfallWorkshop;
+using DaggerfallWorkshop.Game.Items;
 
 public class LootMultiplayer : MonoBehaviour
 {
@@ -26,6 +27,8 @@ public class LootMultiplayer : MonoBehaviour
     float suppressContentUpdatesUntil = 0f;
 
     DaggerfallLoot loot;
+    PartyQuestLootOverlay.LootEditToken partyQuestLootEditToken;
+    DaggerfallUnityItem partyQuestLootClickedItem;
     // Local action is frozen from request through commit acknowledgement.
     Action editAction;
     uint editRequest;
@@ -37,12 +40,26 @@ public class LootMultiplayer : MonoBehaviour
 
     public bool BeginEdit(Action action)
     {
+        return BeginEdit(null, action);
+    }
+
+    // Optional exact clicked item is used only for party-scoped corpse quest items.
+    // All ordinary loot keeps the original transaction path unchanged.
+    public bool BeginEdit(DaggerfallUnityItem clickedItem, Action action)
+    {
         if (EditPending || lootId == 0 || lootCatcher == null)
             return false;
+        string partySelection = PartyQuestLootOverlay.Selection(loot, clickedItem);
+        if (partySelection == "!")
+        {
+            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Quest loot is synchronizing. Please try again.");
+            return false;
+        }
         editAction = action;
+        partyQuestLootClickedItem = clickedItem;
         editGranted = commitSent = false;
         editRequest = lootCatcher.RequestLootEdit(lootId, lootVersion);
-        lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest);
+        lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest, partySelection);
         return true;
     }
 
@@ -53,11 +70,16 @@ public class LootMultiplayer : MonoBehaviour
         {
             editRequest = 0;
             editAction = null;
+            partyQuestLootEditToken = null;
+            partyQuestLootClickedItem = null;
             ApplyFinalSnapshot(version, items);
             DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot changed or is busy. Please try again.");
             return true;
         }
+        PartyQuestLootOverlay.ReconcileBeforeGrantedEdit(loot);
         editGranted = true;
+        partyQuestLootEditToken = PartyQuestLootOverlay.BeginLocalLootEdit(loot, partyQuestLootClickedItem);
+        partyQuestLootClickedItem = null;
         var action = editAction;
         editAction = null;
         try
@@ -78,8 +100,13 @@ public class LootMultiplayer : MonoBehaviour
     public void CompleteEdit()
     {
         if (!EditGranted || lootCatcher == null) return;
+
+        string[] partyConsumed = PartyQuestLootOverlay.EndLocalLootEdit(loot, partyQuestLootEditToken);
+        partyQuestLootEditToken = null;
+        partyQuestLootClickedItem = null;
+
         commitSent = true;
-        lootCatcher.CommitLootEdit(lootId, editRequest, LootCatcher.SerializeLootItems(loot));
+        lootCatcher.CommitLootEdit(lootId, editRequest, LootCatcher.SerializeLootItems(loot), partyConsumed);
     }
 
     public void ReceiveEditCommit(uint request, int version, string items)
@@ -88,6 +115,8 @@ public class LootMultiplayer : MonoBehaviour
         editRequest = 0;
         editGranted = commitSent = false;
         editAction = null;
+        partyQuestLootEditToken = null;
+        partyQuestLootClickedItem = null;
         ApplyFinalSnapshot(version, items);
     }
 
@@ -242,6 +271,8 @@ public class LootMultiplayer : MonoBehaviour
     {
         CompleteEdit();
         editAction = null;
+        partyQuestLootEditToken = null;
+        partyQuestLootClickedItem = null;
         inventoryOpen = false;
         if (closeRoutine != null) { StopCoroutine(closeRoutine); closeRoutine = null; }
         ReleaseReader();

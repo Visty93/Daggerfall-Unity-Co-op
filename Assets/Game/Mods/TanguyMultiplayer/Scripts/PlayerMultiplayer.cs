@@ -331,6 +331,96 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
         ApplyLifeStateVisualIfChanged(false);
         MaintainSeparateDownedCorpseVisibility();
         MaintainPureClientSavedDungeonAnchor();
+        UpdateDungeonSizeWarning();
+    }
+
+    // Notification only: never changes SmallerDungeons or delays dungeon generation.
+    private bool dungeonSizeServerKnown;
+    private bool dungeonSizeServerSmall;
+    private bool dungeonSizeWasInside;
+    private bool dungeonSizeWarningShown;
+    private bool dungeonSizeWarnedLocalSmall;
+    private bool dungeonSizeWarnedServerSmall;
+    private float dungeonSizeNextCheck;
+    private float dungeonSizeNotifyAfter;
+    private uint dungeonSizeRequestSerial;
+
+    private void UpdateDungeonSizeWarning()
+    {
+        // Compare with the physical server, regardless of party membership.
+        if (!isLocalPlayer || NetworkServer.active || !NetworkClient.isConnected || !NetworkClient.ready)
+            return;
+        var game = GameManager.Instance;
+        if (game == null || game.PlayerEnterExit == null)
+            return;
+        float now = Time.realtimeSinceStartup;
+        if (IsLocalSaveLoadInProgress())
+        {
+            dungeonSizeNotifyAfter = now + 1f;
+            dungeonSizeNextCheck = 0f;
+            return;
+        }
+
+        bool inside = game.PlayerEnterExit.IsPlayerInsideDungeon;
+        if (inside != dungeonSizeWasInside)
+        {
+            dungeonSizeWasInside = inside;
+            if (inside)
+            {
+                // Observe entry afterwards, outside the dungeon generation/request path.
+                dungeonSizeNextCheck = 0f;
+                dungeonSizeNotifyAfter = now + 1f;
+            }
+        }
+        if (now >= dungeonSizeNextCheck)
+        {
+            dungeonSizeNextCheck = now + 15f;
+            dungeonSizeRequestSerial++;
+            if (dungeonSizeRequestSerial == 0U) dungeonSizeRequestSerial++;
+            CmdCheckDungeonSizeSetting(dungeonSizeRequestSerial);
+        }
+        if (!dungeonSizeServerKnown)
+            return;
+        bool localSmall = DaggerfallUnity.Settings.SmallerDungeons;
+        if (localSmall == dungeonSizeServerSmall)
+        {
+            // A later, new mismatch may warn again after settings have matched.
+            dungeonSizeWarningShown = false;
+            return;
+        }
+        if (dungeonSizeWarningShown && dungeonSizeWarnedLocalSmall == localSmall &&
+            dungeonSizeWarnedServerSmall == dungeonSizeServerSmall)
+            return;
+        if (now < dungeonSizeNotifyAfter || DaggerfallUI.Instance == null ||
+            DaggerfallUI.Instance.DaggerfallHUD == null || DaggerfallUI.UIManager == null ||
+            DaggerfallUI.UIManager.TopWindow != DaggerfallUI.Instance.DaggerfallHUD)
+            return;
+
+        string localSize = localSmall ? "smaller" : "full-size";
+        string serverSize = dungeonSizeServerSmall ? "smaller" : "full-size";
+        DaggerfallUI.AddHUDText("Dungeon size mismatch: yours " + localSize + "; server " + serverSize + ".", 10f);
+        DaggerfallUI.AddHUDText("Different layouts can place enemies outside your dungeon rooms.", 10f);
+        Debug.LogWarning("[DungeonSizeMismatch] Local=" + localSize + " server=" + serverSize +
+            ". Warning only; no settings or dungeon data were changed. Active quests can retain their original dungeon size.");
+        dungeonSizeWarningShown = true;
+        dungeonSizeWarnedLocalSmall = localSmall;
+        dungeonSizeWarnedServerSmall = dungeonSizeServerSmall;
+    }
+
+    [Command]
+    private void CmdCheckDungeonSizeSetting(uint requestSerial)
+    {
+        if (connectionToClient != null && connectionToClient.isReady)
+            TargetDungeonSizeSetting(connectionToClient, requestSerial, DaggerfallUnity.Settings.SmallerDungeons);
+    }
+
+    [TargetRpc]
+    private void TargetDungeonSizeSetting(NetworkConnection target, uint requestSerial, bool serverSmall)
+    {
+        if (!isLocalPlayer || NetworkServer.active || requestSerial != dungeonSizeRequestSerial)
+            return;
+        dungeonSizeServerSmall = serverSmall;
+        dungeonSizeServerKnown = true;
     }
 
     private IEnumerator ApplyLifeStateVisualAfterSpawn()
@@ -1907,8 +1997,431 @@ void enableAll(bool b)
         return null;
     }
 
+
 //enemy related stuff
-	
+
+// Pure-client safety fallback for compiled external callers that ask
+// CreateFoeGameObjects(Vector3.zero) to return real objects before creating a
+// zero-count FoeSpawner. The normal case is claimed synchronously by
+// FoeSpawner.SetFoeGameObjects() in the same frame. If no spawner claims them,
+// fall back to the existing generic CmdCreateFoes request so unrelated external
+// spawn callers are not silently lost.
+public void BeginExternalFoeSpawnerFallback(
+    GameObject[] stagingObjects,
+    MobileTypes foeType,
+    MobileReactions reaction,
+    bool alliedToPlayer,
+    int requesterLevel)
+{
+    if (!isLocalPlayer || stagingObjects == null || stagingObjects.Length == 0)
+        return;
+
+    StartCoroutine(CoExternalFoeSpawnerFallback(
+        stagingObjects,
+        foeType,
+        reaction,
+        alliedToPlayer,
+        requesterLevel));
+}
+
+private IEnumerator CoExternalFoeSpawnerFallback(
+    GameObject[] stagingObjects,
+    MobileTypes foeType,
+    MobileReactions reaction,
+    bool alliedToPlayer,
+    int requesterLevel)
+{
+    // The stock external-object pattern is synchronous. A few frames is ample for
+    // CreateFoeSpawner(...count=0) + SetFoeGameObjects() to claim these actors.
+    for (int i = 0; i < 4; i++)
+        yield return null;
+
+    if (!GameObjectHelper.ArePendingExternalClientFoes(stagingObjects))
+        yield break;
+
+    GameObjectHelper.ReleasePendingExternalClientFoes(stagingObjects);
+
+    Vector3[] positions = new Vector3[stagingObjects.Length];
+    Vector3 fallbackPosition = GameManager.Instance != null && GameManager.Instance.PlayerObject != null
+        ? GameManager.Instance.PlayerObject.transform.position
+        : Vector3.zero;
+
+    for (int i = 0; i < stagingObjects.Length; i++)
+    {
+        GameObject go = stagingObjects[i];
+        positions[i] = go != null ? go.transform.position : fallbackPosition;
+    }
+
+    bool isInteriorFromClient =
+        GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideBuilding == true;
+    bool isDungeonFromClient =
+        GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true;
+
+    Vector3 firstPosition = positions.Length > 0 ? positions[0] : fallbackPosition;
+
+    Debug.Log(
+        $"[ExternalFoeMP] No zero-count FoeSpawner claimed {stagingObjects.Length} external staging foe(s); " +
+        $"falling back to normal CmdCreateFoes type={foeType} firstPos={firstPosition}.");
+
+    CmdCreateFoes(
+        firstPosition,
+        foeType,
+        stagingObjects.Length,
+        reaction,
+        alliedToPlayer,
+        0UL,
+        string.Empty,
+        positions,
+        isInteriorFromClient,
+        isDungeonFromClient,
+        requesterLevel);
+
+    for (int i = 0; i < stagingObjects.Length; i++)
+    {
+        if (stagingObjects[i] != null)
+        {
+            stagingObjects[i].SetActive(false);
+            Destroy(stagingObjects[i]);
+        }
+    }
+}
+
+// Server endpoint for the vanilla external-object FoeSpawner pattern.
+// A pure client first creates/customizes/places a temporary local foe, then sends
+// this finished snapshot so the host can create one authoritative network copy.
+[Command]
+public void CmdSpawnExternallySuppliedFoe(
+    Vector3 position,
+    Quaternion rotation,
+    Vector3 scale,
+    string displayName,
+    int entityEnemyId,
+    int visualEnemyId,
+    int visualMaleTexture,
+    int visualFemaleTexture,
+    int visualRangedFlags,
+    int reactionValue,
+    int genderValue,
+    bool alliedToPlayer,
+    int teamValue,
+    bool hasExplicitTeam,
+    bool liveHostile,
+    int currentHealth,
+    int maxHealth,
+    byte classicSpawnDistanceType,
+    int requesterLevel,
+    bool isInteriorFromClient,
+    bool isDungeonFromClient)
+{
+    if (!isServer)
+        return;
+
+    PositionMultiplayer externalRequesterPos = GetComponent<PositionMultiplayer>();
+    string requesterDf = externalRequesterPos != null ? externalRequesterPos.x + "/" + externalRequesterPos.z : "<none>";
+    string requesterUnity = externalRequesterPos != null ? externalRequesterPos.transform.position.ToString("F3") : "<none>";
+    string hostDf = "<none>";
+    string hostUnity = "<none>";
+    try
+    {
+        if (GameManager.Instance != null && GameManager.Instance.PlayerGPS != null)
+            hostDf = GameManager.Instance.PlayerGPS.WorldX + "/" + GameManager.Instance.PlayerGPS.WorldZ;
+        if (GameManager.Instance != null && GameManager.Instance.PlayerObject != null)
+            hostUnity = GameManager.Instance.PlayerObject.transform.position.ToString("F3");
+    }
+    catch { }
+
+    Debug.Log(
+        $"[ExternalFoeDiag][SERVER_COMMAND_RECEIVED] requesterNetId={netId} name='{displayName}' " +
+        $"requestedPos={position} requesterDF={requesterDf} requesterProxyUnity={requesterUnity} " +
+        $"hostDF={hostDf} hostUnity={hostUnity} interior={isInteriorFromClient} dungeon={isDungeonFromClient}");
+
+    bool finitePosition =
+        !float.IsNaN(position.x) && !float.IsInfinity(position.x) &&
+        !float.IsNaN(position.y) && !float.IsInfinity(position.y) &&
+        !float.IsNaN(position.z) && !float.IsInfinity(position.z);
+    bool finiteRotation =
+        !float.IsNaN(rotation.x) && !float.IsInfinity(rotation.x) &&
+        !float.IsNaN(rotation.y) && !float.IsInfinity(rotation.y) &&
+        !float.IsNaN(rotation.z) && !float.IsInfinity(rotation.z) &&
+        !float.IsNaN(rotation.w) && !float.IsInfinity(rotation.w);
+    bool finiteScale =
+        !float.IsNaN(scale.x) && !float.IsInfinity(scale.x) &&
+        !float.IsNaN(scale.y) && !float.IsInfinity(scale.y) &&
+        !float.IsNaN(scale.z) && !float.IsInfinity(scale.z) &&
+        scale.x > 0.01f && scale.y > 0.01f && scale.z > 0.01f &&
+        scale.x < 20f && scale.y < 20f && scale.z < 20f;
+
+    if (!finitePosition || !finiteRotation || !finiteScale ||
+        !GameObjectHelper.EnemyDict.ContainsKey(entityEnemyId) ||
+        !Enum.IsDefined(typeof(MobileReactions), reactionValue) ||
+        !Enum.IsDefined(typeof(MobileGender), genderValue))
+    {
+        Debug.LogWarning(
+            $"[ExternalFoeMP] Rejected invalid external foe request from netId={netId} " +
+            $"entityId={entityEnemyId} reaction={reactionValue} gender={genderValue} pos={position}");
+        return;
+    }
+
+    if (hasExplicitTeam && !Enum.IsDefined(typeof(MobileTeams), teamValue))
+    {
+        Debug.LogWarning(
+            $"[ExternalFoeMP] Rejected invalid team={teamValue} for external foe from netId={netId}.");
+        return;
+    }
+
+    if (visualRangedFlags < -1 || visualRangedFlags > 7)
+        visualRangedFlags = -1;
+
+    if (!GameObjectHelper.EnemyDict.ContainsKey(visualEnemyId))
+        visualEnemyId = -1;
+
+    MobileTypes enemyType = (MobileTypes)entityEnemyId;
+    MobileReactions reaction = (MobileReactions)reactionValue;
+    MobileGender gender = (MobileGender)genderValue;
+
+    if (string.IsNullOrEmpty(displayName))
+        displayName = $"DaggerfallEnemy [{enemyType}]";
+    else if (displayName.Length > 120)
+        displayName = displayName.Substring(0, 120);
+
+    string networkObjectName = $"DaggerfallEnemy [{enemyType}]";
+
+    int spawnScalingLevel =
+        ResolveServerPlayerLevelForSpawn(this.netId, requesterLevel, "CmdSpawnExternallySuppliedFoe");
+
+    GameObject go = GameObjectHelper.InstantiatePrefab(
+        DaggerfallUnity.Instance.Option_EnemyPrefab.gameObject,
+        networkObjectName,
+        null,
+        position);
+
+    if (go == null)
+    {
+        Debug.LogError($"[ExternalFoeDiag][SERVER_INSTANTIATE_FAILED] requesterNetId={netId} name='{displayName}' pos={position}");
+        return;
+    }
+
+    ExternalFoeLifetimeDiagnostics lifetimeDiag = ExternalFoeLifetimeDiagnostics.Attach(
+        go, "SERVER_AUTHORITATIVE_EXTERNAL", this.netId);
+    if (lifetimeDiag != null)
+        lifetimeDiag.Mark("SERVER_AFTER_INSTANTIATE");
+
+    SetupDemoEnemy setup = go.GetComponent<SetupDemoEnemy>();
+    if (setup == null)
+    {
+        Destroy(go);
+        return;
+    }
+
+    // Apply the finished MobileUnit visual snapshot during initial setup so the
+    // authoritative host copy and all observers start from the same external visual state.
+    setup.ExternalVisualEnemyId =
+        visualEnemyId >= 0 && visualEnemyId != entityEnemyId
+            ? visualEnemyId
+            : -1;
+    setup.ExternalVisualMaleTexture = visualMaleTexture >= 0 ? visualMaleTexture : -1;
+    setup.ExternalVisualFemaleTexture = visualFemaleTexture >= 0 ? visualFemaleTexture : -1;
+    setup.ExternalVisualRangedFlags = visualRangedFlags;
+
+    setup.ApplyEnemySettingsWithScalingLevel(
+        enemyType,
+        reaction,
+        gender,
+        classicSpawnDistanceType,
+        alliedToPlayer,
+        spawnScalingLevel);
+
+    setup.ExternalSpawnOriginNetId = this.netId;
+    setup.ExternalSpawnDisplayName = displayName;
+
+    if (hasExplicitTeam)
+        setup.SpawnTeamOverride = teamValue;
+
+    // Preserve the finished client's team/reaction and fresh spawn health.
+    DaggerfallEntityBehaviour entityBehaviour = go.GetComponent<DaggerfallEntityBehaviour>();
+    if (entityBehaviour != null && entityBehaviour.Entity is EnemyEntity enemyEntity)
+    {
+        MobileEnemy mobile = enemyEntity.MobileEnemy;
+        mobile.Reactions = reaction;
+        mobile.Gender = gender;
+        if (hasExplicitTeam)
+        {
+            mobile.Team = (MobileTeams)teamValue;
+            enemyEntity.Team = (MobileTeams)teamValue;
+        }
+        enemyEntity.SetMobileEnemy(mobile);
+
+        if (currentHealth > 0 || maxHealth > 0)
+        {
+            int authoritativeMax = Mathf.Max(1, maxHealth, currentHealth);
+            int authoritativeCurrent = currentHealth > 0
+                ? Mathf.Clamp(currentHealth, 1, authoritativeMax)
+                : authoritativeMax;
+
+            entityBehaviour.ApplyAuthoritativeHealthCurrentAndMax(
+                authoritativeCurrent,
+                authoritativeMax);
+        }
+    }
+
+    EnemyMotor motor = go.GetComponent<EnemyMotor>();
+    if (motor != null)
+        motor.IsHostile = liveHostile;
+
+    setup.SyncedMotorIsHostile = liveHostile;
+    setup.SpawnedMotorIsHostile = liveHostile;
+    setup.CurrentMotorIsHostile = liveHostile;
+    setup.LastAppliedMotorIsHostile = liveHostile;
+
+    // The requesting client already ran the vanilla FoeSpawner floor/clearance
+    // placement against its own loaded town/interior. Do not ground this again using
+    // the host's physics scene, which can be a different streamed location.
+    go.transform.position = position;
+    go.transform.rotation = rotation;
+    go.transform.localScale = scale;
+
+    NetworkIdentity identity = go.GetComponent<NetworkIdentity>();
+    if (identity == null)
+        identity = go.AddComponent<NetworkIdentity>();
+
+    DaggerfallEnemy dfEnemy = go.GetComponent<DaggerfallEnemy>();
+    if (dfEnemy != null)
+        dfEnemy.LoadID = DaggerfallUnity.NextUID;
+
+    if (isDungeonFromClient)
+        setup.isDungeonEnemy = true;
+
+    EnemyWorldPosition world = go.GetComponent<EnemyWorldPosition>();
+    if (world != null)
+    {
+        if (isDungeonFromClient)
+            world.SetDungeonSpawnContext(this.netId, 0, 0, false);
+        else
+            world.SetSpawnContext(isInteriorFromClient, this.netId);
+
+        // Generic external FoeSpawner actors are not quest CreateFoe wave markers.
+        world.intendedSpawnPos = Vector3.zero;
+        world.isCreateFoeWaveSpawn = false;
+    }
+
+    if (lifetimeDiag != null)
+        lifetimeDiag.Mark("SERVER_BEFORE_NETWORK_SPAWN");
+
+    NetworkServer.Spawn(go);
+
+    if (lifetimeDiag != null)
+        lifetimeDiag.Mark("SERVER_AFTER_NETWORK_SPAWN");
+
+    // Safe even when Unity Start() has not run yet, and necessary if this path is
+    // ever fed an actor that existed locally before it became a network object.
+    if (world != null)
+        world.ResumeRetainedActorNetworking();
+
+    if (lifetimeDiag != null)
+        lifetimeDiag.Mark("SERVER_AFTER_WORLD_RESUME");
+
+    go.SetActive(true);
+
+    ExternalFoeLifetimeDiagnostics.LogEnemySpawnSubscribers("SERVER_BEFORE_RAISE", go);
+    ExternalFoeLifetimeDiagnostics.LogComponents("SERVER_COMPONENTS_BEFORE_RAISE", go);
+    if (lifetimeDiag != null)
+        lifetimeDiag.Mark("SERVER_BEFORE_RAISE_ENEMY_SPAWN");
+
+    GameManager.Instance?.RaiseOnEnemySpawnEvent(go);
+
+    ExternalFoeLifetimeDiagnostics.LogComponents("SERVER_COMPONENTS_AFTER_RAISE", go);
+    if (lifetimeDiag != null)
+        lifetimeDiag.Mark("SERVER_AFTER_RAISE_ENEMY_SPAWN");
+
+    StartCoroutine(CoTraceExternallySuppliedServerFoe(go, identity != null ? identity.netId : 0U, displayName));
+
+    Debug.Log(
+        $"[ExternalFoeMP] Server spawned client-supplied foe '{displayName}' " +
+        $"requester={this.netId} netId={(identity != null ? identity.netId : 0U)} " +
+        $"entityId={entityEnemyId} visualId={visualEnemyId} visualTex={visualMaleTexture}/{visualFemaleTexture} " +
+        $"team={(hasExplicitTeam ? teamValue.ToString() : "default")} " +
+        $"reaction={reaction} hostile={liveHostile} pos={go.transform.position}");
+}
+
+[Command]
+public void CmdDestroyOriginExternalFoe(uint enemyNetId)
+{
+    if (!isServer || enemyNetId == 0U)
+        return;
+
+    if (!NetworkServer.spawned.TryGetValue(enemyNetId, out NetworkIdentity identity) ||
+        identity == null)
+        return;
+
+    SetupDemoEnemy setup = identity.GetComponent<SetupDemoEnemy>();
+    if (setup == null)
+        return;
+
+    // Only the player that originally supplied this external FoeSpawner actor may
+    // request its authoritative destruction.
+    if (setup.ExternalSpawnOriginNetId == 0U ||
+        setup.ExternalSpawnOriginNetId != this.netId ||
+        string.IsNullOrEmpty(setup.ExternalSpawnDisplayName))
+    {
+        Debug.LogWarning(
+            $"[ExternalFoeMP] Rejected external foe destroy request requester={this.netId} " +
+            $"enemyNetId={enemyNetId} origin={setup.ExternalSpawnOriginNetId}.");
+        return;
+    }
+
+    Debug.Log(
+        $"[ExternalFoeMP] Server accepted origin-client destroy request " +
+        $"requester={this.netId} enemyNetId={enemyNetId}.");
+
+    NetworkServer.Destroy(identity.gameObject);
+}
+
+private IEnumerator CoTraceExternallySuppliedServerFoe(GameObject go, uint spawnedNetId, string displayName)
+{
+    float started = Time.unscaledTime;
+    float nextHeartbeat = started;
+    bool lastActive = go != null && go.activeInHierarchy;
+    bool lastRegistered = spawnedNetId != 0U && NetworkServer.spawned.ContainsKey(spawnedNetId);
+
+    while (Time.unscaledTime - started < 12f)
+    {
+        float age = Time.unscaledTime - started;
+
+        if (go == null)
+        {
+            bool stillRegistered = spawnedNetId != 0U && NetworkServer.spawned.ContainsKey(spawnedNetId);
+            Debug.LogWarning(
+                $"[ExternalFoeDiag][SERVER_WATCH_OBJECT_GONE] name='{displayName}' netId={spawnedNetId} " +
+                $"age={age:0.000}s frame={Time.frameCount} serverRegistered={stillRegistered}");
+            yield break;
+        }
+
+        bool active = go.activeInHierarchy;
+        bool registered = spawnedNetId != 0U && NetworkServer.spawned.ContainsKey(spawnedNetId);
+        if (active != lastActive || registered != lastRegistered)
+        {
+            Debug.LogWarning(
+                $"[ExternalFoeDiag][SERVER_WATCH_TRANSITION] name='{go.name}' netId={spawnedNetId} age={age:0.000}s " +
+                $"active={active} serverRegistered={registered} parent='{(go.transform.parent != null ? go.transform.parent.name : "<root>")}' pos={go.transform.position}");
+            lastActive = active;
+            lastRegistered = registered;
+        }
+
+        if (Time.unscaledTime >= nextHeartbeat)
+        {
+            ExternalFoeLifetimeDiagnostics diag = go.GetComponent<ExternalFoeLifetimeDiagnostics>();
+            if (diag != null)
+                diag.Mark("SERVER_WATCH_HEARTBEAT");
+            nextHeartbeat = Time.unscaledTime + (age < 4f ? 0.5f : 1f);
+        }
+
+        yield return null;
+    }
+
+    if (go != null)
+        Debug.Log($"[ExternalFoeDiag][SERVER_WATCH_SURVIVED_12S] name='{go.name}' netId={spawnedNetId} pos={go.transform.position}");
+}
+
 [Command]
 public void CmdCreateFoes(
     Vector3 position,
@@ -1927,6 +2440,27 @@ public void CmdCreateFoes(
     if (!isServer) return;
 
     int spawnScalingLevel = ResolveServerPlayerLevelForSpawn(this.netId, requesterLevel, "CmdCreateFoes");
+
+    // Physical spawn only. A separate party binding resolves the QNS instance through
+    // the requester and validates it on the party leader, without host UID lookup.
+    if (PartyQuestVirtualAuthority.QuestVirtualizationActive &&
+        questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
+    {
+        Srv_SpawnFoesInternal(
+            positions,
+            foeType,
+            spawnCount,
+            reaction,
+            alliedToPlayer,
+            questUID,
+            foeSymbolName,
+            isInteriorFromClient,
+            spawnScalingLevel,
+            false,
+            isDungeonFromClient,
+            true);
+        return;
+    }
     Debug.Log($"[CmdCreateFoes] Spawning {spawnCount} x {foeType} at {position} | questUID={questUID} foeSymbol='{foeSymbolName}' spawnScalingLevel={spawnScalingLevel}");
 
     // Rebuild quest resource if provided so these become TRUE quest wave spawns
@@ -2137,22 +2671,29 @@ private void Srv_SpawnSingleQuestFoeInternal(
     int mobileGenderInt,
     int siteTypeInt,
     bool isInteriorAtRequest,
-    MobileReactions reaction)
+    MobileReactions reaction,
+    bool privateQuestBinding = false,
+    bool partyQuestBinding = false)
 {
     try
     {
-        // Rebuild quest Foe from UID+symbol (true quest foe on server)
+        // Shared/full quest foes resolve the host's local Quest/Foe as before. Private
+        // quest foes deliberately do not interpret the requester's UID on the host.
         Foe foeRes = null;
-        Quest q = QuestMachine.Instance.GetQuest(questUID);
-        if (q != null && !string.IsNullOrEmpty(foeSymbolOriginal))
+        Quest q = null;
+        if (!privateQuestBinding && !partyQuestBinding)
         {
-            foeRes = q.GetFoe(new Symbol(foeSymbolOriginal));
-            if (foeRes == null)
-                Debug.LogWarning($"[CmdSpawnQuestFoe] Foe '{foeSymbolOriginal}' not found in quest {questUID}. Spawning as non-quest enemy.");
-        }
-        else
-        {
-            Debug.LogWarning($"[CmdSpawnQuestFoe] Quest {questUID} not found. Spawning as non-quest enemy.");
+            q = QuestMachine.Instance.GetQuest(questUID);
+            if (q != null && !string.IsNullOrEmpty(foeSymbolOriginal))
+            {
+                foeRes = q.GetFoe(new Symbol(foeSymbolOriginal));
+                if (foeRes == null)
+                    Debug.LogWarning($"[CmdSpawnQuestFoe] Foe '{foeSymbolOriginal}' not found in quest {questUID}. Spawning as non-quest enemy.");
+            }
+            else
+            {
+                Debug.LogWarning($"[CmdSpawnQuestFoe] Quest {questUID} not found. Spawning as non-quest enemy.");
+            }
         }
 
         // Spawn at SCENE ROOT, at the PASSED WORLD POSITION (no parenting)
@@ -2203,7 +2744,7 @@ private void Srv_SpawnSingleQuestFoeInternal(
         if (dfEnemy)
         {
             dfEnemy.LoadID = DaggerfallUnity.NextUID;
-            if (foeRes != null)
+            if (foeRes != null || privateQuestBinding || partyQuestBinding)
                 dfEnemy.QuestSpawn = true;
         }
 
@@ -2285,7 +2826,9 @@ private void Srv_SpawnSingleQuestFoeInternal(
             // Preserve the actual Foe restraint separately from the generic settle
             // marker. Ordinary passive enemies and unrestrained quest waves must not
             // be pinned by the host after their finite spawn settle completes.
-            ewp.isFixedQuestFoeRestrained = foeRes != null && foeRes.IsRestrained;
+            ewp.isFixedQuestFoeRestrained = (privateQuestBinding || partyQuestBinding)
+                ? reaction == MobileReactions.Passive
+                : foeRes != null && foeRes.IsRestrained;
         }
 
         // Optional: dungeon flagging you already use
@@ -2299,12 +2842,20 @@ private void Srv_SpawnSingleQuestFoeInternal(
 
         GameManager.Instance?.RaiseOnEnemySpawnEvent(go);
 
-        // Ensure clients bind the quest on their local side too
+        // Shared/full foes keep the existing broadcast binding. A private quest foe is
+        // bound only on the requesting client, after its network spawn is visible there.
         var niAfterSpawn = go.GetComponent<NetworkIdentity>();
-        if (niAfterSpawn != null && foeRes != null)
-            RpcBindQuestFoe(niAfterSpawn.netId, questUID, foeSymbolOriginal);
+        if (niAfterSpawn != null)
+        {
+            if (partyQuestBinding)
+                PartyQuestFoeBinding.Register(niAfterSpawn.netId, this.netId, questUID, foeSymbolOriginal);
+            else if (privateQuestBinding && connectionToClient != null)
+                TargetBindPrivateQuestFoe(connectionToClient, niAfterSpawn.netId, questUID, foeSymbolOriginal);
+            else if (foeRes != null)
+                RpcBindQuestFoe(niAfterSpawn.netId, questUID, foeSymbolOriginal);
+        }
 
-        Debug.Log($"[CmdSpawnQuestFoe] Spawned networked quest foe ({foeType}) at {worldPosition} | questUID={questUID}, foe={foeSymbolOriginal}, interiorAtRequest={isInteriorAtRequest}, reaction={reaction}");
+        Debug.Log($"[CmdSpawnQuestFoe] Spawned networked quest foe ({foeType}) at {worldPosition} | questUID={questUID}, foe={foeSymbolOriginal}, privateBinding={privateQuestBinding}, interiorAtRequest={isInteriorAtRequest}, reaction={reaction}");
     }
     catch (System.Exception e)
     {
@@ -2325,6 +2876,24 @@ public void CmdSpawnQuestFoe(
 {
     if (!isServer) return;
 
+    // Shared party foes use a validated network quest instance, not the private path.
+    if (PartyQuestVirtualAuthority.QuestVirtualizationActive &&
+        questUID != 0UL && !string.IsNullOrEmpty(foeSymbolOriginal))
+    {
+        Srv_SpawnSingleQuestFoeInternal(
+            worldPosition,
+            questUID,
+            foeSymbolOriginal,
+            foeType,
+            mobileGenderInt,
+            siteTypeInt,
+            isInteriorAtRequest,
+            reaction,
+            false,
+            true);
+        return;
+    }
+
     // If the host/server does not have the client's quest yet, request the StartPacket
     // and delay spawning. This lets the server rebuild the Foe resource first, so the
     // single quest foe gets QuestResourceBehaviour while preserving the original spawn body.
@@ -2341,7 +2910,33 @@ public void CmdSpawnQuestFoe(
     Srv_SpawnSingleQuestFoeInternal(worldPosition, questUID, foeSymbolOriginal, foeType, mobileGenderInt, siteTypeInt, isInteriorAtRequest, reaction);
 }
 
+[Command]
+public void CmdSpawnPrivateQuestFoe(
+    UnityEngine.Vector3 worldPosition,
+    ulong questUID,
+    string foeSymbolOriginal,
+    MobileTypes foeType,
+    int mobileGenderInt,
+    int siteTypeInt,
+    bool isInteriorAtRequest,
+    MobileReactions reaction)
+{
+    if (!isServer) return;
 
+    // Private quest path: never request/import the client's quest on the host. The
+    // enemy is a normal network enemy on the server and is quest-bound only back on
+    // the requester through TargetBindPrivateQuestFoe().
+    Srv_SpawnSingleQuestFoeInternal(
+        worldPosition,
+        questUID,
+        foeSymbolOriginal,
+        foeType,
+        mobileGenderInt,
+        siteTypeInt,
+        isInteriorAtRequest,
+        reaction,
+        true);
+}
 
 
 [Command]
@@ -2358,6 +2953,26 @@ public void CmdCreateFoesWithPositions(
     if (!isServer) return;
 
     int spawnScalingLevel = ResolveServerPlayerLevelForSpawn(this.netId, 0, "CmdCreateFoesWithPositions");
+
+    // Shared wave foes receive the same party/instance binding as marker foes.
+    if (PartyQuestVirtualAuthority.QuestVirtualizationActive &&
+        questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
+    {
+        Srv_SpawnFoesInternal(
+            positions,
+            foeType,
+            spawnCount,
+            reaction,
+            alliedToPlayer,
+            questUID,
+            foeSymbolName,
+            isInteriorAtRequest,
+            spawnScalingLevel,
+            false,
+            false,
+            true);
+        return;
+    }
 
     // If this is a quest wave and server doesn't have the quest yet, request it from this client and queue the spawn.
     if (questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
@@ -2410,12 +3025,38 @@ public void CmdCreateFoesWithPositions(
     Srv_SpawnFoesInternal(positions, foeType, spawnCount, reaction, alliedToPlayer, questUID, foeSymbolName, isInteriorAtRequest, spawnScalingLevel);
 }
 
+[Command]
+public void CmdCreatePrivateQuestFoesWithPositions(
+    Vector3[] positions,
+    MobileTypes foeType,
+    int spawnCount,
+    MobileReactions reaction,
+    bool alliedToPlayer,
+    ulong questUID,
+    string foeSymbolName,
+    bool isInteriorAtRequest,
+    bool isDungeonAtRequest,
+    int requesterLevel)
+{
+    if (!isServer) return;
 
+    int spawnScalingLevel = ResolveServerPlayerLevelForSpawn(this.netId, requesterLevel, "CmdCreatePrivateQuestFoesWithPositions");
 
-
-
-
-
+    // Do not queue behind a StartPacket and do not look up questUID in the host's
+    // QuestMachine. The requester will attach its local Foe resource by TargetRpc.
+    Srv_SpawnFoesInternal(
+        positions,
+        foeType,
+        spawnCount,
+        reaction,
+        alliedToPlayer,
+        questUID,
+        foeSymbolName,
+        isInteriorAtRequest,
+        spawnScalingLevel,
+        true,
+        isDungeonAtRequest);
+}
 
 
     [Server]
@@ -2488,11 +3129,15 @@ public void CmdCreateFoesWithPositions(
         ulong questUID,
         string foeSymbolName,
         bool isInteriorAtRequest,
-        int spawnScalingLevel)
+        int spawnScalingLevel,
+        bool privateQuestBinding = false,
+        bool forceDungeonAtRequest = false,
+        bool partyQuestBinding = false)
     {
-        // Rebuild quest foe resource if provided (quest should exist now if UID was non-zero)
+        // Shared/full path resolves the host quest resource. Private path must never
+        // interpret the requester's quest UID against the host QuestMachine.
         Foe foeResource = null;
-        if (questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
+        if (!privateQuestBinding && !partyQuestBinding && questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
         {
             Quest q = QuestMachine.Instance != null ? QuestMachine.Instance.GetQuest(questUID) : null;
             if (q != null)
@@ -2552,6 +3197,9 @@ public void CmdCreateFoesWithPositions(
             // authoritative spawn target. Stamping the original client suggestion into
             // EnemyWorldPosition.intendedSpawnPos made later authority resnaps pull the
             // enemy back toward a stale pre-alignment height.
+            if ((privateQuestBinding || partyQuestBinding) && forceDungeonAtRequest && setupEnemy != null)
+                setupEnemy.isDungeonEnemy = true;
+
             Vector3 alignedSpawnPos = go.transform.position;
             if ((alignedSpawnPos - pos).sqrMagnitude > 0.0001f)
             {
@@ -2567,7 +3215,7 @@ public void CmdCreateFoesWithPositions(
             if (dfEnemy)
             {
                 dfEnemy.LoadID = DaggerfallUnity.NextUID;
-                if (foeResource != null)
+                if (foeResource != null || privateQuestBinding || partyQuestBinding)
                     dfEnemy.QuestSpawn = true;
             }
             if (foeResource != null)
@@ -2584,7 +3232,8 @@ public void CmdCreateFoesWithPositions(
                 // Wave CreateFoe requests do not carry siteType, so infer dungeon-anchor
                 // mode from the spawn Y slot. This protects dungeon CreateFoe waves from
                 // the same fake DF-distance/deactivation bug as single marker quest foes.
-                if (!isInteriorAtRequest && SrvLooksLikeNetworkDungeonPosition(alignedSpawnPos))
+                if (forceDungeonAtRequest ||
+                    (!isInteriorAtRequest && SrvLooksLikeNetworkDungeonPosition(alignedSpawnPos)))
                 {
                     int anchorX, anchorZ;
                     bool hasAnchor = SrvTryGetDungeonAnchorForQuestFoePosition(alignedSpawnPos, out anchorX, out anchorZ);
@@ -2605,7 +3254,11 @@ public void CmdCreateFoesWithPositions(
 
             GameManager.Instance?.RaiseOnEnemySpawnEvent(go);
 
-            if (foeResource != null)
+            if (partyQuestBinding)
+                PartyQuestFoeBinding.Register(ni.netId, this.netId, questUID, foeSymbolName);
+            else if (privateQuestBinding && connectionToClient != null)
+                TargetBindPrivateQuestFoe(connectionToClient, ni.netId, questUID, foeSymbolName);
+            else if (foeResource != null)
                 RpcBindQuestFoe(ni.netId, questUID, foeSymbolName);
 
             // Do not re-apply enemy settings after spawn. That rerolls health/gender and can create client max-health mismatches.
@@ -2613,8 +3266,81 @@ public void CmdCreateFoesWithPositions(
 
         RpcCreateFoes(Vector3.zero, foeType, spawnCount, reaction, alliedToPlayer);
     }
-[ClientRpc]
+[TargetRpc]
+public void TargetBindPrivateQuestFoe(NetworkConnection conn, uint enemyNetId, ulong questUID, string foeSymbolName)
+{
+    if (!isClient) return;
+    StartCoroutine(CoBindPrivateQuestFoeWhenSpawned(enemyNetId, questUID, foeSymbolName));
+}
+
+private IEnumerator CoBindPrivateQuestFoeWhenSpawned(uint enemyNetId, ulong questUID, string foeSymbolName)
+{
+    // TargetRpc and the spawned NetworkIdentity can arrive in either order. Give the
+    // normal Mirror spawn message a short window to populate NetworkClient.spawned.
+    float deadline = Time.realtimeSinceStartup + 3f;
+    NetworkIdentity ni = null;
+    while (Time.realtimeSinceStartup < deadline)
+    {
+        if (NetworkClient.spawned.TryGetValue(enemyNetId, out ni) && ni != null)
+            break;
+        yield return null;
+    }
+
+    if (ni == null)
+    {
+        Debug.LogWarning($"[PrivateQuestFoe] Requester could not resolve enemy netId={enemyNetId} for questUID={questUID} foe='{foeSymbolName}'.");
+        yield break;
+    }
+
+    Quest quest = QuestMachine.Instance != null ? QuestMachine.Instance.GetQuest(questUID) : null;
+    if (quest == null)
+    {
+        Debug.LogWarning($"[PrivateQuestFoe] Requester no longer has local quest uid={questUID} for enemy netId={enemyNetId}.");
+        yield break;
+    }
+
+    Foe foeRes = !string.IsNullOrEmpty(foeSymbolName)
+        ? quest.GetFoe(new Symbol(foeSymbolName))
+        : null;
+    if (foeRes == null)
+    {
+        Debug.LogWarning($"[PrivateQuestFoe] Requester could not find local Foe '{foeSymbolName}' in quest uid={questUID}.");
+        yield break;
+    }
+
+    GameObject go = ni.gameObject;
+    DaggerfallEnemy dfEnemy = go.GetComponent<DaggerfallEnemy>();
+    if (dfEnemy != null)
+        dfEnemy.QuestSpawn = true;
+
+    QuestResourceBehaviour qrb = go.GetComponent<QuestResourceBehaviour>();
+    if (qrb == null)
+        qrb = go.AddComponent<QuestResourceBehaviour>();
+
+    qrb.AssignResource(foeRes);
+    foeRes.QuestResourceBehaviour = qrb;
+    foeRes.RearmInjured();
+
+    Debug.Log($"[PrivateQuestFoe] Bound requester-only quest foe netId={enemyNetId} questUID={questUID} symbol='{foeSymbolName}'.");
+}
+
+// Keep the public call used by GameObjectHelper, but do not broadcast a host-local
+// quest UID. GameObjectHelper may choose ANY server PlayerMultiplayer as broadcaster.
 public void RpcBindQuestFoe(uint enemyNetId, ulong questUID, string foeSymbolName)
+{
+    if (!NetworkServer.active) return;
+    if (PartyQuestVirtualAuthority.QuestVirtualizationActive)
+    {
+        var host = NetworkServer.localConnection;
+        if (host != null && host.identity != null)
+            PartyQuestFoeBinding.Register(enemyNetId, host.identity.netId, questUID, foeSymbolName);
+        return;
+    }
+    RpcBindLegacyQuestFoe(enemyNetId, questUID, foeSymbolName);
+}
+
+[ClientRpc]
+private void RpcBindLegacyQuestFoe(uint enemyNetId, ulong questUID, string foeSymbolName)
 {
     if (isServer) return;
 
@@ -2819,6 +3545,8 @@ private void ApplyEnemySettingsPayload(
                     Debug.Log($"[SpawnHealthDbg][ClientApplySkipped] source={source} enemy='{enemy.name}' netId={netId} reason=already-initialized localCur={initializedEnemyEntity.CurrentHealth}");
                 }
             }
+
+            enemy.ReapplyExternalVisualOverrides();
             break;
         }
 
@@ -2826,11 +3554,30 @@ private void ApplyEnemySettingsPayload(
             entityBehaviourBefore.Entity is EnemyEntity enemyEntityBefore)
         {
             MobileEnemy beforeMe = enemyEntityBefore.MobileEnemy;
+            MobileUnit beforeMobileUnit = enemy.GetComponentInChildren<MobileUnit>();
+            EnemyMotor beforeMotor = enemy.GetComponent<EnemyMotor>();
+            string beforeVisualState = beforeMobileUnit != null
+                ? $"id={beforeMobileUnit.Enemy.ID} tex={beforeMobileUnit.Enemy.MaleTexture}/{beforeMobileUnit.Enemy.FemaleTexture} " +
+                  $"ranged={beforeMobileUnit.Enemy.HasRangedAttack1}/{beforeMobileUnit.Enemy.HasRangedAttack2}/{beforeMobileUnit.Enemy.CastsMagic}"
+                : "<none>";
+
             Debug.Log($"[SpawnHealthDbg][ClientBeforeApply] source={source} enemy='{enemy.name}' netId={netId} cur={enemyEntityBefore.CurrentHealth} min={beforeMe.MinHealth} max={beforeMe.MaxHealth} gender={enemy.EnemyGender} reaction={enemy.EnemyReaction}");
+            Debug.Log(
+                $"[ExternalFoeStateDiag][CLIENT_BEFORE_SETTINGS] source={source} enemy='{enemy.name}' netId={netId} " +
+                $"payloadType={foeType} payloadEnemyId={enemyID} entityId={beforeMe.ID} " +
+                $"entityRanged={beforeMe.HasRangedAttack1}/{beforeMe.HasRangedAttack2}/{beforeMe.CastsMagic} " +
+                $"visual=({beforeVisualState}) motorBow={(beforeMotor != null ? beforeMotor.hasBowAttack.ToString() : "<none>")} " +
+                $"extVisualId={enemy.ExternalVisualEnemyId} extTex={enemy.ExternalVisualMaleTexture}/{enemy.ExternalVisualFemaleTexture} " +
+                $"extVisualRangedFlags={enemy.ExternalVisualRangedFlags}");
         }
         else
         {
             Debug.Log($"[SpawnHealthDbg][ClientBeforeApply] source={source} enemy='{enemy.name}' netId={netId} entity=missing");
+            Debug.Log(
+                $"[ExternalFoeStateDiag][CLIENT_BEFORE_SETTINGS] source={source} enemy='{enemy.name}' netId={netId} " +
+                $"payloadType={foeType} payloadEnemyId={enemyID} entity=<missing> " +
+                $"extVisualId={enemy.ExternalVisualEnemyId} extTex={enemy.ExternalVisualMaleTexture}/{enemy.ExternalVisualFemaleTexture} " +
+                $"extVisualRangedFlags={enemy.ExternalVisualRangedFlags}");
         }
 
         enemy.SetPendingAuthoritativeSpawnHealth(authoritativeCurrent);
@@ -2858,12 +3605,45 @@ private void ApplyEnemySettingsPayload(
 
             EnemyMotor motor = enemy.GetComponent<EnemyMotor>();
             if (motor != null)
-                motor.hasBowAttack = (rangedAttack1 && (!castsMagic || rangedAttack2));
+            {
+                if (enemy.ExternalVisualRangedFlags >= 0)
+                {
+                    bool externalRangedAttack1 = (enemy.ExternalVisualRangedFlags & 1) != 0;
+                    bool externalRangedAttack2 = (enemy.ExternalVisualRangedFlags & 2) != 0;
+                    bool externalCastsMagic = (enemy.ExternalVisualRangedFlags & 4) != 0;
+
+                    motor.hasBowAttack =
+                        externalRangedAttack1 &&
+                        (!externalCastsMagic || externalRangedAttack2);
+                }
+                else
+                {
+                    motor.hasBowAttack = (rangedAttack1 && (!castsMagic || rangedAttack2));
+                }
+            }
 
             enemy.ApplyInitialSyncedHostility(isHostile);
 
+            // Normal authoritative settings rebuild the base enemy first. External
+            // caller-selected visuals are applied last so they cannot be overwritten
+            // by that ordinary enemy setup pass.
+            enemy.ReapplyExternalVisualOverrides();
+
             MobileEnemy afterMe = enemyEntityAfter.MobileEnemy;
+            MobileUnit afterMobileUnit = enemy.GetComponentInChildren<MobileUnit>();
+            string afterVisualState = afterMobileUnit != null
+                ? $"id={afterMobileUnit.Enemy.ID} tex={afterMobileUnit.Enemy.MaleTexture}/{afterMobileUnit.Enemy.FemaleTexture} " +
+                  $"ranged={afterMobileUnit.Enemy.HasRangedAttack1}/{afterMobileUnit.Enemy.HasRangedAttack2}/{afterMobileUnit.Enemy.CastsMagic}"
+                : "<none>";
+
             Debug.Log($"[SpawnHealthDbg][ClientAfterApply] source={source} enemy='{enemy.name}' netId={netId} foeType={foeType} reaction={reaction} gender={gender} cur={enemyEntityAfter.CurrentHealth} min={afterMe.MinHealth} max={afterMe.MaxHealth} authoritativeCur={authoritativeCurrent} authoritativeMax={authoritativeMax} hostile={isHostile}");
+            Debug.Log(
+                $"[ExternalFoeStateDiag][CLIENT_AFTER_SETTINGS] source={source} enemy='{enemy.name}' netId={netId} " +
+                $"payloadType={foeType} payloadEnemyId={enemyID} entityId={afterMe.ID} " +
+                $"entityRanged={afterMe.HasRangedAttack1}/{afterMe.HasRangedAttack2}/{afterMe.CastsMagic} " +
+                $"visual=({afterVisualState}) motorBow={(motor != null ? motor.hasBowAttack.ToString() : "<none>")} " +
+                $"extVisualId={enemy.ExternalVisualEnemyId} extTex={enemy.ExternalVisualMaleTexture}/{enemy.ExternalVisualFemaleTexture} " +
+                $"extVisualRangedFlags={enemy.ExternalVisualRangedFlags}");
         }
         else
         {
@@ -5393,10 +6173,13 @@ public void ServerSpawnSavedInteriorEnemy(
         MobileReactions reaction = isHostile ? MobileReactions.Hostile : MobileReactions.Passive;
         MobileTypes mobileType = SavedEnemyMobileType(entityType, careerIndex);
 
+        bool partyQuestBinding = PartyQuestVirtualAuthority.QuestVirtualizationActive &&
+            questSpawn && questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName);
+
         // If this was a quest foe but the host does not have the quest yet, use the
         // existing quest-spawn queue so QuestNetSync can request the quest packet from
         // the loading client, then spawn a proper quest foe after the quest exists.
-        if (questSpawn && questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
+        if (!partyQuestBinding && questSpawn && questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
         {
             Quest qCheck = QuestMachine.Instance != null ? QuestMachine.Instance.GetQuest(questUID) : null;
             if (qCheck == null)
@@ -5417,7 +6200,7 @@ public void ServerSpawnSavedInteriorEnemy(
         }
 
         Foe foeRes = null;
-        if (questSpawn && questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
+        if (!partyQuestBinding && questSpawn && questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName))
         {
             Quest q = QuestMachine.Instance != null ? QuestMachine.Instance.GetQuest(questUID) : null;
             if (q != null)
@@ -5459,7 +6242,7 @@ public void ServerSpawnSavedInteriorEnemy(
         if (dfEnemy != null)
         {
             dfEnemy.LoadID = DaggerfallUnity.NextUID;
-            dfEnemy.QuestSpawn = (foeRes != null);
+            dfEnemy.QuestSpawn = (foeRes != null || partyQuestBinding);
         }
 
         if (foeRes != null)
@@ -5505,7 +6288,9 @@ public void ServerSpawnSavedInteriorEnemy(
         GameManager.Instance?.RaiseOnEnemySpawnEvent(go);
 
         NetworkIdentity spawnedNi = go.GetComponent<NetworkIdentity>();
-        if (spawnedNi != null && foeRes != null)
+        if (spawnedNi != null && partyQuestBinding)
+            PartyQuestFoeBinding.Register(spawnedNi.netId, this.netId, questUID, foeSymbolName);
+        else if (spawnedNi != null && foeRes != null)
             RpcBindQuestFoe(spawnedNi.netId, questUID, foeSymbolName);
 
         Debug.Log($"[NetworkInteriorSave] Spawned saved MP interior enemy as network enemy type={mobileType} quest={questSpawn} questUID={questUID} foe='{foeSymbolName}' pos={worldPosition} hp={currentHealth}/{startingHealth}");

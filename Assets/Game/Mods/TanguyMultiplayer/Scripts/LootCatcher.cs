@@ -190,23 +190,23 @@ public class LootCatcher : NetworkBehaviour
         return ++nextEditRequest;
     }
 
-    public void SendLootEditRequest(uint id, int version, uint request)
+    public void SendLootEditRequest(uint id, int version, uint request, string partySelection = "")
     {
         if (!isLocalPlayer) return;
         // Sample on an inventory action, not during the empty corpse-created callback.
         // The action itself has not run: these are the pre-transfer contents.
         var corpse = IsCorpseLootId(id) ? FindLocalLootById(id) : null;
         string corpseItems = corpse != null ? SerializeLootItems(corpse) : null;
-        CmdBeginLootEdit(id, version, request, corpseItems);
+        CmdBeginLootEdit(id, version, request, corpseItems, partySelection);
     }
 
-    public void CommitLootEdit(uint id, uint request, string items)
+    public void CommitLootEdit(uint id, uint request, string items, string[] partyConsumed = null)
     {
-        if (isLocalPlayer) CmdCommitLootEdit(id, request, items);
+        if (isLocalPlayer) CmdCommitLootEdit(id, request, items, partyConsumed);
     }
 
     [Command]
-    void CmdBeginLootEdit(uint id, int version, uint request, string corpseItems)
+    void CmdBeginLootEdit(uint id, int version, uint request, string corpseItems, string partySelection)
     {
         // Commands are processed serially: only the first valid initial snapshot wins.
         // Other clients must match its contents and version before they can edit it.
@@ -226,6 +226,8 @@ public class LootCatcher : NetworkBehaviour
         bool sameCorpseContents = current != 0 || !clientInitializedCorpses.Contains(id) ||
             string.Equals(corpseItems, items, StringComparison.Ordinal);
         bool accepted = available && current == version && sameCorpseContents;
+        if (accepted)
+            accepted = PartyQuestLootOverlay.ServerReserve(connectionToClient, id, request, partySelection);
         if (accepted)
             lootEdits[id] = new LootEdit { owner = this, request = request, startedRealtime = Time.realtimeSinceStartup };
         TraceLootPause(accepted ? "request-granted" : "request-rejected", id,
@@ -271,11 +273,11 @@ public class LootCatcher : NetworkBehaviour
         if (sync != null && sync.ReceiveEditGrant(request, accepted, version, items))
             return;
         // Window/scene disappeared before permission arrived. No action occurred.
-        if (accepted) CmdCommitLootEdit(id, request, items);
+        if (accepted) CmdCommitLootEdit(id, request, items, null);
     }
 
     [Command]
-    void CmdCommitLootEdit(uint id, uint request, string items)
+    void CmdCommitLootEdit(uint id, uint request, string items, string[] partyConsumed)
     {
         LootEdit edit;
         if (!lootEdits.TryGetValue(id, out edit) || edit.owner != this || edit.request != request)
@@ -293,6 +295,7 @@ public class LootCatcher : NetworkBehaviour
         if (items != previous) ++version;
         serverLootVersionById[id] = version;
         TraceLootPause("commit", id, "requester=" + netId + " request=" + request + " heldSeconds=" + (Time.realtimeSinceStartup - edit.startedRealtime).ToString("F3"));
+        PartyQuestLootOverlay.ServerCommit(netId, id, request, partyConsumed);
         lootEdits.Remove(id);
         Debug.Log("[LootTransaction] committed request=" + request + " lootId=" + id + " version=" + version);
 
@@ -318,6 +321,7 @@ public class LootCatcher : NetworkBehaviour
 
     void ReleaseDisconnectedEdits()
     {
+        PartyQuestLootOverlay.ServerRelease(netId);
         var remove = new List<uint>();
         foreach (var entry in lootEdits)
             if (entry.Value.owner == this) remove.Add(entry.Key);
@@ -396,6 +400,10 @@ public class LootCatcher : NetworkBehaviour
         TraceLootPause("local-corpse-created", corpseLootId, "items=" + corpseLoot.Items.Count);
         string localItems = SerializeLootItems(corpseLoot);
         catcher.RegisterLocalCorpseLoot(corpseLootId, 0, corpseLoot, localItems, "local-corpse-created");
+
+        // Party quest loot stays out of the global snapshot above. Register the local
+        // corpse with the party overlay so only the owning party receives those items.
+        PartyQuestLootOverlay.OnLocalCorpseRegistered(enemy, corpseLoot);
     }
 
     // Called from DaggerfallEntityBehaviour on the server after the normal DFU death event has
@@ -562,6 +570,95 @@ public class LootCatcher : NetworkBehaviour
         cmdSpawnLoot(pos.x, pos.y, pos.z, items, parentName, exterior, worldX, worldZ, exteriorY);
     }
 
+    static bool IsLocalOnlyPrivateQuestLootItem(DaggerfallUnityItem item)
+    {
+        if (item == null || !item.IsQuestItem || item.QuestUID == 0)
+            return false;
+
+        // In party virtual-server mode quest-linked corpse items are a party-local
+        // overlay. Never put them into LootCatcher's global authoritative snapshot,
+        // otherwise every party would see the same green quest item.
+        if (PartyQuestVirtualAuthority.QuestVirtualizationActive)
+            return true;
+
+        try
+        {
+            return QuestNetSync.ShouldKeepQuestLootLocalOnly(item.QuestUID);
+        }
+        catch
+        {
+            // If quest-mode state is unavailable for any reason, fall back to the
+            // established synchronized loot behavior rather than hiding an item.
+            return false;
+        }
+    }
+
+    static List<DaggerfallUnityItem> CaptureLocalOnlyPrivateQuestLoot(DaggerfallLoot loot)
+    {
+        List<DaggerfallUnityItem> privateItems = new List<DaggerfallUnityItem>();
+        if (loot == null || loot.Items == null)
+            return privateItems;
+
+        for (int i = 0; i < loot.Items.Count; i++)
+        {
+            DaggerfallUnityItem item = loot.Items.GetItem(i);
+            if (IsLocalOnlyPrivateQuestLootItem(item))
+                privateItems.Add(item);
+        }
+
+        return privateItems;
+    }
+
+    static bool HasEquivalentQuestItem(DaggerfallLoot loot, DaggerfallUnityItem wanted)
+    {
+        if (loot == null || loot.Items == null || wanted == null)
+            return false;
+
+        string wantedSymbol = wanted.QuestItemSymbol != null ? wanted.QuestItemSymbol.Name : string.Empty;
+
+        for (int i = 0; i < loot.Items.Count; i++)
+        {
+            DaggerfallUnityItem existing = loot.Items.GetItem(i);
+            if (existing == null)
+                continue;
+
+            if (object.ReferenceEquals(existing, wanted))
+                return true;
+
+            if (!existing.IsQuestItem || existing.QuestUID != wanted.QuestUID)
+                continue;
+
+            string existingSymbol = existing.QuestItemSymbol != null ? existing.QuestItemSymbol.Name : string.Empty;
+            if (!string.IsNullOrEmpty(wantedSymbol) &&
+                string.Equals(existingSymbol, wantedSymbol, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    static int RestoreLocalOnlyPrivateQuestLoot(DaggerfallLoot loot, List<DaggerfallUnityItem> privateItems)
+    {
+        if (loot == null || loot.Items == null || privateItems == null || privateItems.Count == 0)
+            return 0;
+
+        int restored = 0;
+        for (int i = 0; i < privateItems.Count; i++)
+        {
+            DaggerfallUnityItem item = privateItems[i];
+            if (item == null || !IsLocalOnlyPrivateQuestLootItem(item))
+                continue;
+
+            if (!HasEquivalentQuestItem(loot, item))
+            {
+                loot.Items.AddItem(item);
+                restored++;
+            }
+        }
+
+        return restored;
+    }
+
     public static string SerializeLootItems(DaggerfallLoot loot)
     {
         if (loot == null || loot.Items == null)
@@ -572,6 +669,13 @@ public class LootCatcher : NetworkBehaviour
         foreach (DaggerfallUnityItem item in loot.Items.CloneAll())
         {
             if (item == null)
+                continue;
+
+            // An unshared/off quest item attached to a requester-only quest foe is a
+            // local overlay on an otherwise shared corpse. Never put that overlay into
+            // the server's authoritative loot snapshot. Full mode and mapped/shared
+            // quests always return false here and use the established serializer.
+            if (IsLocalOnlyPrivateQuestLootItem(item))
                 continue;
 
             // Keep the original stable serializer for all normal loot:
@@ -1568,8 +1672,22 @@ public class LootCatcher : NetworkBehaviour
 
             WatchCorpseQuestItems(lootId, items);
             if (IsCorpseLootId(lootId)) TraceCorpseQuestInventoryNow("before-corpse-replace");
+
+            // The server owns the shared/base corpse inventory, but intentionally knows
+            // nothing about requester-only private quests. Preserve only those local
+            // quest items across the base snapshot replacement.
+            List<DaggerfallUnityItem> localOnlyPrivateQuestItems =
+                IsCorpseLootId(lootId) ? CaptureLocalOnlyPrivateQuestLoot(loot) : null;
+
             loot.Items.Clear();
             int added = AddSerializedItemsToLoot(loot, items);
+            int restoredPrivate = RestoreLocalOnlyPrivateQuestLoot(loot, localOnlyPrivateQuestItems);
+            PartyQuestLootOverlay.ReconcileCorpse(loot);
+
+            if (restoredPrivate > 0)
+                Debug.Log("[PrivateQuestLoot] Preserved " + restoredPrivate +
+                    " requester-only quest item(s) across corpse snapshot. lootId=" + lootId);
+
             if (IsCorpseLootId(lootId)) TraceCorpseQuestInventoryNow("after-corpse-replace");
 
             localLootItemsById[lootId] = items ?? string.Empty;

@@ -944,6 +944,12 @@ namespace Mirror
                 return;
             }
 
+            // QuestNetSync-only virtual authority routing. The normal Mirror authority
+            // checks above have already authenticated the sender. Non-QNS Commands return
+            // false and continue through the original dispatcher unchanged.
+            if (QuestNetVirtualTransport.TryInterceptCommand(conn, identity, msg, channelId))
+                return;
+
             // Debug.Log($"OnCommandMessage for netId:{msg.netId} conn:{conn}");
 
             using (PooledNetworkReader networkReader = NetworkReaderPool.GetReader(msg.payload))

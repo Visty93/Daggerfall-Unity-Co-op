@@ -131,6 +131,9 @@ namespace DaggerfallWorkshop.Game.UserInterface
                 if (player == null || player.isLocalPlayer || !player.isActiveAndEnabled)
                     continue;
 
+                if (!global::MultiplayerPartyManager.IsLocalPartyMember(player))
+                    continue;
+
                 uint key = GetStableEntryKey(player);
                 if (!seenKeys.Add(key))
                     continue;

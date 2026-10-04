@@ -1,5 +1,4 @@
 ﻿using System.Collections;
-using System.Collections.Generic;
 using UnityEngine;
 using DaggerfallWorkshop.Utility;
 using DaggerfallWorkshop;
@@ -11,189 +10,168 @@ using Mirror;
 public class TimeCatcher : NetworkBehaviour
 {
     WorldTime worldTime;
-    static uint lastGameMinutes;
-
-    // Current behaviour syncs after a large local time jump (>40 minutes), on a host
-    // heartbeat, and immediately after connect/load. QuestNetSync uses the readiness
-    // flag below to avoid importing a timed quest before authoritative host time arrives.
+    static TimeCatcher localInstance;
+    static bool postLoadAuthoritativeTimeReady;
+    uint lastGameMinutes;
     const float checkIntervalSeconds = 2.25f;
-    const float periodicHostSyncSeconds = 10f;
+    const float periodicLeaderSyncSeconds = 10f;
     const uint largeLocalJumpMinutes = 40;
     const uint applyDriftThresholdMinutes = 1;
 
-    static bool postLoadAuthoritativeTimeReady = false;
+    bool subscribed;
+    bool wasLoadInProgress;
+    bool observedTimeOption;
+    bool routeKnown;
+    bool routeNeedsSync;
+    bool waitingForFreshSample;
+    ulong localParty, localEpoch;
+    uint localLeader;
+    ulong requestToken, lastDelivery;
+    float nextCheckTime, nextPeriodicSyncTime;
+    bool alignClassicDiseasesOnNextPostLoadHostTime;
 
-    float nextPeriodicSyncTime = 0f;
-    bool wasLoadInProgress = false;
-    bool subscribedToSaveLoadEvents = false;
-
-    // Set only when a pure client actually starts loading a save while host-authoritative
-    // time is active. The next accepted host-time sample rebases ordinary classic disease
-    // day counters once, then this flag is consumed. Initial connection and periodic time
-    // packets never set it, so ordinary disease progression remains intact.
-    bool alignClassicDiseasesOnNextPostLoadHostTime = false;
-
-    // This is deliberately acknowledgement-based rather than drift-based. A one-minute
-    // difference is harmless; the important point is that host time has been received
-    // after the current load. Non-host-authoritative mode never needs this gate.
-    public static bool IsPostLoadAuthoritativeTimeReady
-    {
-        get { return !OptionsMultiplayer.timeHost || postLoadAuthoritativeTimeReady; }
-    }
+    // These belong to this player's replica on the physical server, not its clock.
+    ulong serverParty, serverEpoch, serverToken, serverDelivery;
+    uint serverLeader;
 
     public static bool IsMultiplayerSessionActive
     {
         get { return NetworkServer.active || NetworkClient.isConnected; }
     }
 
-    // A listen-server host is also a Mirror client, so NetworkClient.isConnected alone
-    // is not enough. This is the shared policy for local-only behaviour that must be
-    // suppressed when the host owns world time.
-    public static bool IsPureClientUsingHostTime
+    public static bool IsPostLoadAuthoritativeTimeReady
     {
         get
         {
-            return OptionsMultiplayer.timeHost &&
-                   NetworkClient.isConnected &&
-                   !NetworkServer.active;
+            if (!OptionsMultiplayer.timeHost || !IsMultiplayerSessionActive)
+                return true;
+            ulong party, epoch;
+            uint leader;
+            return localInstance != null && !localInstance.IsLoadInProgress() &&
+                postLoadAuthoritativeTimeReady && TryGetLocalRoute(out party, out leader, out epoch) &&
+                localInstance.routeKnown && localInstance.localParty == party &&
+                localInstance.localLeader == leader && localInstance.localEpoch == epoch;
         }
+    }
+
+    // Used ONLY by travel, prison, and vampire transformation. Rest/wait and
+    // exhaustion retain their existing local time passage and gameplay effects.
+    public static bool ShouldSuppressLocalTimeJump
+    {
+        get
+        {
+            if (!OptionsMultiplayer.timeHost || !IsMultiplayerSessionActive)
+                return false;
+            ulong party, epoch;
+            uint leader;
+            // During initial membership discovery do not assume local leadership.
+            return !TryGetLocalRoute(out party, out leader, out epoch) || leader != GetLocalNetId();
+        }
+    }
+
+    // Compatibility for callers compiled against the old name. The host can now
+    // be a follower and a pure client can now be a leader.
+    public static bool IsPureClientUsingHostTime
+    {
+        get { return ShouldSuppressLocalTimeJump; }
+    }
+
+    static uint GetLocalNetId()
+    {
+        if (NetworkClient.localPlayer != null)
+            return NetworkClient.localPlayer.netId;
+        return localInstance != null ? localInstance.netId : 0U;
+    }
+
+    static bool TryGetLocalRoute(out ulong party, out uint leader, out ulong epoch)
+    {
+        party = epoch = 0UL;
+        leader = 0U;
+        uint player = GetLocalNetId();
+        if (player == 0U)
+            return false;
+        if (NetworkServer.active)
+            return MultiplayerPartyManager.ServerTryGetPartyTimeRoute(player, out party, out leader, out epoch);
+        MultiplayerPartyManager.PartyClientState state;
+        if (!MultiplayerPartyManager.TryGetClientPartyState(player, out state) || state == null)
+            return false;
+        party = state.PartyId;
+        leader = state.LeaderNetId;
+        epoch = state.TimeEpoch;
+        return party != 0UL && leader != 0U && epoch != 0UL;
+    }
+
+    public override void OnStartLocalPlayer()
+    {
+        base.OnStartLocalPlayer();
+        InitializeLocal();
     }
 
     void Start()
     {
-        init();
+        if (isLocalPlayer)
+            InitializeLocal();
     }
 
-    void init()
+    void InitializeLocal()
     {
-        worldTime = GameObject.Find("DaggerfallUnity").GetComponent<WorldTime>();
-
-        if (isLocalPlayer)
-        {
-            SubscribeToSaveLoadEvents();
-            StartCoroutine(Check());
-        }
+        if (subscribed || !isLocalPlayer)
+            return;
+        localInstance = this;
+        postLoadAuthoritativeTimeReady = false;
+        observedTimeOption = OptionsMultiplayer.timeHost;
+        wasLoadInProgress = IsLoadInProgress();
+        alignClassicDiseasesOnNextPostLoadHostTime = wasLoadInProgress && ShouldSuppressLocalTimeJump;
+        SaveLoadManager.OnStartLoad += HandleStartLoad;
+        SaveLoadManager.OnLoad += HandleLoadComplete;
+        MultiplayerPartyManager.PartyStateChanged += HandlePartyStateChanged;
+        Mirror.NetworkManager.SessionStopped += HandleSessionStopped;
+        subscribed = true;
+        routeNeedsSync = true;
+        nextCheckTime = nextPeriodicSyncTime = 0f;
+        InvalidateSample();
     }
 
     void OnDestroy()
     {
-        UnsubscribeFromSaveLoadEvents();
+        Unsubscribe();
     }
 
-    void SubscribeToSaveLoadEvents()
+    public override void OnStopClient()
     {
-        if (subscribedToSaveLoadEvents)
-            return;
-
-        SaveLoadManager.OnStartLoad += HandleStartLoad;
-        SaveLoadManager.OnLoad += HandleLoadComplete;
-        subscribedToSaveLoadEvents = true;
+        Unsubscribe();
+        base.OnStopClient();
     }
 
-    void UnsubscribeFromSaveLoadEvents()
+    void HandleSessionStopped()
     {
-        if (!subscribedToSaveLoadEvents)
-            return;
-
-        SaveLoadManager.OnStartLoad -= HandleStartLoad;
-        SaveLoadManager.OnLoad -= HandleLoadComplete;
-        subscribedToSaveLoadEvents = false;
+        Unsubscribe();
     }
 
-    void HandleStartLoad(SaveData_v1 saveData)
+    void Unsubscribe()
     {
-        wasLoadInProgress = true;
-        alignClassicDiseasesOnNextPostLoadHostTime = IsPureClientUsingHostTime;
-        MarkAuthoritativeTimePending("load-start");
-    }
-
-    void HandleLoadComplete(SaveData_v1 saveData)
-    {
-        wasLoadInProgress = false;
-        SynchronizeImmediatelyAfterLoad("load-complete-event");
-    }
-
-    IEnumerator Check()
-    {
-        // Wait one frame so Mirror ownership/world objects have settled, then do an
-        // immediate synchronization. Pure clients stay gated until a host response arrives.
-        yield return null;
-
-        lastGameMinutes = GetClassicGameMinutes();
-        wasLoadInProgress = IsLoadInProgress();
-        nextPeriodicSyncTime = Time.realtimeSinceStartup + periodicHostSyncSeconds;
-
-        if (wasLoadInProgress)
+        if (subscribed)
         {
-            // Do not apply an in-flight host packet while SaveLoadManager is still
-            // restoring this save. OnLoad will request again immediately.
-            MarkAuthoritativeTimePending("initial-load-in-progress");
-            alignClassicDiseasesOnNextPostLoadHostTime = IsPureClientUsingHostTime;
+            SaveLoadManager.OnStartLoad -= HandleStartLoad;
+            SaveLoadManager.OnLoad -= HandleLoadComplete;
+            MultiplayerPartyManager.PartyStateChanged -= HandlePartyStateChanged;
+            Mirror.NetworkManager.SessionStopped -= HandleSessionStopped;
+            subscribed = false;
         }
-        else
+        if (localInstance == this)
         {
-            if (OptionsMultiplayer.timeHost && !isServer)
-                MarkAuthoritativeTimePending("initial-client-sync");
-
-            RequestOrBroadcastCurrentTime("initial");
+            localInstance = null;
+            postLoadAuthoritativeTimeReady = false;
         }
-
-        while (true)
-        {
-            bool loadInProgress = IsLoadInProgress();
-
-            // Event callbacks are the normal path. Keep this edge detector only as a
-            // fallback for unusual lifecycle ordering where the local component missed
-            // OnStartLoad or OnLoad while it was being created/re-enabled.
-            if (loadInProgress && !wasLoadInProgress)
-            {
-                wasLoadInProgress = true;
-                alignClassicDiseasesOnNextPostLoadHostTime = IsPureClientUsingHostTime;
-                MarkAuthoritativeTimePending("load-start-poll-fallback");
-            }
-            else if (!loadInProgress && wasLoadInProgress)
-            {
-                wasLoadInProgress = false;
-                SynchronizeImmediatelyAfterLoad("load-complete-poll-fallback");
-            }
-
-            if (loadInProgress)
-            {
-                yield return new WaitForSeconds(checkIntervalSeconds);
-                continue;
-            }
-
-            uint currentGameMinutes = GetClassicGameMinutes();
-
-            // Do not use unsigned subtraction here. If host time sync moves the local
-            // clock backwards, uint/ulong subtraction underflows and this check fires forever.
-            if (currentGameMinutes >= lastGameMinutes && currentGameMinutes - lastGameMinutes > largeLocalJumpMinutes)
-                RequestOrBroadcastCurrentTime("large-local-jump");
-
-            // Only the host's local player broadcasts periodically in host-authoritative mode.
-            // Clients request immediately on connect/load or after a large local jump.
-            if (OptionsMultiplayer.timeHost && isServer && Time.realtimeSinceStartup >= nextPeriodicSyncTime)
-            {
-                SendCurrentTimeToOthers("periodic-host");
-                nextPeriodicSyncTime = Time.realtimeSinceStartup + periodicHostSyncSeconds;
-            }
-
-            lastGameMinutes = GetClassicGameMinutes();
-            yield return new WaitForSeconds(checkIntervalSeconds);
-        }
+        routeKnown = false;
+        serverParty = serverEpoch = serverToken = 0UL;
     }
 
-    void SynchronizeImmediatelyAfterLoad(string reason)
+    bool EnsureWorldTime()
     {
-        lastGameMinutes = GetClassicGameMinutes();
-        nextPeriodicSyncTime = Time.realtimeSinceStartup + periodicHostSyncSeconds;
-
-        if (OptionsMultiplayer.timeHost)
-            MarkAuthoritativeTimePending(reason + "-requesting");
-
-        // No extra frame or 0.5-second delay: SaveLoadManager raises OnLoad only after
-        // restoring save data and clearing LoadInProgress.
-        RequestOrBroadcastCurrentTime(reason);
+        if (worldTime == null && DaggerfallUnity.Instance != null)
+            worldTime = DaggerfallUnity.Instance.WorldTime;
+        return worldTime != null;
     }
 
     bool IsLoadInProgress()
@@ -201,87 +179,274 @@ public class TimeCatcher : NetworkBehaviour
         return SaveLoadManager.Instance != null && SaveLoadManager.Instance.LoadInProgress;
     }
 
-    static void MarkAuthoritativeTimePending(string reason)
+    void InvalidateSample()
     {
+        requestToken++;
+        if (requestToken == 0UL) requestToken++;
+        waitingForFreshSample = true;
+        lastDelivery = 0UL;
+        postLoadAuthoritativeTimeReady = false;
+    }
+
+    void RefreshRoute()
+    {
+        ulong party, epoch;
+        uint leader;
+        bool known = TryGetLocalRoute(out party, out leader, out epoch);
+        if (known == routeKnown && party == localParty && leader == localLeader && epoch == localEpoch)
+            return;
+        routeKnown = known;
+        localParty = party;
+        localLeader = leader;
+        localEpoch = epoch;
+        InvalidateSample();
+        routeNeedsSync = true;
+        nextCheckTime = 0f;
+        // Becoming solo or leader keeps the current clock. It never restores a
+        // pre-party date or applies an old leader's cached sample.
+    }
+
+    void HandlePartyStateChanged()
+    {
+        if (!isLocalPlayer || localInstance != this || !OptionsMultiplayer.timeHost)
+            return;
+        RefreshRoute();
+        // Work runs in Update, outside the party snapshot handler.
+    }
+
+    void HandleStartLoad(SaveData_v1 saveData)
+    {
+        wasLoadInProgress = true;
+        alignClassicDiseasesOnNextPostLoadHostTime = ShouldSuppressLocalTimeJump;
+        InvalidateSample();
+        routeNeedsSync = true;
+    }
+
+    void HandleLoadComplete(SaveData_v1 saveData)
+    {
+        wasLoadInProgress = false;
+        // A second invalidation also covers a missed OnStartLoad and rejects any
+        // response sampled during restoration. Only a new leader reply can reopen readiness.
+        InvalidateSample();
+        if (OptionsMultiplayer.timeHost) RefreshRoute();
+        routeNeedsSync = true;
+        SynchronizeNow("load-complete");
+    }
+
+    void Update()
+    {
+        if (!isLocalPlayer || !IsMultiplayerSessionActive)
+            return;
+        InitializeLocal();
+        if (localInstance != this || !EnsureWorldTime())
+            return;
+
+        if (observedTimeOption != OptionsMultiplayer.timeHost)
+        {
+            observedTimeOption = OptionsMultiplayer.timeHost;
+            InvalidateSample();
+            routeNeedsSync = true;
+        }
+        if (OptionsMultiplayer.timeHost) RefreshRoute();
+        bool loading = IsLoadInProgress();
+        if (loading && !wasLoadInProgress)
+            HandleStartLoad(default(SaveData_v1));
+        else if (!loading && wasLoadInProgress)
+            HandleLoadComplete(default(SaveData_v1));
+        if (loading)
+            return;
+
+        float now = Time.realtimeSinceStartup;
+        if (routeNeedsSync)
+        {
+            SynchronizeNow("initial-or-party-change");
+            return;
+        }
+        if (now < nextCheckTime)
+            return;
+        nextCheckTime = now + checkIntervalSeconds;
+        uint current = GetClassicGameMinutes();
+        bool largeJump = current >= lastGameMinutes && current - lastGameMinutes > largeLocalJumpMinutes;
+        if (OptionsMultiplayer.timeHost)
+        {
+            if (waitingForFreshSample || largeJump || now >= nextPeriodicSyncTime)
+                SynchronizeNow(largeJump ? "local-time-jump" : "periodic-or-retry");
+        }
+        else if (largeJump)
+        {
+            // Preserve the old setting-OFF behavior: a local large jump is shared.
+            cmdSendTime(worldTime.Now.ToSeconds());
+        }
+        lastGameMinutes = GetClassicGameMinutes();
+    }
+
+    void SynchronizeNow(string reason)
+    {
+        if (!isLocalPlayer || IsLoadInProgress() || !EnsureWorldTime() || !NetworkClient.ready)
+            return;
+        if (OptionsMultiplayer.timeHost) RefreshRoute();
+        if (OptionsMultiplayer.timeHost && !routeKnown)
+            return; // No host-time fallback while discovering a solo party.
+        routeNeedsSync = false;
+        nextCheckTime = Time.realtimeSinceStartup + checkIntervalSeconds;
+        nextPeriodicSyncTime = Time.realtimeSinceStartup + periodicLeaderSyncSeconds;
+        lastGameMinutes = GetClassicGameMinutes();
         if (!OptionsMultiplayer.timeHost)
         {
-            postLoadAuthoritativeTimeReady = true;
+            cmdSendTime(worldTime.Now.ToSeconds());
+            waitingForFreshSample = false;
+            MarkAuthoritativeTimeReady(reason + "-legacy");
             return;
         }
-
-        postLoadAuthoritativeTimeReady = false;
-        if (Debug.isDebugBuild)
-            Debug.Log("[TimeCatcher] Authoritative time pending. reason=" + reason);
-    }
-
-    void MarkAuthoritativeTimeReady(string reason)
-    {
-        // A periodic packet can arrive while SaveLoadManager is still restoring the save.
-        // Do not let that old/in-flight packet reopen quest sharing during the load.
-        if (IsLoadInProgress())
-            return;
-
-        if (!postLoadAuthoritativeTimeReady && Debug.isDebugBuild)
-            Debug.Log("[TimeCatcher] Authoritative time ready. reason=" + reason + " minutes=" + GetClassicGameMinutes());
-
-        postLoadAuthoritativeTimeReady = true;
-    }
-
-    void RequestOrBroadcastCurrentTime(string reason)
-    {
-        if (worldTime == null)
-            worldTime = GameObject.Find("DaggerfallUnity").GetComponent<WorldTime>();
-
-        // Host-authoritative mode: clients request host time. The host's loaded local
-        // clock is authoritative, so it can become ready as soon as it broadcasts.
-        if (OptionsMultiplayer.timeHost && !isServer)
+        if (localLeader == netId)
         {
-            Debug.Log($"[TimeCatcher] Requesting host time. reason={reason} localMinutes={GetClassicGameMinutes()}");
-            cmdReceiveTime();
-            return;
+            alignClassicDiseasesOnNextPostLoadHostTime = false;
+            waitingForFreshSample = false;
+            CmdPublishPartyTime(localParty, localEpoch, worldTime.Now.ToSeconds());
+            MarkAuthoritativeTimeReady(reason + "-leader");
         }
-
-        SendCurrentTimeToOthers(reason);
-        MarkAuthoritativeTimeReady(reason + "-local-authority");
+        else
+        {
+            CmdRequestPartyTime(localParty, localEpoch, requestToken);
+        }
     }
 
-    void SendCurrentTimeToOthers(string reason)
+    static TimeCatcher FindServerClock(uint player)
     {
-        if (worldTime == null)
-            worldTime = GameObject.Find("DaggerfallUnity").GetComponent<WorldTime>();
+        NetworkIdentity identity;
+        return NetworkServer.spawned.TryGetValue(player, out identity) && identity != null
+            ? identity.GetComponent<TimeCatcher>() : null;
+    }
 
-        DaggerfallDateTime now = worldTime.Now;
-        Debug.Log($"[TimeCatcher] Sending time. reason={reason} minutes={now.ToClassicDaggerfallTime()} seconds={now.ToSeconds()} isServer={isServer}");
-        cmdSendTime(now.ToSeconds());
+    bool ServerMatchesRoute(ulong party, ulong epoch, out uint leader)
+    {
+        ulong currentParty, currentEpoch;
+        return MultiplayerPartyManager.ServerTryGetPartyTimeRoute(netId, out currentParty, out leader, out currentEpoch) &&
+            currentParty == party && currentEpoch == epoch;
     }
 
     [Command]
-    public void cmdSendTime(ulong i/*int year, int month, int day, int hour, int minute, float second*/)
+    void CmdPublishPartyTime(ulong party, ulong epoch, ulong seconds)
     {
-        rpcSendTime(i/*year, month, day, hour, minute, second*/);
+        uint leader;
+        if (!OptionsMultiplayer.timeHost || !ServerMatchesRoute(party, epoch, out leader) || leader != netId)
+            return;
+        foreach (NetworkConnection connection in MultiplayerPartyManager.ServerGetPartyConnections(netId))
+        {
+            if (connection == null || !connection.isReady || connection.identity == null || connection.identity.netId == netId)
+                continue;
+            TimeCatcher follower = connection.identity.GetComponent<TimeCatcher>();
+            if (follower != null)
+                follower.SendPartySample(party, epoch, netId, follower.serverToken, seconds, false);
+        }
+    }
+
+    [Command]
+    void CmdRequestPartyTime(ulong party, ulong epoch, ulong token)
+    {
+        uint leader;
+        if (!OptionsMultiplayer.timeHost || token == 0UL ||
+            !ServerMatchesRoute(party, epoch, out leader) || leader == netId)
+            return;
+        serverParty = party;
+        serverEpoch = epoch;
+        serverLeader = leader;
+        serverToken = token;
+        TimeCatcher source = FindServerClock(leader);
+        if (source != null && source.connectionToClient != null && source.connectionToClient.isReady)
+            source.TargetCapturePartyTime(source.connectionToClient, netId, party, epoch, token);
+    }
+
+    [TargetRpc]
+    void TargetCapturePartyTime(NetworkConnection target, uint requester, ulong party, ulong epoch, ulong token)
+    {
+        if (!isLocalPlayer || !OptionsMultiplayer.timeHost || IsLoadInProgress() || !EnsureWorldTime())
+            return;
+        InitializeLocal();
+        RefreshRoute();
+        if (!routeKnown || localParty != party || localEpoch != epoch || localLeader != netId)
+            return;
+        CmdReplyPartyTime(requester, party, epoch, token, worldTime.Now.ToSeconds());
+    }
+
+    [Command]
+    void CmdReplyPartyTime(uint requester, ulong party, ulong epoch, ulong token, ulong seconds)
+    {
+        uint leader;
+        if (!OptionsMultiplayer.timeHost || !ServerMatchesRoute(party, epoch, out leader) || leader != netId)
+            return;
+        TimeCatcher follower = FindServerClock(requester);
+        if (follower != null && requester != netId)
+            follower.SendPartySample(party, epoch, netId, token, seconds, true);
+    }
+
+    void SendPartySample(ulong party, ulong epoch, uint leader, ulong token, ulong seconds, bool freshReply)
+    {
+        uint currentLeader;
+        if (!NetworkServer.active || token == 0UL || serverToken != token || serverParty != party ||
+            serverEpoch != epoch || serverLeader != leader || !ServerMatchesRoute(party, epoch, out currentLeader) ||
+            currentLeader != leader || connectionToClient == null || !connectionToClient.isReady)
+            return;
+        serverDelivery++;
+        TargetApplyPartyTime(connectionToClient, party, epoch, leader, token, serverDelivery, seconds, freshReply);
+    }
+
+    [TargetRpc]
+    void TargetApplyPartyTime(NetworkConnection target, ulong party, ulong epoch, uint leader,
+        ulong token, ulong delivery, ulong seconds, bool freshReply)
+    {
+        if (!isLocalPlayer || !OptionsMultiplayer.timeHost || IsLoadInProgress() || !EnsureWorldTime())
+            return;
+        InitializeLocal();
+        RefreshRoute();
+        if (!routeKnown || localParty != party || localEpoch != epoch || localLeader != leader ||
+            leader == netId || token != requestToken || delivery <= lastDelivery ||
+            (waitingForFreshSample && !freshReply))
+            return;
+        lastDelivery = delivery;
+        waitingForFreshSample = false;
+        ApplySyncedTime(seconds, "party-leader-" + leader);
+    }
+
+    // Keep the public legacy entry points for existing compiled callers, but
+    // never permit them to broadcast global time while party-leader time is ON.
+    [Command]
+    public void cmdSendTime(ulong seconds)
+    {
+        if (!OptionsMultiplayer.timeHost)
+            rpcSendTime(seconds);
     }
 
     [Command]
     public void cmdReceiveTime()
     {
-        DaggerfallDateTime now = worldTime.Now;
-        receiveTime(now.ToSeconds()/*now.Year, now.Month, now.Day, now.Hour, now.Minute, now.Second*/);
+        if (!OptionsMultiplayer.timeHost && EnsureWorldTime())
+            receiveTime(worldTime.Now.ToSeconds());
     }
 
     [ClientRpc]
-    void receiveTime(ulong i/*int year, int month, int day, int hour, int minute, float second*/)
+    void receiveTime(ulong seconds)
     {
-        if (isLocalPlayer)
-            ApplySyncedTime(i, "receiveTime");
+        if (!OptionsMultiplayer.timeHost && isLocalPlayer && EnsureWorldTime())
+            ApplySyncedTime(seconds, "legacy-receiveTime");
     }
 
     [ClientRpc]
-    public void rpcSendTime(ulong i/*int year, int month, int day, int hour, int minute, float second*/)
+    public void rpcSendTime(ulong seconds)
     {
-        if (!isLocalPlayer)
-            ApplySyncedTime(i, "rpcSendTime");
+        if (!OptionsMultiplayer.timeHost && !isLocalPlayer && localInstance != null && localInstance.EnsureWorldTime())
+            localInstance.ApplySyncedTime(seconds, "legacy-rpcSendTime");
     }
 
+    void MarkAuthoritativeTimeReady(string reason)
+    {
+        if (IsLoadInProgress())
+            return;
+        if (!postLoadAuthoritativeTimeReady && Debug.isDebugBuild)
+            Debug.Log("[PartyTime] Ready. reason=" + reason + " party=" + localParty +
+                " leader=" + localLeader + " minutes=" + GetClassicGameMinutes());
+        postLoadAuthoritativeTimeReady = true;
+    }
     uint GetClassicGameMinutes()
     {
         if (worldTime == null)
@@ -301,8 +466,8 @@ public class TimeCatcher : NetworkBehaviour
             return;
         }
 
-        if (worldTime == null)
-            worldTime = GameObject.Find("DaggerfallUnity").GetComponent<WorldTime>();
+        if (!EnsureWorldTime())
+            return;
 
         uint beforeMinutes = worldTime.Now.ToClassicDaggerfallTime();
 
@@ -332,7 +497,7 @@ public class TimeCatcher : NetworkBehaviour
         syncedMinutes = worldTime.Now.ToClassicDaggerfallTime();
         lastGameMinutes = syncedMinutes;
 
-        // PlayerEntity has its own per-minute accumulator. When host time pulls a client
+        // PlayerEntity has its own per-minute accumulator. When leader time pulls a follower
         // backwards, it must accept the host minute as the new baseline.
         if (GameManager.Instance != null && GameManager.Instance.PlayerEntity != null)
             GameManager.Instance.PlayerEntity.LastGameMinutes = syncedMinutes;

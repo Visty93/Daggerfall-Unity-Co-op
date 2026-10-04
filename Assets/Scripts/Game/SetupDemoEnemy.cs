@@ -24,6 +24,233 @@ namespace DaggerfallWorkshop.Game
         [SyncVar(hook = nameof(OnSpawnTeamOverrideChanged))]
         public int SpawnTeamOverride = -1;
 
+        // Optional visual override for externally supplied/customized foe objects.
+        // The gameplay EnemyType/entity remains authoritative; this only preserves a
+        // caller-selected MobileUnit visual when it differs from the entity's enemy ID.
+        [SyncVar(hook = nameof(OnExternalVisualOverrideChanged))]
+        public int ExternalVisualEnemyId = -1;
+        [SyncVar(hook = nameof(OnExternalVisualOverrideChanged))]
+        public int ExternalVisualMaleTexture = -1;
+        [SyncVar(hook = nameof(OnExternalVisualOverrideChanged))]
+        public int ExternalVisualFemaleTexture = -1;
+
+        // Bit 0 = HasRangedAttack1, bit 1 = HasRangedAttack2, bit 2 = CastsMagic.
+        // -1 means no external MobileUnit combat-visual override.
+        [SyncVar(hook = nameof(OnExternalVisualOverrideChanged))]
+        public int ExternalVisualRangedFlags = -1;
+
+        // Caller-assigned names for externally supplied foes stay local to the player
+        // that created them. Other peers use a normal enemy name so local mod state
+        // cannot accidentally manage another player's network actor by object name.
+        [SyncVar(hook = nameof(OnExternalSpawnOriginNetIdChanged))]
+        public uint ExternalSpawnOriginNetId = 0U;
+
+        [SyncVar(hook = nameof(OnExternalSpawnDisplayNameChanged))]
+        public string ExternalSpawnDisplayName = string.Empty;
+
+        uint cachedExternalLifecycleNetId = 0U;
+        uint cachedExternalLifecycleOriginNetId = 0U;
+
+        void CacheExternalLifecycleIdentity()
+        {
+            if (ExternalSpawnOriginNetId != 0U)
+                cachedExternalLifecycleOriginNetId = ExternalSpawnOriginNetId;
+
+            NetworkIdentity identity = GetComponent<NetworkIdentity>();
+            if (identity != null && identity.netId != 0U)
+                cachedExternalLifecycleNetId = identity.netId;
+        }
+
+        void OnExternalSpawnOriginNetIdChanged(uint previous, uint current)
+        {
+            CacheExternalLifecycleIdentity();
+            ApplyExternalSpawnDisplayName();
+        }
+
+        void OnExternalVisualOverrideChanged(int previous, int current)
+        {
+            ApplyExternalVisualOverridesToCurrentMobile();
+        }
+
+        public void ReapplyExternalVisualOverrides()
+        {
+            if (ExternalVisualEnemyId < 0 &&
+                ExternalVisualMaleTexture < 0 &&
+                ExternalVisualFemaleTexture < 0 &&
+                ExternalVisualRangedFlags < 0)
+                return;
+
+            ApplyExternalVisualOverridesToCurrentMobile();
+        }
+
+        // Host-side object-first callers can customize the MobileUnit after the enemy has
+        // already been network-spawned. Reapply late SyncVar updates directly to the existing
+        // billboard so observers do not keep the original enemy type's sprite/attack frames.
+        void ApplyExternalVisualOverridesToCurrentMobile()
+        {
+            if (DaggerfallUnity.Instance == null)
+                return;
+
+            MobileUnit dfMobile = GetMobileBillboardChild();
+            if (dfMobile == null || !dfMobile.IsSetup)
+                return;
+
+            MobileEnemy visualMobileEnemy = dfMobile.Enemy;
+            MobileTeams currentTeam = visualMobileEnemy.Team;
+
+            if (ExternalVisualEnemyId >= 0 &&
+                GameObjectHelper.EnemyDict.TryGetValue(ExternalVisualEnemyId, out MobileEnemy externalVisual))
+            {
+                visualMobileEnemy = externalVisual;
+                visualMobileEnemy.Gender = EnemyGender;
+                visualMobileEnemy.Reactions = EnemyReaction;
+                visualMobileEnemy.Team = currentTeam;
+            }
+
+            if (ExternalVisualMaleTexture >= 0)
+                visualMobileEnemy.MaleTexture = ExternalVisualMaleTexture;
+            if (ExternalVisualFemaleTexture >= 0)
+                visualMobileEnemy.FemaleTexture = ExternalVisualFemaleTexture;
+
+            if (ExternalVisualRangedFlags >= 0)
+            {
+                visualMobileEnemy.HasRangedAttack1 = (ExternalVisualRangedFlags & 1) != 0;
+                visualMobileEnemy.HasRangedAttack2 = (ExternalVisualRangedFlags & 2) != 0;
+                visualMobileEnemy.CastsMagic = (ExternalVisualRangedFlags & 4) != 0;
+            }
+
+            dfMobile.SetEnemy(
+                DaggerfallUnity.Instance,
+                visualMobileEnemy,
+                EnemyReaction,
+                ClassicSpawnDistanceType);
+            clientVisualSettingsApplied = true;
+
+            if (ExternalVisualRangedFlags >= 0)
+            {
+                EnemyMotor motor = GetComponent<EnemyMotor>();
+                if (motor != null)
+                {
+                    motor.hasBowAttack =
+                        visualMobileEnemy.HasRangedAttack1 &&
+                        (!visualMobileEnemy.CastsMagic || visualMobileEnemy.HasRangedAttack2);
+                }
+            }
+
+            EnemySounds enemySounds = GetComponent<EnemySounds>();
+            if (enemySounds != null)
+            {
+                enemySounds.MoveSound = (SoundClips)dfMobile.Enemy.MoveSound;
+                enemySounds.BarkSound = (SoundClips)dfMobile.Enemy.BarkSound;
+                enemySounds.AttackSound = (SoundClips)dfMobile.Enemy.AttackSound;
+            }
+        }
+
+        void OnExternalSpawnDisplayNameChanged(string previous, string current)
+        {
+            ApplyExternalSpawnDisplayName();
+
+            if (!string.IsNullOrEmpty(current))
+            {
+                global::ExternalFoeLifetimeDiagnostics diag = global::ExternalFoeLifetimeDiagnostics.Attach(
+                    gameObject,
+                    isServer ? "SERVER_EXTERNAL_SYNC_NAME" : "CLIENT_AUTHORITATIVE_EXTERNAL",
+                    ExternalSpawnOriginNetId);
+                if (diag != null)
+                    diag.Mark("EXTERNAL_DISPLAY_NAME_SYNC");
+            }
+        }
+
+        uint GetExternalSpawnLocalPeerNetId()
+        {
+            try
+            {
+                if (NetworkServer.active && NetworkServer.localConnection != null &&
+                    NetworkServer.localConnection.identity != null)
+                    return NetworkServer.localConnection.identity.netId;
+            }
+            catch { }
+
+            try
+            {
+                if (NetworkClient.active && NetworkClient.localPlayer != null)
+                    return NetworkClient.localPlayer.netId;
+            }
+            catch { }
+
+            return PlayerMultiplayer.GetLocalPlayerNetIdSafe();
+        }
+
+        string GetExternalSpawnNeutralName()
+        {
+            return $"DaggerfallEnemy [{EnemyType}]";
+        }
+
+        void ApplyExternalSpawnDisplayName()
+        {
+            if (string.IsNullOrEmpty(ExternalSpawnDisplayName))
+                return;
+
+            uint localPeerNetId = GetExternalSpawnLocalPeerNetId();
+            gameObject.name = localPeerNetId == ExternalSpawnOriginNetId
+                ? ExternalSpawnDisplayName
+                : GetExternalSpawnNeutralName();
+        }
+
+        void OnDestroy()
+        {
+            // Host/server destroys are already authoritative and Mirror propagates them.
+            // This relay is only for a pure client whose local mod directly destroys
+            // an externally supplied foe that originated from that same client.
+            if (NetworkServer.active ||
+                !NetworkClient.active ||
+                !NetworkClient.isConnected ||
+                !NetworkClient.ready)
+                return;
+
+            uint originNetId = ExternalSpawnOriginNetId != 0U
+                ? ExternalSpawnOriginNetId
+                : cachedExternalLifecycleOriginNetId;
+
+            NetworkIdentity identity = GetComponent<NetworkIdentity>();
+            uint enemyNetId =
+                identity != null && identity.netId != 0U
+                    ? identity.netId
+                    : cachedExternalLifecycleNetId;
+
+            if (originNetId == 0U || enemyNetId == 0U ||
+                string.IsNullOrEmpty(ExternalSpawnDisplayName))
+                return;
+
+            NetworkIdentity localPlayerIdentity = NetworkClient.localPlayer;
+            uint localPlayerNetId =
+                localPlayerIdentity != null ? localPlayerIdentity.netId : 0U;
+
+            if (localPlayerNetId == 0U || originNetId != localPlayerNetId)
+                return;
+
+            // Mirror removes server-driven despawns from NetworkClient.spawned before
+            // Unity invokes OnDestroy(). If this entry is still present, the object was
+            // destroyed locally and Mirror never sent that destruction to the server.
+            if (!NetworkClient.spawned.ContainsKey(enemyNetId))
+                return;
+
+            PlayerMultiplayer player = PlayerMultiplayer.GetLocalPlayerForCommand(
+                "external foe local destroy");
+            if (player == null || !player.isLocalPlayer)
+                return;
+
+            // The local object is already being destroyed outside Mirror. Remove its
+            // stale registry entry now; the server's later DestroyMessage can safely no-op.
+            NetworkClient.spawned.Remove(enemyNetId);
+
+            Debug.Log(
+                $"[ExternalFoeMP] Origin client locally destroyed external foe " +
+                $"netId={enemyNetId}; requesting authoritative server destroy.");
+
+            player.CmdDestroyOriginExternalFoe(enemyNetId);
+        }
+
         // Called by EnemyMotor only on its actual provocation path, not by the
         // initial hostility snapshot. Applies only to opt-in spawner-owned allies.
         public void HandleSpawnAllyProvocation(DaggerfallEntityBehaviour attacker)
@@ -697,6 +924,20 @@ public override void OnStartServer()
 public override void OnStartClient()
 {
     base.OnStartClient();
+    CacheExternalLifecycleIdentity();
+    ApplyExternalSpawnDisplayName();
+
+    if (!string.IsNullOrEmpty(ExternalSpawnDisplayName))
+    {
+        EnemyWorldPosition diagWorld = GetComponent<EnemyWorldPosition>();
+        global::ExternalFoeLifetimeDiagnostics diag = global::ExternalFoeLifetimeDiagnostics.Attach(
+            gameObject,
+            isServer ? "HOST_CLIENT_EXTERNAL_COPY" : "CLIENT_AUTHORITATIVE_EXTERNAL",
+            diagWorld != null ? diagWorld.requesterNetId : 0U);
+        if (diag != null)
+            diag.Mark("SETUP_ON_START_CLIENT");
+    }
+
     Debug.Log($"[OnStartClient] SetupDemoEnemy started on client: {gameObject.name}");
 
     if (TryGetComponent(out DaggerfallEntityBehaviour startEntityBehaviour) && startEntityBehaviour.Entity is EnemyEntity startEnemyEntity)
@@ -1005,16 +1246,53 @@ private IEnumerator WaitForDungeon()
             if (SpawnTeamOverride >= 0 && System.Enum.IsDefined(typeof(MobileTeams), SpawnTeamOverride))
                 mobileEnemy.Team = (MobileTeams)SpawnTeamOverride;
 
+            mobileEnemy.Gender = gender;
+            mobileEnemy.Reactions = EnemyReaction;
+
+            // Externally supplied foes can have a caller-selected visual that differs
+            // from their gameplay entity type. Keep entity setup on mobileEnemy, while
+            // feeding the optional visual template only to MobileUnit.SetEnemy().
+            MobileEnemy visualMobileEnemy = mobileEnemy;
+            if (ExternalVisualEnemyId >= 0 &&
+                enemyDict.TryGetValue(ExternalVisualEnemyId, out MobileEnemy externalVisual))
+            {
+                visualMobileEnemy = externalVisual;
+                visualMobileEnemy.Gender = gender;
+                visualMobileEnemy.Reactions = EnemyReaction;
+                visualMobileEnemy.Team = mobileEnemy.Team;
+            }
+
+            if (ExternalVisualMaleTexture >= 0)
+                visualMobileEnemy.MaleTexture = ExternalVisualMaleTexture;
+            if (ExternalVisualFemaleTexture >= 0)
+                visualMobileEnemy.FemaleTexture = ExternalVisualFemaleTexture;
+
+            if (ExternalVisualRangedFlags >= 0)
+            {
+                visualMobileEnemy.HasRangedAttack1 = (ExternalVisualRangedFlags & 1) != 0;
+                visualMobileEnemy.HasRangedAttack2 = (ExternalVisualRangedFlags & 2) != 0;
+                visualMobileEnemy.CastsMagic = (ExternalVisualRangedFlags & 4) != 0;
+            }
+
             // Find mobile unit in children
             MobileUnit dfMobile = GetMobileBillboardChild();
             if (dfMobile != null)
             {
                 // Setup mobile billboard
                 Vector2 size = Vector2.one;
-                mobileEnemy.Gender = gender;
-                mobileEnemy.Reactions = EnemyReaction;
-                dfMobile.SetEnemy(dfUnity, mobileEnemy, EnemyReaction, ClassicSpawnDistanceType);
+                dfMobile.SetEnemy(dfUnity, visualMobileEnemy, EnemyReaction, ClassicSpawnDistanceType);
                 clientVisualSettingsApplied = true;
+
+                if (ExternalVisualRangedFlags >= 0)
+                {
+                    EnemyMotor motor = GetComponent<EnemyMotor>();
+                    if (motor != null)
+                    {
+                        motor.hasBowAttack =
+                            visualMobileEnemy.HasRangedAttack1 &&
+                            (!visualMobileEnemy.CastsMagic || visualMobileEnemy.HasRangedAttack2);
+                    }
+                }
 
                 // Setup controller
                 CharacterController controller = GetComponent<CharacterController>();

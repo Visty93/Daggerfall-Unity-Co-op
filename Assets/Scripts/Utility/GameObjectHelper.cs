@@ -2007,18 +2007,35 @@ static void AddQuestFoe(SiteTypes siteType, Quest quest, QuestMarker marker, Foe
             // Restrained foes stay passive; normal quest foes are hostile.
             MobileReactions questFoeReaction = foe.IsRestrained ? MobileReactions.Passive : MobileReactions.Hostile;
 
-            pm.CmdSpawnQuestFoe(
-                worldPosition,
-                quest.UID,
-                foe.Symbol.Original,
-                foe.FoeType,
-                (int)mobileGender,
-                (int)siteType,
-                isInteriorAtRequest,
-                questFoeReaction
-            );
+            bool privateQuestBinding = global::QuestNetSync.ShouldUsePrivateQuestFoeBinding(quest);
+            if (privateQuestBinding)
+            {
+                pm.CmdSpawnPrivateQuestFoe(
+                    worldPosition,
+                    quest.UID,
+                    foe.Symbol.Original,
+                    foe.FoeType,
+                    (int)mobileGender,
+                    (int)siteType,
+                    isInteriorAtRequest,
+                    questFoeReaction
+                );
+            }
+            else
+            {
+                pm.CmdSpawnQuestFoe(
+                    worldPosition,
+                    quest.UID,
+                    foe.Symbol.Original,
+                    foe.FoeType,
+                    (int)mobileGender,
+                    (int)siteType,
+                    isInteriorAtRequest,
+                    questFoeReaction
+                );
+            }
 
-            Debug.Log($"[AddQuestFoe] Client requested single quest foe '{foe.Symbol.Original}' type={foe.FoeType} reaction={questFoeReaction} restrained={foe.IsRestrained}");
+            Debug.Log($"[AddQuestFoe] Client requested single quest foe '{foe.Symbol.Original}' type={foe.FoeType} reaction={questFoeReaction} restrained={foe.IsRestrained} privateBinding={privateQuestBinding}");
         }
         else
         {
@@ -2140,9 +2157,10 @@ static void AddQuestFoe(SiteTypes siteType, Quest quest, QuestMarker marker, Foe
         if (enemyComponent != null && enemyComponent.transform.parent != null)
             enemyComponent.StartCoroutine(MoveQuestEnemyToRoot(enemyComponent, siteType, 2));
 
-        // Broadcast quest binding so clients attach QuestResourceBehaviour locally
+        // Broadcast quest binding only when this quest participates in network quest
+        // sync. Full mode returns true here and therefore retains historical behaviour.
         var ni = go.GetComponent<NetworkIdentity>();
-        if (ni != null)
+        if (ni != null && global::QuestNetSync.ShouldBroadcastQuestFoeBinding(quest))
         {
             var broadcasters = GameObject.FindObjectsOfType<PlayerMultiplayer>();
             PlayerMultiplayer serverBroadcaster = null;
@@ -2343,6 +2361,219 @@ private static IEnumerator MoveQuestEnemyToRoot(DaggerfallEnemy enemy, SiteTypes
         /// </summary>
         /// <param name="reaction">Foe is hostile by default but can optionally set to passive.</param>
         /// <returns>GameObject[] array of 1-N foes. Array can be null or empty if create fails.</returns>
+// Identify the first caller outside GameObjectHelper/FoeSpawner.
+        // This is used only to pair the vanilla external-object pattern within one frame;
+        // no mod or assembly name is hard-coded.
+        static string GetExternalFoeCallerKey()
+        {
+            try
+            {
+                System.Diagnostics.StackTrace trace = new System.Diagnostics.StackTrace(false);
+                for (int i = 0; i < trace.FrameCount; i++)
+                {
+                    System.Diagnostics.StackFrame frame = trace.GetFrame(i);
+                    MethodBase method = frame != null ? frame.GetMethod() : null;
+                    Type declaringType = method != null ? method.DeclaringType : null;
+                    if (declaringType == null)
+                        continue;
+
+                    if (declaringType == typeof(GameObjectHelper) ||
+                        declaringType == typeof(FoeSpawner))
+                        continue;
+
+                    return declaringType.FullName + "." + method.Name;
+                }
+            }
+            catch { }
+
+            return string.Empty;
+        }
+
+
+        // Pure-client external callers sometimes need the real return objects because they
+        // customize them and only afterwards hand them to a zero-count FoeSpawner. Track
+        // those staging actors briefly so SetFoeGameObjects() can claim them and cancel the
+        // normal fallback network request. This is generic and does not name any mod.
+        static readonly HashSet<int> pendingExternalClientFoeIds = new HashSet<int>();
+
+        public static void MarkPendingExternalClientFoes(GameObject[] gameObjects)
+        {
+            if (gameObjects == null)
+                return;
+
+            for (int i = 0; i < gameObjects.Length; i++)
+            {
+                if (gameObjects[i] != null)
+                    pendingExternalClientFoeIds.Add(gameObjects[i].GetInstanceID());
+            }
+        }
+
+        public static bool ArePendingExternalClientFoes(GameObject[] gameObjects)
+        {
+            if (gameObjects == null || gameObjects.Length == 0)
+                return false;
+
+            bool foundAny = false;
+            for (int i = 0; i < gameObjects.Length; i++)
+            {
+                GameObject go = gameObjects[i];
+                if (go == null)
+                    continue;
+
+                foundAny = true;
+                if (!pendingExternalClientFoeIds.Contains(go.GetInstanceID()))
+                    return false;
+            }
+
+            return foundAny;
+        }
+
+        public static bool TryClaimPendingExternalClientFoes(GameObject[] gameObjects)
+        {
+            if (!ArePendingExternalClientFoes(gameObjects))
+                return false;
+
+            for (int i = 0; i < gameObjects.Length; i++)
+            {
+                if (gameObjects[i] != null)
+                    pendingExternalClientFoeIds.Remove(gameObjects[i].GetInstanceID());
+            }
+
+            Debug.Log($"[ExternalFoeMP] Claimed {gameObjects.Length} pure-client staging foe(s) for zero-count FoeSpawner placement.");
+            return true;
+        }
+
+        public static void ReleasePendingExternalClientFoes(GameObject[] gameObjects)
+        {
+            if (gameObjects == null)
+                return;
+
+            for (int i = 0; i < gameObjects.Length; i++)
+            {
+                if (gameObjects[i] != null)
+                    pendingExternalClientFoeIds.Remove(gameObjects[i].GetInstanceID());
+            }
+        }
+
+        // Identify a compiled caller outside DFU/this multiplayer assembly. This is used
+        // only on a pure client for the stock "create object now, place it later" return-value
+        // pattern. Base DFU and our own scripts remain on the existing MP path.
+        static bool IsExternalCompiledFoeCaller(out string callerKey)
+        {
+            callerKey = string.Empty;
+            try
+            {
+                System.Reflection.Assembly localAssembly = typeof(GameObjectHelper).Assembly;
+                System.Diagnostics.StackTrace trace = new System.Diagnostics.StackTrace(false);
+                for (int i = 0; i < trace.FrameCount; i++)
+                {
+                    System.Diagnostics.StackFrame frame = trace.GetFrame(i);
+                    MethodBase method = frame != null ? frame.GetMethod() : null;
+                    Type declaringType = method != null ? method.DeclaringType : null;
+                    if (declaringType == null)
+                        continue;
+
+                    if (declaringType == typeof(GameObjectHelper) || declaringType == typeof(FoeSpawner))
+                        continue;
+
+                    callerKey = declaringType.FullName + "." + method.Name;
+                    return declaringType.Assembly != localAssembly;
+                }
+            }
+            catch { }
+
+            return false;
+        }
+
+        // Create real DFU enemy objects for an external caller to customize, but do not
+        // add them to Mirror yet. FoeSpawner will place these same objects first.
+        static GameObject[] CreatePendingExternalFoeGameObjects(
+            Vector3 position,
+            MobileTypes foeType,
+            int spawnCount,
+            MobileReactions reaction,
+            Foe foeResource,
+            bool alliedToPlayer,
+            int spawnScalingLevel)
+        {
+            List<GameObject> gameObjects = new List<GameObject>();
+
+            for (int i = 0; i < spawnCount; i++)
+            {
+                string name = $"DaggerfallEnemy [{foeType}]";
+                GameObject go = InstantiatePrefab(
+                    DaggerfallUnity.Instance.Option_EnemyPrefab.gameObject,
+                    name,
+                    GetBestParent(),
+                    position);
+
+                ExternalFoeLifetimeDiagnostics externalDiag = ExternalFoeLifetimeDiagnostics.Attach(
+                    go,
+                    Mirror.NetworkServer.active ? "HOST_PENDING_EXTERNAL" : "CLIENT_STAGING_CREATED",
+                    PlayerMultiplayer.GetLocalPlayerNetIdSafe());
+                if (externalDiag != null)
+                    externalDiag.Mark("CREATE_PENDING_BEFORE_SETUP");
+
+                SetupDemoEnemy setupEnemy = go.GetComponent<SetupDemoEnemy>();
+                if (setupEnemy != null)
+                {
+                    MobileGender gender =
+                        (UnityEngine.Random.Range(0f, 1f) < 0.55f)
+                            ? MobileGender.Male
+                            : MobileGender.Female;
+
+                    setupEnemy.ApplyEnemySettingsWithScalingLevel(
+                        foeType,
+                        reaction,
+                        gender,
+                        (byte)(alliedToPlayer ? 1 : 0),
+                        alliedToPlayer,
+                        spawnScalingLevel);
+
+                    MobileUnit mobileUnit = setupEnemy.GetMobileBillboardChild();
+                    if (mobileUnit != null && mobileUnit.Enemy.Behaviour != MobileBehaviour.Flying)
+                        AlignControllerToGround(go.GetComponent<CharacterController>());
+                }
+
+                DaggerfallEnemy enemy = go.GetComponent<DaggerfallEnemy>();
+                if (enemy != null)
+                {
+                    enemy.LoadID = DaggerfallUnity.NextUID;
+                    if (foeResource != null)
+                        enemy.QuestSpawn = true;
+                }
+
+                if (foeResource != null)
+                {
+                    QuestResourceBehaviour qrb =
+                        go.GetComponent<QuestResourceBehaviour>() ??
+                        go.AddComponent<QuestResourceBehaviour>();
+
+                    qrb.AssignResource(foeResource);
+                    foeResource.QuestResourceBehaviour = qrb;
+                    foeResource.RearmInjured();
+                }
+
+                // Preserve vanilla creation semantics for subscribers. The object is still
+                // a local pending actor at this point and has not been NetworkServer.Spawn()ed.
+                if (externalDiag != null)
+                    externalDiag.Mark("PENDING_BEFORE_RAISE_ENEMY_SPAWN");
+                ExternalFoeLifetimeDiagnostics.LogEnemySpawnSubscribers("PENDING_BEFORE_RAISE", go);
+                ExternalFoeLifetimeDiagnostics.LogComponents("PENDING_COMPONENTS_BEFORE_RAISE", go);
+                GameManager.Instance?.RaiseOnEnemySpawnEvent(go);
+                ExternalFoeLifetimeDiagnostics.LogComponents("PENDING_COMPONENTS_AFTER_RAISE", go);
+                if (externalDiag != null)
+                    externalDiag.Mark("PENDING_AFTER_RAISE_ENEMY_SPAWN");
+                gameObjects.Add(go);
+            }
+
+            Debug.Log(
+                $"[ExternalFoeMP] Created {gameObjects.Count} local pending object(s) " +
+                $"type={foeType} reaction={reaction} level={spawnScalingLevel}; waiting for SetFoeGameObjects placement.");
+
+            return gameObjects.ToArray();
+        }
+
 // Preserve the original six-parameter signature for compiled DFU mods.
 // Keep defaults on the existing overload so shorter and named-argument calls remain valid.
 public static GameObject[] CreateFoeGameObjects(
@@ -2370,6 +2601,81 @@ public static GameObject[] CreateFoeGameObjects(
     int spawnScalingLevel = requesterLevel > 0 ? Mathf.Clamp(requesterLevel, 1, 100) : DaggerfallDungeon.GetLocalPlayerLevelFallback();
 
     Debug.Log($"[CreateFoeGameObjects] Spawning {totalSpawns} enemies of type {foeType} at {position} spawnScalingLevel={spawnScalingLevel}");
+
+    // Vanilla-compatible externally supplied foe pattern:
+    // a zero-count FoeSpawner created by this same caller in this same frame is waiting
+    // for the actual GameObjects. Return local real actors for the caller to customize,
+    // but do NOT network-spawn them yet. FoeSpawner will do that after final placement.
+    if (Mirror.NetworkClient.active || Mirror.NetworkServer.active)
+    {
+        FoeSpawner externalSpawner;
+        string externalCaller = GetExternalFoeCallerKey();
+        if (FoeSpawner.TryClaimPendingExternalSpawner(externalCaller, out externalSpawner))
+        {
+            Debug.Log(
+                $"[ExternalFoeMP] CreateFoeGameObjects claimed by zero-count FoeSpawner " +
+                $"caller='{externalCaller}' type={foeType} count={totalSpawns} position={position}");
+
+            return CreatePendingExternalFoeGameObjects(
+                position,
+                foeType,
+                totalSpawns,
+                reaction,
+                foeResource,
+                alliedToPlayer,
+                spawnScalingLevel);
+        }
+    }
+
+    // Pure-client compatibility for compiled external callers using the stock
+    // CreateFoeGameObjects(Vector3.zero) -> customize returned object -> zero-count
+    // FoeSpawner.SetFoeGameObjects(object) pattern. Support either creation order.
+    //
+    // Keep this narrow: pure client, non-quest, zero-position creation, external assembly.
+    // Normal DFU/MP callers and quest waves remain on the existing path.
+    if (Mirror.NetworkClient.active && !Mirror.NetworkServer.active &&
+        foeResource == null && position == Vector3.zero)
+    {
+        string externalCaller;
+        if (IsExternalCompiledFoeCaller(out externalCaller))
+        {
+            bool isDungeonFromClient =
+                GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true;
+
+            // Preserve the existing Horrible Hordes dungeon compatibility path. That
+            // caller already has its own return-object adapter and immediate server request.
+            if (!isDungeonFromClient)
+            {
+                GameObject[] staging = CreatePendingExternalFoeGameObjects(
+                    position,
+                    foeType,
+                    totalSpawns,
+                    reaction,
+                    foeResource,
+                    alliedToPlayer,
+                    spawnScalingLevel);
+
+                MarkPendingExternalClientFoes(staging);
+
+                PlayerMultiplayer fallbackOwner =
+                    PlayerMultiplayer.GetLocalPlayerForCommand("external CreateFoeGameObjects staging fallback");
+                if (fallbackOwner != null)
+                {
+                    fallbackOwner.BeginExternalFoeSpawnerFallback(
+                        staging,
+                        foeType,
+                        reaction,
+                        alliedToPlayer,
+                        spawnScalingLevel);
+                }
+
+                Debug.Log(
+                    $"[ExternalFoeMP] Pure client returned {staging.Length} local staging foe(s) " +
+                    $"to external caller='{externalCaller}' type={foeType}. Waiting briefly for zero-count FoeSpawner.");
+                return staging;
+            }
+        }
+    }
 
     // Multiplayer logic
     if (Mirror.NetworkClient.active)
@@ -2439,20 +2745,44 @@ public static GameObject[] CreateFoeGameObjects(
                 for (int i = 0; i < totalSpawns; i++)
                     preferredPositions[i] = position;
 
-                Debug.Log("[CreateFoeGameObjects] Client: requesting CmdCreateFoes (with quest context + positions).");
-                multiplayer.CmdCreateFoes(
-                    position,
-                    foeType,
-                    totalSpawns,
-                    reaction,
-                    alliedToPlayer,
-                    questUID,
-                    foeSymbolName,
-                    preferredPositions,
-                    isInteriorFromClient,
-                    isDungeonFromClient,
-                    spawnScalingLevel
-                );
+                bool privateQuestBinding =
+                    foeResource != null &&
+                    foeResource.ParentQuest != null &&
+                    global::QuestNetSync.ShouldUsePrivateQuestFoeBinding(foeResource.ParentQuest);
+
+                if (privateQuestBinding)
+                {
+                    Debug.Log("[CreateFoeGameObjects] Client: requesting private quest foe spawn (requester-only quest binding).");
+                    multiplayer.CmdCreatePrivateQuestFoesWithPositions(
+                        preferredPositions,
+                        foeType,
+                        totalSpawns,
+                        reaction,
+                        alliedToPlayer,
+                        questUID,
+                        foeSymbolName,
+                        isInteriorFromClient,
+                        isDungeonFromClient,
+                        spawnScalingLevel
+                    );
+                }
+                else
+                {
+                    Debug.Log("[CreateFoeGameObjects] Client: requesting CmdCreateFoes (with quest context + positions).");
+                    multiplayer.CmdCreateFoes(
+                        position,
+                        foeType,
+                        totalSpawns,
+                        reaction,
+                        alliedToPlayer,
+                        questUID,
+                        foeSymbolName,
+                        preferredPositions,
+                        isInteriorFromClient,
+                        isDungeonFromClient,
+                        spawnScalingLevel
+                    );
+                }
                 // Optional compatibility return objects for client-side callers.
                 return MultiplayerFoeSpawnCompatibility.GetClientReturnObjects(
                     totalSpawns, position, foeType, isDungeonFromClient, foeResource);
@@ -2631,7 +2961,8 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
 
             // Also bind quest foe on clients so their local quest system recognizes it.
             // (Host/single-player already has qrb above.)
-            if (foeResource != null && foeResource.ParentQuest != null)
+            if (foeResource != null && foeResource.ParentQuest != null &&
+                global::QuestNetSync.ShouldBroadcastQuestFoeBinding(foeResource.ParentQuest))
             {
                 NetworkIdentity ni = go.GetComponent<NetworkIdentity>();
                 if (ni != null)
@@ -2659,6 +2990,33 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
         /// <param name="maxDistance">Maximum distance from player.</param>
         /// <param name="parent">Parent GameObject. If none specified the most suitable parent will be selected automatically.</param>
         /// <returns>FoeSpawner GameObject.</returns>
+        // Experimental compatibility overload for mods compiled against stock DFU.
+        // Preserves the original seven-parameter CLR signature and forwards into
+        // the multiplayer requester-level overload without changing its behaviour.
+        public static GameObject CreateFoeSpawner(
+            bool lineOfSightCheck,
+            MobileTypes foeType,
+            int spawnCount,
+            float minDistance,
+            float maxDistance,
+            Transform parent,
+            bool alliedToPlayer)
+        {
+            Debug.Log(
+                $"[CreateFoeSpawnerCompat] Legacy DFU 7-parameter call received. " +
+                $"foeType={foeType} count={spawnCount} min={minDistance} max={maxDistance} allied={alliedToPlayer}");
+
+            return CreateFoeSpawner(
+                lineOfSightCheck,
+                foeType,
+                spawnCount,
+                minDistance,
+                maxDistance,
+                parent,
+                alliedToPlayer,
+                0);
+        }
+
         public static GameObject CreateFoeSpawner(bool lineOfSightCheck = true, MobileTypes foeType = MobileTypes.None, int spawnCount = 0, float minDistance = 4, float maxDistance = 20, Transform parent = null, bool alliedToPlayer = false, int requesterLevel = 0)
         {
 			
@@ -2674,6 +3032,13 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
             spawner.Parent = parent;
             spawner.AlliedToPlayer = alliedToPlayer;
             spawner.RequesterLevel = requesterLevel > 0 ? Mathf.Clamp(requesterLevel, 1, 100) : DaggerfallDungeon.GetLocalPlayerLevelFallback();
+
+            // Stock DFU allows callers to create an empty spawner and later supply
+            // already-created/customized GameObjects through SetFoeGameObjects().
+            // Register only this zero-count MP pattern; ordinary SpawnCount>0 spawners
+            // keep the existing deferred network-spawn behavior unchanged.
+            if (spawnCount == 0 && (Mirror.NetworkClient.active || Mirror.NetworkServer.active))
+                spawner.RegisterExternalObjectMode(GetExternalFoeCallerKey());
 
             // Assign position on top of player
             // Spawner can be placed anywhere to work, but rest system considers a spawner to be an enemy "in potentia" for purposes of breaking rest and travel

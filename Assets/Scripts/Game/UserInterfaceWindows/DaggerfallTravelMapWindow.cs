@@ -1854,6 +1854,9 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 if (player == null || !player.isActiveAndEnabled || player.isLocalPlayer)
                     continue;
 
+                if (!global::MultiplayerPartyManager.IsLocalPartyMember(player))
+                    continue;
+
                 DFPosition mapPixel;
                 int remoteRegion;
                 string playerName;
@@ -1916,6 +1919,9 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             {
                 global::PlayerMultiplayer player = players[i];
                 if (player == null || !player.isActiveAndEnabled || player.isLocalPlayer)
+                    continue;
+
+                if (!global::MultiplayerPartyManager.IsLocalPartyMember(player))
                     continue;
 
                 DFPosition mapPixel;

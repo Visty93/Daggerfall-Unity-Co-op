@@ -32,15 +32,22 @@ public class HudMultiplayer : MonoBehaviour
     bool partyButtonWired;
     bool runtimeModeButtonCreated;
     bool modeButtonWired;
+    GameObject questSyncModeButton;
+    bool runtimeQuestSyncModeButtonCreated;
+    CanvasGroup questSyncModeCanvasGroup;
 
     void Start()
     {
         OptionsMultiplayer.EnsureLocalRespawnSettings();
+        OptionsMultiplayer.EnsureLocalQuestSyncSettings();
         ResolveConnectionManager();
         EnsurePartyButton();
         EnsureConnectionModeButton();
+        RenamePartyTimeSetting();
         BuildRespawnSettings();
+        BuildQuestSyncModeSetting();
         RefreshLegacyOptionsAvailability();
+        RefreshQuestSyncModeSetting();
         StartCoroutine(Check());
     }
 
@@ -52,6 +59,7 @@ public class HudMultiplayer : MonoBehaviour
         while (true)
         {
             OptionsMultiplayer.EnsureLocalRespawnSettings();
+            OptionsMultiplayer.EnsureLocalQuestSyncSettings();
             ResolveConnectionManager();
             EnsurePartyButton();
             EnsureConnectionModeButton();
@@ -64,6 +72,7 @@ public class HudMultiplayer : MonoBehaviour
                 NetworkServer.active || NetworkClient.isConnected;
             bool connectionBusy = connected || NetworkClient.active;
             RefreshLegacyOptionsAvailability();
+            RefreshQuestSyncModeSetting();
             bool directMode = connectionManager != null &&
                 connectionManager.SelectedMode == MultiplayerManager.ConnectionMode.DirectIP;
 
@@ -263,6 +272,103 @@ public class HudMultiplayer : MonoBehaviour
         });
         SetButtonText(defaults, "Restore defaults");
         respawnSettingsPanel.SetActive(false);
+    }
+
+    void BuildQuestSyncModeSetting()
+    {
+        if (options == null || existingOptionsPanel == null)
+            return;
+
+        Transform parent = existingOptionsPanel.transform;
+        questSyncModeButton = Instantiate(options, parent);
+        questSyncModeButton.name = "Quest sync mode";
+        runtimeQuestSyncModeButtonCreated = true;
+
+        var button = questSyncModeButton.GetComponent<UnityEngine.UI.Button>();
+        if (button != null)
+        {
+            button.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
+            button.onClick.AddListener(CycleQuestSyncMode);
+        }
+
+        questSyncModeButton.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
+        questSyncModeButton.GetComponent<RectTransform>().sizeDelta = new Vector2(180, 40);
+        questSyncModeButton.SetActive(true);
+
+        questSyncModeCanvasGroup = questSyncModeButton.GetComponent<CanvasGroup>();
+        if (questSyncModeCanvasGroup == null)
+            questSyncModeCanvasGroup = questSyncModeButton.AddComponent<CanvasGroup>();
+
+        RefreshQuestSyncModeSetting();
+    }
+
+    bool CanEditQuestSyncMode()
+    {
+        if (NetworkServer.active || NetworkClient.isConnected)
+            return MultiplayerPartyManager.CanChangeLocalQuestSyncMode();
+        return PlayerMultiplayer.state == 0 &&
+            !NetworkServer.active && !NetworkClient.active && !NetworkClient.isConnected;
+    }
+
+    void CycleQuestSyncMode()
+    {
+        if (!CanEditQuestSyncMode())
+            return;
+
+        if (NetworkServer.active || NetworkClient.isConnected)
+        {
+            MultiplayerPartyManager.RequestLocalQuestSyncMode(
+                (OptionsMultiplayer.QuestSyncMode)(((int)OptionsMultiplayer.questSyncMode + 1) % 3));
+            return;
+        }
+        OptionsMultiplayer.EnsureLocalQuestSyncSettings();
+        switch (OptionsMultiplayer.questSyncMode)
+        {
+            case OptionsMultiplayer.QuestSyncMode.Full:
+                OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.SharedOnly;
+                break;
+            case OptionsMultiplayer.QuestSyncMode.SharedOnly:
+                OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.Off;
+                break;
+            default:
+                OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.Full;
+                break;
+        }
+
+        OptionsMultiplayer.SaveLocalQuestSyncSettings();
+        RefreshQuestSyncModeSetting();
+    }
+
+    void RefreshQuestSyncModeSetting()
+    {
+        if (questSyncModeButton == null)
+            return;
+
+        string modeLabel;
+        switch (OptionsMultiplayer.questSyncMode)
+        {
+            case OptionsMultiplayer.QuestSyncMode.SharedOnly:
+                modeLabel = "Shared only";
+                break;
+            case OptionsMultiplayer.QuestSyncMode.Off:
+                modeLabel = "Off";
+                break;
+            default:
+                modeLabel = "Full";
+                break;
+        }
+
+        SetButtonText(questSyncModeButton, "Quest sync: " + modeLabel);
+
+        bool editable = CanEditQuestSyncMode();
+        var button = questSyncModeButton.GetComponent<UnityEngine.UI.Button>();
+        if (button != null)
+            button.interactable = editable;
+        if (questSyncModeCanvasGroup != null)
+        {
+            questSyncModeCanvasGroup.alpha = editable ? 1f : 0.45f;
+            questSyncModeCanvasGroup.interactable = editable;
+        }
     }
 
     void OpenRespawnSettings()
@@ -501,6 +607,19 @@ public class HudMultiplayer : MonoBehaviour
         gameUI.enabled = b;
     }
 
+    void RenamePartyTimeSetting()
+    {
+        // The checkbox is a child of its existing option button in the legacy HUD.
+        if (checks == null || checks.Length == 0 || checks[0] == null)
+            return;
+        UnityEngine.UI.Button button = checks[0].GetComponentInParent<UnityEngine.UI.Button>();
+        if (button == null)
+            return;
+        Text label = button.GetComponentInChildren<Text>(true);
+        if (label != null)
+            label.text = "Party leader time";
+    }
+
     public void toggleTimeHost()
     {
         if (NetworkServer.active || NetworkClient.active) return;
@@ -583,6 +702,7 @@ public class HudMultiplayer : MonoBehaviour
     public void hostButton()
     {
         OptionsMultiplayer.EnsureLocalRespawnSettings();
+        OptionsMultiplayer.EnsureLocalQuestSyncSettings();
         ResolveConnectionManager();
 
         if (connectionManager != null)
@@ -652,5 +772,8 @@ public class HudMultiplayer : MonoBehaviour
 
         if (runtimeModeButtonCreated && connectionModeButton != null)
             Destroy(connectionModeButton);
+
+        if (runtimeQuestSyncModeButtonCreated && questSyncModeButton != null)
+            Destroy(questSyncModeButton);
     }
 }
