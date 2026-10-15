@@ -40,12 +40,6 @@ namespace DaggerfallWorkshop.Game
         DaggerfallEntityBehaviour entityBehaviour;
         int damage = 0;
 
-        // Last local attack-sound decision for the current melee swing.
-        // The actual player-damage event is local in MP, so observers should get
-        // enemy attack audio from the same local damage report that already syncs
-        // player hit sounds.
-        private bool lastMeleeAttackSoundPlayed = false;
-
         void Start()
         {
             motor = GetComponent<EnemyMotor>();
@@ -82,6 +76,13 @@ namespace DaggerfallWorkshop.Game
             // Slow down enemy frame rate based on floored speed value
             // If enemy is still at maximum speed then divisor is 1 and will experience no change to frame rate
             mobile.FrameSpeedDivisor = entity.Stats.PermanentSpeed / speed;
+
+            // Pure clients never initiate an enemy attack. They only play server-authorized
+            // attack states received through RpcPlayAttackAnimation(). Previously every client
+            // still rolled this attack check and called MeleeAnimation(), which immediately
+            // refused the call and could generate hundreds of thousands of warning lines.
+            if (NetworkClient.active && !isServer)
+                return;
 
             // Note: Speed comparison here is reversed from classic. Classic's way makes fewer attack
             // attempts at higher speeds, so it seems backwards.
@@ -211,8 +212,9 @@ namespace DaggerfallWorkshop.Game
     // 🔹 **Ensure only the host runs this in multiplayer**
     if (NetworkClient.active && !isServer) 
     {
+        global::EnemySwingDiagnostics.RecordUnexpectedClientMelee(this);
         Debug.LogWarning($"[MeleeAnimation] ERROR: Client is running MeleeAnimation() when it should not! ({gameObject.name})");
-        return false; // 🔹 **Clients should never execute this**
+        return false; // Safety guard: pure clients should never initiate melee.
     }
 
     if (senses.TargetInSight && senses.TargetIsWithinYawAngle(22.5f, senses.LastKnownTargetPos))
@@ -225,16 +227,13 @@ namespace DaggerfallWorkshop.Game
         if (senses.DistanceToTarget > distance + senses.TargetRateOfApproach)
             return false;
 
-        bool playedAttackSound = false;
-        lastMeleeAttackSoundPlayed = false;
+        global::EnemySwingDiagnostics.RecordAcceptedMelee(this);
 
-        // The simulator decides whether this swing actually made an attack sound.
-        // Observing clients will replay the same decision through the animation RPC.
+        // 🔹 **Play melee sound for everyone (Single-player & Multiplayer)**
         if (sounds)
         {
             Debug.Log($"[MeleeAnimation] Playing attack sound on {gameObject.name}");
-            playedAttackSound = sounds.PlayAttackSound();
-            lastMeleeAttackSoundPlayed = playedAttackSound;
+            sounds.PlayAttackSound();
         }
 
         // 🔹 **Single-Player Mode: Play Animation Locally**
@@ -248,8 +247,9 @@ namespace DaggerfallWorkshop.Game
             Debug.Log($"[MeleeAnimation] Host is executing attack animation.");
             mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
 
-            // 🔹 **Tell all clients to play the animation and the same attack sound decision**
-            RpcPlayAttackAnimation(playedAttackSound);
+            // 🔹 **Tell all clients to play the animation**
+            global::EnemySwingDiagnostics.RecordAttackRpc(this, "SERVER_SEND");
+            RpcPlayAttackAnimation();
         }
 
         return true;
@@ -259,21 +259,12 @@ namespace DaggerfallWorkshop.Game
 }
 
 [ClientRpc]
-void RpcPlayAttackAnimation(bool playedAttackSound)
+void RpcPlayAttackAnimation()
 {
-    if (isServer) return; // 🔹 Host already played animation/sound, ignore it
+    if (isServer) return; // 🔹 Host already played animation, ignore it
 
+    global::EnemySwingDiagnostics.RecordAttackRpc(this, "CLIENT_RECEIVE");
     Debug.Log($"[RpcPlayAttackAnimation] Client received animation RPC. Playing attack animation.");
-
-    if (playedAttackSound)
-    {
-        if (sounds == null)
-            sounds = GetComponent<EnemySounds>();
-
-        if (sounds != null)
-            sounds.PlayAttackSoundForced();
-    }
-
     mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
 }
 
@@ -637,14 +628,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
                     SendDamageToPlayer();
             }
             else
-            {
-                if (sounds != null)
-                    sounds.PlayMissSound(weapon);
-
-                // Multiplayer cosmetic sync: the local target hears the miss locally,
-                // but observers do not unless we report the 0-damage enemy swing too.
-                ReportLocalPlayerHitByEnemyCosmetics(false, 0);
-            }
+                sounds.PlayMissSound(weapon);
 
             return damage;
         }
@@ -730,7 +714,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
             if (applyActualDamage && canCalculateDamage && calculatedDamage > 0)
                 targetEntity.DecreaseHealth(calculatedDamage);
 
-            // Route knockback to the target enemy's current movement owner.
+            // Knockback only where authoritative.
             if (applyActualDamage && canCalculateDamage && calculatedDamage > 0 && targetMotor)
             {
                 float enemyWeight = targetEntity.GetWeightInClassicUnits();
@@ -741,7 +725,8 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
                 if (knockBackSpeed < (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10)))
                     knockBackSpeed = (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10));
 
-                targetMotor.RequestNetworkKnockback(knockBackSpeed, direction);
+                targetMotor.KnockbackSpeed = knockBackSpeed;
+                targetMotor.KnockbackDirection = direction;
             }
 
             if (targetMotor)
@@ -812,7 +797,7 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
         targetEntity.DecreaseHealth(damage);
     }
 
-    // Route host-calculated knockback to the target enemy's current movement owner.
+    // Knockback (only on host)
     if (isDamageAllowed && damage > 0 && targetMotor)
     {
         float enemyWeight = targetEntity.GetWeightInClassicUnits();
@@ -823,7 +808,8 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
         if (KnockbackSpeed < (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10)))
             KnockbackSpeed = (15 / (PlayerSpeedChanger.classicToUnitySpeedUnitRatio / 10));
 
-        targetMotor.RequestNetworkKnockback(KnockbackSpeed, direction);
+        targetMotor.KnockbackSpeed = KnockbackSpeed;
+        targetMotor.KnockbackDirection = direction;
     }
 
     // Make enemy hostile
@@ -844,20 +830,6 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
                 SendDamageToPlayer();
         }
 
-        private void ReportLocalPlayerHitByEnemyCosmetics(bool weaponHit, int damageAmount)
-        {
-            if (!NetworkClient.active)
-                return;
-
-            PlayerMultiplayer localPlayer = PlayerMultiplayer.GetLocalPlayerForCommand("enemy-hit-player-cosmetics");
-            if (localPlayer == null)
-                localPlayer = PlayerMultiplayer.GetAnyPlayerForCommandFallback("enemy-hit-player-cosmetics");
-
-            NetworkIdentity enemyIdentity = GetComponent<NetworkIdentity>();
-            if (localPlayer != null && enemyIdentity != null)
-                localPlayer.CmdReportLocalPlayerHitByEnemyCosmetics(enemyIdentity.netId, weaponHit, damageAmount, lastMeleeAttackSoundPlayed);
-        }
-
         private void SendDamageToPlayer()
         {
             GameManager.Instance.PlayerObject.SendMessage("RemoveHealth", damage);
@@ -866,16 +838,10 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
             Items.DaggerfallUnityItem weapon = entity.ItemEquipTable.GetItem(Items.EquipSlots.RightHand);
             if (weapon == null)
                 weapon = entity.ItemEquipTable.GetItem(Items.EquipSlots.LeftHand);
-            bool weaponHit = weapon != null;
-            if (weaponHit)
+            if (weapon != null)
                 GameManager.Instance.PlayerObject.SendMessage("PlayWeaponHitSound");
             else
                 GameManager.Instance.PlayerObject.SendMessage("PlayWeaponlessHitSound");
-
-            // The target player hears this locally through PlayerFootsteps, but other clients
-            // only see synced health/animation. Report a cosmetic hit event so observers also
-            // hear the hit sound near the attacking enemy.
-            ReportLocalPlayerHitByEnemyCosmetics(weaponHit, damage);
         }
 
         #endregion

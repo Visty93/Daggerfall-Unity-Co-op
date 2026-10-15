@@ -480,8 +480,16 @@ namespace DaggerfallWorkshop.Game
             // Cache initial QualitySettings shadow distance
             initialQualitySettingsShadowDistance = QualitySettings.shadowDistance;
 
-            // Always start game paused
-            PauseGame(true);
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+            {
+                // No local terrain/player simulation while the dedicated bootstrap
+                // finishes initializing the game scene.
+                if (StreamingWorld != null) StreamingWorld.enabled = false;
+                if (PlayerEntity != null) PlayerEntity.Quiesce = true;
+                PauseGame(false);
+            }
+            else
+                PauseGame(true);
 
             // Log welcome message
             Debug.Log("Welcome to Daggerfall Unity " + VersionInfo.DaggerfallUnityVersion);
@@ -508,6 +516,8 @@ namespace DaggerfallWorkshop.Game
 
         void Update()
         {
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+                return; // Dedicated servers never process local player input.
             // Don't process game manager input messages when game not running
             if (!IsPlayingGame())
                 return;
@@ -599,6 +609,13 @@ namespace DaggerfallWorkshop.Game
         /// <param name="hideHUD">HUD is disabled on screen if true. Ignored when unpausing.</param>
         public void PauseGame(bool pause, bool hideHUD = false)
         {
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+            {
+                // Menu/UI events must not stop physics, coroutines or cleanup.
+                isGamePaused = false;
+                Time.timeScale = 1f;
+                return;
+            }
             DaggerfallUI.Instance.ShowVersionText = false;
 
             if (pause && !isGamePaused)
@@ -968,6 +985,8 @@ namespace DaggerfallWorkshop.Game
         /// </summary>
         public bool IsPlayingGame()
         {
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+                return Mirror.NetworkServer.active;
             // Game not active when paused
             if (isGamePaused)
                 return false;

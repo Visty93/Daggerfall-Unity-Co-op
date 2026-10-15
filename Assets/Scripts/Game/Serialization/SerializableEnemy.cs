@@ -234,6 +234,12 @@ namespace DaggerfallWorkshop.Game.Serialization
                 mobileEnemy.SetSpecialTransformationCompleted();
             }
 
+            // Publish restored equipment rather than the initial random loadout.
+            // Pure clients reapply the server snapshot after their local restore.
+            SetupDemoEnemy equipmentSetup = enemy.GetComponent<SetupDemoEnemy>();
+            if (equipmentSetup != null)
+                equipmentSetup.RefreshEquipmentAfterRestore();
+
             // Resume entity
             entity.Quiesce = false;
         }

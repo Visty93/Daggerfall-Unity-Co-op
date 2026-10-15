@@ -143,7 +143,10 @@ namespace DaggerfallWorkshop
             // Only change if in a different state
             MobileStates currentState = EnemyState;
             if (currentState != newState)
+            {
+                EnemySwingDiagnostics.RecordTransition(this, currentState, newState);
                 ApplyEnemyStateChange(currentState, EnemyState = newState);
+            }
         }
 
         /// <summary>

@@ -15,10 +15,288 @@ namespace DaggerfallWorkshop.Game
     [RequireComponent(typeof(EnemyMotor))]
     public class SetupDemoEnemy : NetworkBehaviour
     {
+        // Spawn equipment is generated once by the server. Keep this separate from
+        // corpse inventory and party-private quest items. A retained SyncVar also
+        // supplies late joiners without depending on an observer RPC arriving first.
+        [SyncVar] private string syncedSpawnEquipment = string.Empty;
+        private uint equipmentRequesterNetId;
+        private static uint activeDungeonEquipmentRequester;
+
+        public static uint PushDungeonEquipmentRequester(uint requester)
+        {
+            uint previous = activeDungeonEquipmentRequester;
+            activeDungeonEquipmentRequester = requester;
+            return previous;
+        }
+
+        public static void RestoreDungeonEquipmentRequester(uint previous)
+        {
+            activeDungeonEquipmentRequester = previous;
+        }
+        private EnemyEntity equipmentCapturedEntity;
+        private EnemyEntity equipmentAppliedEntity;
+        private string equipmentAppliedPayload;
+        private bool equipmentCaptureFailed;
+
+        [System.Serializable]
+        private class SpawnEquipmentData
+        {
+            public DaggerfallWorkshop.Game.Serialization.ItemData_v1[] items;
+            public ulong[] slots;
+            public sbyte[] armor;
+        }
+
+        public void ConfigureEquipmentRequester(uint requesterNetId)
+        {
+            equipmentRequesterNetId = requesterNetId;
+        }
+
+        // Called by the default equipment delegate. Mod overrides retain their
+        // original delegate/signature; their final equipped items are captured too.
+        public void ResolveEquipmentGenerationContext(ref int level, ref Genders gender, ref Races race)
+        {
+            if (!NetworkServer.active)
+                return;
+
+            uint requester = equipmentRequesterNetId != 0 ? equipmentRequesterNetId : activeDungeonEquipmentRequester;
+            if (requester == 0)
+            {
+                DaggerfallDungeon dungeon = GetComponentInParent<DaggerfallDungeon>();
+                if (dungeon != null)
+                    requester = dungeon.RequesterNetId;
+                else
+                {
+                    EnemyWorldPosition position = GetComponent<EnemyWorldPosition>();
+                    if (position != null)
+                        requester = position.requesterNetId;
+                }
+            }
+
+            NetworkIdentity identity;
+            if (requester != 0 && NetworkServer.spawned.TryGetValue(requester, out identity) && identity != null)
+            {
+                PlayerMultiplayer player = identity.GetComponent<PlayerMultiplayer>();
+                if (player != null)
+                    level = Mathf.Clamp(player.PlayerMPLevel, 1, 100);
+                PlayerAssets assets = identity.GetComponent<PlayerAssets>();
+                if (assets != null)
+                {
+                    if (System.Enum.IsDefined(typeof(Genders), assets.gender))
+                        gender = (Genders)assets.gender;
+                    if (assets.race > 0 && System.Enum.IsDefined(typeof(Races), assets.race))
+                        race = (Races)assets.race;
+                }
+            }
+
+            // Explicit spawn/dungeon scaling remains authoritative over the live
+            // player level (which may have changed since the spawn request).
+            int scalingLevel = GetEffectiveSpawnScalingLevel();
+            if (scalingLevel > 0)
+                level = scalingLevel;
+        }
+
+        // Save restoration can replace inventory on the same EnemyEntity instance.
+        public void RefreshEquipmentAfterRestore()
+        {
+            equipmentCapturedEntity = null;
+            equipmentAppliedEntity = null;
+            equipmentCaptureFailed = false;
+            CaptureSpawnEquipment();
+        }
+
+        private void CaptureSpawnEquipment()
+        {
+            if (!isServer || equipmentCaptureFailed)
+                return;
+            DaggerfallEntityBehaviour behaviour = GetComponent<DaggerfallEntityBehaviour>();
+            EnemyEntity enemy = behaviour != null ? behaviour.Entity as EnemyEntity : null;
+            if (enemy == null || ReferenceEquals(equipmentCapturedEntity, enemy))
+                return;
+            try
+            {
+                ulong[] slots = enemy.ItemEquipTable.SerializeEquipTable();
+                var items = new List<DaggerfallWorkshop.Game.Serialization.ItemData_v1>();
+                var seen = new HashSet<ulong>();
+                for (int i = 0; i < slots.Length; i++)
+                {
+                    var item = enemy.ItemEquipTable.GetItem((DaggerfallWorkshop.Game.Items.EquipSlots)i);
+                    if (item == null || item.IsQuestItem)
+                    {
+                        slots[i] = 0;
+                        continue;
+                    }
+                    if (seen.Add(item.UID))
+                        items.Add(item.GetSaveData());
+                }
+                var snapshot = new SpawnEquipmentData
+                {
+                    items = items.ToArray(), slots = slots,
+                    armor = (sbyte[])enemy.ArmorValues.Clone()
+                };
+                FullSerializer.fsData data;
+                var result = new FullSerializer.fsSerializer().TrySerialize(typeof(SpawnEquipmentData), snapshot, out data);
+                if (result.Failed)
+                    throw new System.InvalidOperationException(result.ToString());
+                string json = FullSerializer.fsJsonPrinter.CompressedJson(data);
+                // Mirror 57 strings have a 32 KiB UTF-8 limit.
+                if (System.Text.Encoding.UTF8.GetByteCount(json) >= 32768)
+                    throw new System.InvalidOperationException("Spawn equipment exceeds Mirror's string limit.");
+                syncedSpawnEquipment = json;
+                equipmentCapturedEntity = enemy;
+            }
+            catch (System.Exception e)
+            {
+                equipmentCaptureFailed = true;
+                Debug.LogError("[EnemyEquipmentSync] Cannot capture '" + name + "': " + e);
+            }
+        }
+
+        private void ApplySpawnEquipment()
+        {
+            if (!isClientOnly || string.IsNullOrEmpty(syncedSpawnEquipment))
+                return;
+            DaggerfallEntityBehaviour behaviour = GetComponent<DaggerfallEntityBehaviour>();
+            EnemyEntity enemy = behaviour != null ? behaviour.Entity as EnemyEntity : null;
+            if (enemy == null || (ReferenceEquals(equipmentAppliedEntity, enemy) && equipmentAppliedPayload == syncedSpawnEquipment))
+                return;
+            // Remember failures too, so a missing/incompatible mod doesn't log every frame.
+            equipmentAppliedEntity = enemy;
+            equipmentAppliedPayload = syncedSpawnEquipment;
+            try
+            {
+                object boxed = null;
+                var result = new FullSerializer.fsSerializer().TryDeserialize(
+                    FullSerializer.fsJsonParser.Parse(syncedSpawnEquipment), typeof(SpawnEquipmentData), ref boxed);
+                if (result.Failed)
+                    throw new System.InvalidOperationException(result.ToString());
+                var snapshot = (SpawnEquipmentData)boxed;
+                ulong[] previous = enemy.ItemEquipTable.SerializeEquipTable();
+                if (snapshot.items == null || snapshot.slots == null || snapshot.slots.Length != previous.Length ||
+                    snapshot.armor == null || snapshot.armor.Length != enemy.ArmorValues.Length)
+                    throw new System.InvalidOperationException("Invalid equipment snapshot.");
+
+                // UIDs are process-local. Remap received equipment before inserting,
+                // so it cannot replace a local quest item or unrelated inventory item.
+                var ids = new Dictionary<ulong, ulong>();
+                foreach (var item in snapshot.items)
+                {
+                    if (item == null || item.isQuestItem || item.uid == 0 || ids.ContainsKey(item.uid))
+                        throw new System.InvalidOperationException("Invalid equipped item.");
+                    ulong old = item.uid;
+                    item.uid = DaggerfallUnity.NextUID;
+                    ids.Add(old, item.uid);
+                }
+                for (int i = 0; i < snapshot.slots.Length; i++)
+                {
+                    ulong mapped;
+                    if (snapshot.slots[i] != 0 && !ids.TryGetValue(snapshot.slots[i], out mapped))
+                        throw new System.InvalidOperationException("Missing equipped item.");
+                    snapshot.slots[i] = snapshot.slots[i] == 0 ? 0 : ids[snapshot.slots[i]];
+                }
+                var incoming = new DaggerfallWorkshop.Game.Items.ItemCollection();
+                incoming.DeserializeItems(snapshot.items);
+
+                // Only replace rolled equipment. Keep non-equipped inventory and
+                // locally bound quest items under the existing loot/quest systems.
+                for (int i = 0; i < previous.Length; i++)
+                {
+                    var old = enemy.ItemEquipTable.GetItem((DaggerfallWorkshop.Game.Items.EquipSlots)i);
+                    if (old == null) continue;
+                    if (old.IsQuestItem)
+                    {
+                        if (snapshot.slots[i] == 0)
+                            snapshot.slots[i] = old.UID;
+                        else
+                            old.EquipSlot = DaggerfallWorkshop.Game.Items.EquipSlots.None;
+                        continue;
+                    }
+                    enemy.Items.RemoveItem(old);
+                }
+                for (int i = 0; i < incoming.Count; i++)
+                    enemy.Items.AddItem(incoming.GetItem(i), noStack: true);
+                enemy.ItemEquipTable.DeserializeEquipTable(snapshot.slots, enemy.Items);
+                enemy.ArmorValues = snapshot.armor;
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogError("[EnemyEquipmentSync] Cannot apply '" + name + "': " + e);
+            }
+        }
+
         [SyncVar] public MobileTypes EnemyType = MobileTypes.SkeletalWarrior;
         [SyncVar] public MobileReactions EnemyReaction = MobileReactions.Passive;
         [SyncVar] public MobileGender EnemyGender = MobileGender.Unspecified;
         [SyncVar] public bool AlliedToPlayer = false;
+
+        // Daedra Seducer transformation is a single retained network event.
+        // Any player can request it; the server publishes it to every observer.
+        [SyncVar(hook = nameof(OnSeducerTransformationStartedChanged))]
+        private bool syncedSeducerTransformationStarted = false;
+
+        public bool SeducerTransformationStarted => syncedSeducerTransformationStarted;
+
+        public void RequestSeducerTransformation()
+        {
+            if (EnemyType != MobileTypes.DaedraSeducer)
+                return;
+
+            // If this peer already received the retained event, this doubles as the
+            // vanilla retry path when Hurt or another state interrupts transformation.
+            if (syncedSeducerTransformationStarted)
+            {
+                ApplySyncedSeducerTransformation();
+                return;
+            }
+
+            // Listen host can commit directly. Pure clients use an authority-free command
+            // so the player who triggers the transformation does not need to own the enemy.
+            if (isServer)
+                ServerStartSeducerTransformation();
+            else if (isClient)
+                CmdRequestSeducerTransformation();
+        }
+
+        [Command(requiresAuthority = false)]
+        private void CmdRequestSeducerTransformation(NetworkConnectionToClient sender = null)
+        {
+            if (sender == null || sender.identity == null ||
+                sender.identity.GetComponent<PlayerMultiplayer>() == null)
+                return;
+
+            ServerStartSeducerTransformation();
+        }
+
+        [Server]
+        private void ServerStartSeducerTransformation()
+        {
+            if (syncedSeducerTransformationStarted || EnemyType != MobileTypes.DaedraSeducer)
+                return;
+
+            syncedSeducerTransformationStarted = true;
+            ApplySyncedSeducerTransformation();
+        }
+
+        private void OnSeducerTransformationStartedChanged(bool previous, bool current)
+        {
+            if (current)
+                ApplySyncedSeducerTransformation();
+        }
+
+        private void ApplySyncedSeducerTransformation()
+        {
+            if (!syncedSeducerTransformationStarted)
+                return;
+
+            MobileUnit mobile = GetMobileBillboardChild();
+            if (mobile == null || !mobile.IsSetup ||
+                mobile.Enemy.ID != (int)MobileTypes.DaedraSeducer ||
+                mobile.SpecialTransformationCompleted ||
+                mobile.EnemyState == MobileStates.SeducerTransform1 ||
+                mobile.EnemyState == MobileStates.SeducerTransform2)
+                return;
+
+            mobile.ChangeEnemyState(MobileStates.SeducerTransform1);
+        }
 
         // Optional team selected by an external spawner. -1 preserves ordinary setup.
         [SyncVar(hook = nameof(OnSpawnTeamOverrideChanged))]
@@ -125,6 +403,7 @@ namespace DaggerfallWorkshop.Game
                 EnemyReaction,
                 ClassicSpawnDistanceType);
             clientVisualSettingsApplied = true;
+            ApplySyncedSeducerTransformation();
 
             if (ExternalVisualRangedFlags >= 0)
             {
@@ -880,6 +1159,7 @@ private IEnumerator ApplyPendingOneShotAuthoritativeHealthRepairWhenReady()
 public override void OnStartServer()
 {
     base.OnStartServer();
+    CaptureSpawnEquipment();
 
     // Late-join fix:
     // If this enemy was spawned by normal DFU/GameObjectHelper code, its DaggerfallEntity/MobileUnit
@@ -891,14 +1171,15 @@ public override void OnStartServer()
     {
         MobileEnemy mobileEnemy = enemyEntity.MobileEnemy;
 
-        if (mobileEnemy.ID < 0 || mobileEnemy.ID >= EnemyBasics.Enemies.Length)
+        MobileEnemy enemyDefinition;
+        if (!EnemyBasics.GetEnemy((MobileTypes)mobileEnemy.ID, out enemyDefinition))
         {
-            Debug.LogError($"[SetupDemoEnemy] ERROR: Invalid enemy ID {mobileEnemy.ID}!");
+            Debug.LogError($"[SetupDemoEnemy] ERROR: Unknown enemy ID {mobileEnemy.ID}!");
             return;
         }
 
         mobileEnemy.Team = SpawnTeamOverride >= 0 && System.Enum.IsDefined(typeof(MobileTeams), SpawnTeamOverride)
-            ? (MobileTeams)SpawnTeamOverride : EnemyBasics.Enemies[mobileEnemy.ID].Team;
+            ? (MobileTeams)SpawnTeamOverride : enemyDefinition.Team;
         enemyEntity.SetMobileEnemy(mobileEnemy);
 
         EnemyType = (MobileTypes)mobileEnemy.ID;
@@ -1182,6 +1463,8 @@ private IEnumerator WaitForDungeon()
 
         private void Update()
         {
+            CaptureSpawnEquipment();
+            ApplySpawnEquipment();
             EnemyMotor motor = GetComponent<EnemyMotor>();
             if (motor == null)
                 return;
@@ -1417,11 +1700,18 @@ private IEnumerator WaitForDungeon()
                 if (hasPendingOneShotAuthoritativeHealthRepair)
                     TryApplyPendingOneShotAuthoritativeHealthRepair("after-apply-settings");
 
-                // Add special behaviour for Daedra Seducer mobiles
-                if (dfMobile.Enemy.ID == (int)MobileTypes.DaedraSeducer)
+                ApplySpawnEquipment();
+
+                // Add special behaviour for Daedra Seducer mobiles once.
+                if (dfMobile.Enemy.ID == (int)MobileTypes.DaedraSeducer &&
+                    dfMobile.GetComponent<DaedraSeducerMobileBehaviour>() == null)
                 {
                     dfMobile.gameObject.AddComponent<DaedraSeducerMobileBehaviour>();
                 }
+
+                // The SyncVar can arrive before this mobile/entity rebuild finishes (especially
+                // for late joiners). Reapply the retained event once the billboard is ready.
+                ApplySyncedSeducerTransformation();
             }
         }
 

@@ -12,6 +12,8 @@
 using UnityEngine;
 using UnityEngine.SceneManagement;
 using System.Collections;
+using UnityEngine.Localization.Settings;
+using UnityEngine.ResourceManagement.AsyncOperations;
 
 namespace DaggerfallWorkshop.Game.Utility
 {
@@ -26,6 +28,11 @@ namespace DaggerfallWorkshop.Game.Utility
 
         void Start()
         {
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+            {
+                StartCoroutine(StartDedicatedGameScene());
+                return;
+            }
             // Resolution
             if (DaggerfallUnity.Settings.ExclusiveFullscreen && DaggerfallUnity.Settings.Fullscreen)
             {
@@ -56,6 +63,40 @@ namespace DaggerfallWorkshop.Game.Utility
             {
                 SceneManager.LoadScene(GameSceneIndex);
             }
+        }
+
+        IEnumerator StartDedicatedGameScene()
+        {
+            Debug.Log("[DFUDedicated] Startup scene reached; validating Daggerfall data.");
+            if (!DedicatedServerBootstrap.ValidateDataPath())
+                yield break;
+
+            // Do not force a scene transition while localization/Addressables are
+            // still initializing. Game-scene Awake methods can request localized
+            // text synchronously and block the scene transition they depend on.
+            yield return null;
+            Debug.Log("[DFUDedicated] Waiting for localization initialization.");
+            var initialization = LocalizationSettings.InitializationOperation;
+            float deadline = Time.realtimeSinceStartup + 60f;
+            while (!initialization.IsDone)
+            {
+                if (Time.realtimeSinceStartup >= deadline)
+                {
+                    DedicatedServerBootstrap.Fail("Localization initialization timed out before game-scene loading.");
+                    yield break;
+                }
+                yield return null;
+            }
+            if (initialization.Status != AsyncOperationStatus.Succeeded)
+            {
+                DedicatedServerBootstrap.Fail("Localization initialization failed: " + initialization.OperationException);
+                yield break;
+            }
+
+            Debug.Log("[DFUDedicated] Localization ready; loading game scene asynchronously.");
+            // Let completion callbacks finish before starting a scene transition.
+            yield return null;
+            SceneManager.LoadSceneAsync(GameSceneIndex);
         }
 
         //if scenes not in build menu, not guarenteed to be correct!

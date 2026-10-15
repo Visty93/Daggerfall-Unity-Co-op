@@ -82,7 +82,7 @@ namespace DaggerfallWorkshop.Game.Entity
 		
 		
 [Command(requiresAuthority = false)]
-public void Cmd_UpdateHealth(int newHealth, uint enemyNetId)
+public void Cmd_UpdateHealth(int newHealth, uint enemyNetId, NetworkConnectionToClient sender = null)
 {
     if (!NetworkIdentity.spawned.ContainsKey(enemyNetId))
         return;
@@ -95,6 +95,11 @@ public void Cmd_UpdateHealth(int newHealth, uint enemyNetId)
     int hostHealth = enemyBehaviour.Entity.CurrentHealth;
     int maxHealth = Mathf.Max(1, enemyBehaviour.Entity.MaxHealth);
     int acceptedHealth = Mathf.Clamp(newHealth, 0, maxHealth);
+    if (NetworkServer.active && !NetworkClient.active && acceptedHealth < hostHealth)
+    {
+        NetworkIdentity healthIdentity = enemy.GetComponent<NetworkIdentity>();
+        Debug.LogWarning($"[DedicatedHealthReport] enemy='{enemy.name}' netId={enemyNetId} sender={(sender != null ? sender.connectionId.ToString() : "none")} owner={(healthIdentity != null && healthIdentity.connectionToClient != null ? healthIdentity.connectionToClient.connectionId.ToString() : "server")} hostHp={hostHealth} reportedHp={acceptedHealth} y={enemy.transform.position.y}");
+    }
 
     // Client damage reports are absolute health values. Never let a stale/older client
     // report raise enemy HP on the host, and never let a positive report revive an enemy

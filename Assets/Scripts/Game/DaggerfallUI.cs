@@ -342,6 +342,17 @@ namespace DaggerfallWorkshop.Game
 
         void Awake()
         {
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+            {
+                dfUnity = DaggerfallUnity.Instance;
+                audioSource = GetComponent<AudioSource>();
+                dfAudioSource = GetComponent<DaggerfallAudioSource>();
+                dfSongPlayer = GetComponent<DaggerfallSongPlayer>();
+                fadeBehaviour = GetComponent<FadeBehaviour>();
+                SetupSingleton();
+                enabled = false;
+                return;
+            }
             dfUnity = DaggerfallUnity.Instance;
             audioSource = GetComponent<AudioSource>();
             audioSource.spatialBlend = 0;

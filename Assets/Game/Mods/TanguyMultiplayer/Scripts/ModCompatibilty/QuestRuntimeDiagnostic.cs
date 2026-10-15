@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Reflection;
 using DaggerfallWorkshop.Game.Questing;
 using DaggerfallWorkshop.Game.Questing.Actions;
@@ -18,12 +19,28 @@ public sealed class QuestRuntimeDiagnostic : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Install()
     {
-        if (instance != null)
+        if (instance != null || !Requested())
             return;
 
         GameObject go = new GameObject("QuestRuntimeDiagnostic");
         DontDestroyOnLoad(go);
         instance = go.AddComponent<QuestRuntimeDiagnostic>();
+    }
+
+
+    static bool Requested()
+    {
+        foreach (string arg in Environment.GetCommandLineArgs())
+            if (string.Equals(arg, "-dfu-quest-diagnostics", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(arg, "-dfu-verbose-logs", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+        try
+        {
+            string root = Path.GetDirectoryName(Application.dataPath);
+            return File.Exists(Path.Combine(root, "QuestDiagnostics.enabled"));
+        }
+        catch { return false; }
     }
 
     void OnEnable()

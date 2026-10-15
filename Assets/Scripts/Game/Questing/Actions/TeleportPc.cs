@@ -45,6 +45,12 @@ namespace DaggerfallWorkshop.Game.Questing
         float networkDungeonResumeStartedAt = 0f;
         const float NetworkDungeonResumeTimeout = 20f;
 
+        // Keep the quest's original marker definition intact while the authoritative
+        // network dungeon is created. Once the live dungeon exists, resolve this marker
+        // by markerID against that actual Small/Full block layout.
+        QuestMarker networkDungeonRequestedMarker = new QuestMarker();
+        bool networkDungeonHasRequestedMarker = false;
+
         public override string Pattern
         {
             get { return @"teleport pc to (?<aPlace>[a-zA-Z0-9_.-]+)|" +
@@ -83,6 +89,8 @@ namespace DaggerfallWorkshop.Game.Questing
             networkDungeonRegionName = string.Empty;
             networkDungeonLocationName = string.Empty;
             networkDungeonResumeStartedAt = 0f;
+            networkDungeonRequestedMarker = new QuestMarker();
+            networkDungeonHasRequestedMarker = false;
         }
 
         public override void Update(Task caller)
@@ -147,15 +155,14 @@ namespace DaggerfallWorkshop.Game.Questing
             if (!usingMarker)
                 marker = place.SiteDetails.questSpawnMarkers[0];
 
-            Vector3 dungeonBlockPosition = new Vector3(marker.dungeonX * RDBLayout.RDBSide, 0, marker.dungeonZ * RDBLayout.RDBSide);
-            Vector3 markerLocalPosition = dungeonBlockPosition + marker.flatPosition;
-
             bool multiplayerActive = NetworkServer.active || NetworkClient.active;
             if (multiplayerActive)
             {
-                StartNetworkDungeonTeleport(location, worldPos, markerLocalPosition);
+                StartNetworkDungeonTeleport(location, worldPos, marker);
                 return;
             }
+
+            Vector3 markerLocalPosition = GameObjectHelper.GetDungeonQuestMarkerLocalPosition(marker);
 
             // Original single-player behavior.
             GameManager.Instance.PlayerEnterExit.RespawnPlayer(
@@ -168,11 +175,21 @@ namespace DaggerfallWorkshop.Game.Questing
             resumePending = true;
         }
 
-        void StartNetworkDungeonTeleport(DFLocation location, DFPosition worldPos, Vector3 markerLocalPosition)
+        void StartNetworkDungeonTeleport(DFLocation location, DFPosition worldPos, QuestMarker requestedMarker)
         {
             PlayerEnterExit playerEnterExit = GameManager.Instance.PlayerEnterExit;
             if (playerEnterExit == null)
                 return;
+
+            Vector3 markerLocalPosition = GameObjectHelper.GetDungeonQuestMarkerLocalPosition(requestedMarker);
+            networkDungeonRequestedMarker = requestedMarker;
+            networkDungeonHasRequestedMarker = true;
+
+            // PlayerEnterExit must not snap to the quest's old Small/Full-layout coordinates
+            // during the asynchronous network entry. It enters at the normal dungeon marker;
+            // TryFinishNetworkDungeonTeleport() performs the translated marker snap afterwards.
+            Vector3 deferredMarkerSentinel =
+                new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
 
             // TeleportPc originally uses the dungeon location map-pixel origin, which can be
             // hundreds of Unity units away from the actual exterior dungeon entrance. Normal
@@ -209,7 +226,7 @@ namespace DaggerfallWorkshop.Game.Questing
                 // Register locally too as a fallback, but the important registration happens again in TargetEnterTeleportPcDungeon.
                 playerEnterExit.RegisterMultiplayerQuestDungeonTeleportMarker(
                     location,
-                    markerLocalPosition,
+                    deferredMarkerSentinel,
                     "TeleportPc-client-before-host-request");
 
                 // Update the lightweight MP coordinate before the request, but do not run TransitionDungeonInterior locally.
@@ -227,8 +244,8 @@ namespace DaggerfallWorkshop.Game.Questing
                     return;
                 }
 
-                Debug.Log($"[TeleportPcMP] Pure client requesting host dungeon '{location.RegionName}/{location.Name}' world={worldPos.X}/{worldPos.Y} markerLocal={markerLocalPosition}");
-                localPlayer.RequestTeleportPcDungeonFromHost(location, markerLocalPosition, worldPos.X, worldPos.Y, "TeleportPc-client");
+                Debug.Log($"[TeleportPcMP] Pure client requesting host dungeon '{location.RegionName}/{location.Name}' world={worldPos.X}/{worldPos.Y} originalMarkerLocal={markerLocalPosition}; marker snap deferred until authoritative layout is ready.");
+                localPlayer.RequestTeleportPcDungeonFromHost(location, deferredMarkerSentinel, worldPos.X, worldPos.Y, "TeleportPc-client");
                 return;
             }
 
@@ -241,13 +258,13 @@ namespace DaggerfallWorkshop.Game.Questing
 
             playerEnterExit.RegisterMultiplayerQuestDungeonTeleportMarker(
                 location,
-                markerLocalPosition,
+                deferredMarkerSentinel,
                 "TeleportPc-host-before-dungeon-request");
 
             ForceSendLocalCoordinates("teleportpc-host-before-dungeon-request");
 
             StaticDoor dummyDoor = new StaticDoor();
-            Debug.Log($"[TeleportPcMP] Host/server requesting/entering network dungeon '{location.RegionName}/{location.Name}' world={worldPos.X}/{worldPos.Y} markerLocal={markerLocalPosition}");
+            Debug.Log($"[TeleportPcMP] Host/server requesting/entering network dungeon '{location.RegionName}/{location.Name}' world={worldPos.X}/{worldPos.Y} originalMarkerLocal={markerLocalPosition}; marker snap deferred until authoritative layout is ready.");
             playerEnterExit.TransitionDungeonInterior(null, dummyDoor, location, true);
         }
 
@@ -273,7 +290,45 @@ namespace DaggerfallWorkshop.Game.Questing
                 return false;
             }
 
-            if (!playerEnterExit.TryMovePlayerToDungeonQuestMarker(resumePosition, "TeleportPc-final-marker"))
+            Vector3 resolvedMarkerLocalPosition = resumePosition;
+            if (networkDungeonHasRequestedMarker)
+            {
+                QuestMarker resolvedMarker;
+                string markerResolution;
+                string stableMarkerKey =
+                    (ParentQuest != null ? ParentQuest.QuestName : string.Empty) + "|" +
+                    (targetPlace != null ? targetPlace.Name : string.Empty) + "|" +
+                    targetMarker.ToString() + "|TeleportPc";
+
+                if (GameObjectHelper.TryResolveNetworkDungeonQuestMarker(
+                    dungeon,
+                    networkDungeonRequestedMarker,
+                    MarkerTypes.QuestSpawn,
+                    stableMarkerKey,
+                    out resolvedMarker,
+                    out markerResolution))
+                {
+                    resolvedMarkerLocalPosition =
+                        GameObjectHelper.GetDungeonQuestMarkerLocalPosition(resolvedMarker);
+                    resumePosition = resolvedMarkerLocalPosition;
+
+                    Debug.Log(
+                        $"[DungeonQuestMarkerResolve] TeleportPc resolved marker mode={markerResolution} " +
+                        $"requested=({networkDungeonRequestedMarker.dungeonX},{networkDungeonRequestedMarker.dungeonZ})/" +
+                        $"{networkDungeonRequestedMarker.markerID} resolved=({resolvedMarker.dungeonX},{resolvedMarker.dungeonZ})/" +
+                        $"{resolvedMarker.markerID} local={resolvedMarkerLocalPosition} dungeon='{dungeon.Summary.LocationName}'");
+                }
+                else
+                {
+                    Debug.LogError(
+                        $"[DungeonQuestMarkerResolve] TeleportPc could not resolve quest marker in authoritative " +
+                        $"dungeon '{dungeon.Summary.LocationName}'. reason={markerResolution}. Keeping original local={resumePosition}");
+                }
+
+                networkDungeonHasRequestedMarker = false;
+            }
+
+            if (!playerEnterExit.TryMovePlayerToDungeonQuestMarker(resolvedMarkerLocalPosition, "TeleportPc-final-marker"))
                 return false;
 
             ForceSendLocalCoordinates("teleportpc-dungeon-final-marker");

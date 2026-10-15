@@ -454,7 +454,22 @@ namespace DaggerfallWorkshop
 [System.Serializable]
 public struct DungeonNetworkData
 {
-    public int ID;
+    // Exact MAPS.BSA identity for this location. Region/name are retained for display,
+    // diagnostics, and legacy fallback only; names are not guaranteed unique inside a region.
+    public bool HasExactLocationIdentity;
+    public int RegionIndex;
+    public int LocationIndex;
+
+    // First-creator authoritative physical RDB layout. This is intentionally kept
+    // separate from quest state: whichever player creates this network dungeon first
+    // supplies the exact block list they are actually using (small or full), and every
+    // peer builds that same physical layout.
+    public bool HasAuthoritativeBlockLayout;
+    public string AuthoritativeBlockLayout;
+    public int AuthoritativeBlockCount;
+    public int AuthoritativeBlockLayoutHash;
+
+    public int ID; // MapId
     public string RegionName;
     public string LocationName;
     public DFRegion.LocationTypes LocationType;
@@ -491,6 +506,285 @@ public struct DungeonNetworkData
     public string InitialSavedActionState;
 }
 
+
+
+public static void WriteExactLocationIdentityToNetworkData(ref DungeonNetworkData data, DFLocation location)
+{
+    data.HasExactLocationIdentity = location.Loaded;
+    data.RegionIndex = location.RegionIndex;
+    data.LocationIndex = location.LocationIndex;
+    data.ID = location.MapTableData.MapId;
+    data.RegionName = location.RegionName;
+    data.LocationName = location.Name;
+    data.LocationType = location.MapTableData.LocationType;
+    data.DungeonType = location.MapTableData.DungeonType;
+}
+
+
+public static string BuildAuthoritativeBlockLayoutString(DFLocation location)
+{
+    if (!location.Loaded || !location.HasDungeon ||
+        location.Dungeon.Blocks == null || location.Dungeon.Blocks.Length == 0)
+    {
+        return string.Empty;
+    }
+
+    System.Text.StringBuilder sb = new System.Text.StringBuilder(location.Dungeon.Blocks.Length * 24);
+    for (int i = 0; i < location.Dungeon.Blocks.Length; i++)
+    {
+        DFLocation.DungeonBlock block = location.Dungeon.Blocks[i];
+        if (i > 0)
+            sb.Append(';');
+
+        // RDB names cannot contain these separators. Keep the wire format compact so
+        // even very large classic dungeons remain well below Mirror/KCP message limits.
+        sb.Append(block.BlockName ?? string.Empty);
+        sb.Append(',');
+        sb.Append(block.X);
+        sb.Append(',');
+        sb.Append(block.Z);
+        sb.Append(',');
+        sb.Append(block.IsStartingBlock ? '1' : '0');
+    }
+
+    return sb.ToString();
+}
+
+public static void WriteAuthoritativeBlockLayoutToNetworkData(ref DungeonNetworkData data, DFLocation location)
+{
+    string encoded = BuildAuthoritativeBlockLayoutString(location);
+    data.HasAuthoritativeBlockLayout = !string.IsNullOrEmpty(encoded);
+    data.AuthoritativeBlockLayout = encoded ?? string.Empty;
+    data.AuthoritativeBlockCount =
+        location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0;
+    data.AuthoritativeBlockLayoutHash =
+        data.HasAuthoritativeBlockLayout ? StableStringHash(data.AuthoritativeBlockLayout) : 0;
+}
+
+public static bool TryApplyAuthoritativeBlockLayout(
+    string encodedLayout,
+    ref DFLocation location,
+    out string result)
+{
+    result = string.Empty;
+
+    if (string.IsNullOrEmpty(encodedLayout))
+    {
+        result = "no-layout";
+        return false;
+    }
+
+    // Defensive ceiling only. Classic dungeons are far smaller than this.
+    if (encodedLayout.Length > 128 * 1024)
+    {
+        result = "layout-payload-too-large";
+        return false;
+    }
+
+    string[] entries = encodedLayout.Split(new char[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+    if (entries.Length == 0 || entries.Length > 512)
+    {
+        result = "invalid-block-count=" + entries.Length;
+        return false;
+    }
+
+    List<DFLocation.DungeonBlock> blocks = new List<DFLocation.DungeonBlock>(entries.Length);
+    HashSet<int> occupied = new HashSet<int>();
+    int startingBlocks = 0;
+
+    for (int i = 0; i < entries.Length; i++)
+    {
+        string[] parts = entries[i].Split(',');
+        if (parts.Length != 4)
+        {
+            result = "invalid-entry-fields index=" + i;
+            return false;
+        }
+
+        string blockName = parts[0];
+        if (string.IsNullOrEmpty(blockName) ||
+            blockName.Length > 32 ||
+            !blockName.EndsWith(".RDB", StringComparison.OrdinalIgnoreCase) ||
+            blockName.IndexOf('/') >= 0 ||
+            blockName.IndexOf('\\') >= 0)
+        {
+            result = "invalid-block-name index=" + i + " name='" + blockName + "'";
+            return false;
+        }
+
+        sbyte x;
+        sbyte z;
+        int startInt;
+        if (!sbyte.TryParse(parts[1], out x) ||
+            !sbyte.TryParse(parts[2], out z) ||
+            !int.TryParse(parts[3], out startInt) ||
+            (startInt != 0 && startInt != 1))
+        {
+            result = "invalid-block-fields index=" + i;
+            return false;
+        }
+
+        int coordKey = ((int)x + 128) | (((int)z + 128) << 8);
+        if (!occupied.Add(coordKey))
+        {
+            result = "duplicate-block-coordinate index=" + i + " x=" + x + " z=" + z;
+            return false;
+        }
+
+        DFLocation.DungeonBlock block = new DFLocation.DungeonBlock();
+        block.BlockName = blockName;
+        block.X = x;
+        block.Z = z;
+        block.IsStartingBlock = startInt == 1;
+        block.WaterLevel = 10000;
+        block.CastleBlock = false;
+
+        if (block.IsStartingBlock)
+            startingBlocks++;
+
+        blocks.Add(block);
+    }
+
+    if (startingBlocks != 1)
+    {
+        result = "invalid-starting-block-count=" + startingBlocks;
+        return false;
+    }
+
+    DFLocation.LocationDungeon dungeonData = location.Dungeon;
+    dungeonData.Blocks = blocks.ToArray();
+    dungeonData.Header.BlockCount = (ushort)blocks.Count;
+    location.Dungeon = dungeonData;
+
+    result = "applied";
+    return true;
+}
+
+public static bool TryApplyAuthoritativeBlockLayout(
+    DungeonNetworkData data,
+    ref DFLocation location,
+    out string result)
+{
+    if (!data.HasAuthoritativeBlockLayout || string.IsNullOrEmpty(data.AuthoritativeBlockLayout))
+    {
+        result = "legacy-local-layout";
+        return true;
+    }
+
+    if (!TryApplyAuthoritativeBlockLayout(data.AuthoritativeBlockLayout, ref location, out result))
+        return false;
+
+    int actualCount = location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0;
+    int actualHash = StableStringHash(data.AuthoritativeBlockLayout);
+
+    if (data.AuthoritativeBlockCount > 0 && actualCount != data.AuthoritativeBlockCount)
+    {
+        result = "block-count-mismatch expected=" + data.AuthoritativeBlockCount + " actual=" + actualCount;
+        return false;
+    }
+
+    if (data.AuthoritativeBlockLayoutHash != 0 &&
+        actualHash != data.AuthoritativeBlockLayoutHash)
+    {
+        result = "layout-hash-mismatch expected=" + data.AuthoritativeBlockLayoutHash + " actual=" + actualHash;
+        return false;
+    }
+
+    result = "authoritative-layout";
+    return true;
+}
+
+public static bool TryResolveNetworkDungeonLocation(
+    bool hasExactLocationIdentity,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    string regionName,
+    string locationName,
+    out DFLocation location,
+    out string resolution)
+{
+    location = new DFLocation();
+    resolution = string.Empty;
+
+    if (DaggerfallUnity.Instance == null ||
+        DaggerfallUnity.Instance.ContentReader == null ||
+        DaggerfallUnity.Instance.ContentReader.MapFileReader == null)
+    {
+        resolution = "map-reader-not-ready";
+        return false;
+    }
+
+    MapsFile mapReader = DaggerfallUnity.Instance.ContentReader.MapFileReader;
+
+    if (hasExactLocationIdentity)
+    {
+        if (regionIndex < 0 || locationIndex < 0)
+        {
+            resolution = $"invalid-exact-indices regionIndex={regionIndex} locationIndex={locationIndex}";
+            return false;
+        }
+
+        DFLocation exact = mapReader.GetLocation(regionIndex, locationIndex);
+        if (!exact.Loaded || !exact.HasDungeon)
+        {
+            resolution = $"exact-location-not-found regionIndex={regionIndex} locationIndex={locationIndex} mapId={mapId}";
+            return false;
+        }
+
+        if (exact.MapTableData.MapId != mapId)
+        {
+            resolution = $"exact-mapid-mismatch requested={mapId} resolved={exact.MapTableData.MapId} regionIndex={regionIndex} locationIndex={locationIndex}";
+            return false;
+        }
+
+        if (!string.Equals(exact.RegionName, regionName, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(exact.Name, locationName, StringComparison.OrdinalIgnoreCase))
+        {
+            Debug.LogWarning($"[DungeonLocationIdentity] Exact indices/mapId resolved successfully but display names differ. requested='{regionName}/{locationName}' resolved='{exact.RegionName}/{exact.Name}' regionIndex={regionIndex} locationIndex={locationIndex} mapId={mapId}");
+        }
+
+        location = exact;
+        resolution = "exact-indices";
+        return true;
+    }
+
+    // Legacy fallback for older callers that do not provide exact indices. Keep this path
+    // only for compatibility; validate MapId when one is available so an ambiguous name
+    // cannot silently select a completely different location.
+    DFLocation legacy = mapReader.GetLocation(regionName, locationName);
+    if (!legacy.Loaded || !legacy.HasDungeon)
+    {
+        resolution = $"legacy-name-location-not-found '{regionName}/{locationName}'";
+        return false;
+    }
+
+    if (mapId != 0 && legacy.MapTableData.MapId != mapId)
+    {
+        resolution = $"legacy-name-mapid-mismatch requested={mapId} resolved={legacy.MapTableData.MapId} name='{regionName}/{locationName}'";
+        return false;
+    }
+
+    location = legacy;
+    resolution = "legacy-name";
+    return true;
+}
+
+public static bool TryResolveNetworkDungeonLocation(
+    DungeonNetworkData data,
+    out DFLocation location,
+    out string resolution)
+{
+    return TryResolveNetworkDungeonLocation(
+        data.HasExactLocationIdentity,
+        data.RegionIndex,
+        data.LocationIndex,
+        data.ID,
+        data.RegionName,
+        data.LocationName,
+        out location,
+        out resolution);
+}
 
 
 public static int StableStringHash(string text)
@@ -1167,22 +1461,25 @@ public void SetDungeon(DFLocation location, bool importEnemies = true)
 
             DungeonNetworkData requestSpec = new DungeonNetworkData
             {
-                ID = location.MapTableData.MapId,
-                RegionName = location.RegionName,
-                LocationName = location.Name,
-                LocationType = location.MapTableData.LocationType,
-                DungeonType = location.MapTableData.DungeonType,
                 RequesterNetId = myNetId
             };
+            WriteExactLocationIdentityToNetworkData(ref requestSpec, location);
 
             int requesterLevel = GetLocalPlayerLevelFallback();
             FillGenerationSpecFromLocation(ref requestSpec, location, requesterLevel);
 
-            Debug.Log($"[SetDungeon] Sending requester generation spec to host: level={requestSpec.RequesterLevel}, seed={requestSpec.MonsterSeed}, textures=[{requestSpec.Texture0},{requestSpec.Texture1},{requestSpec.Texture2},{requestSpec.Texture3},{requestSpec.Texture4},{requestSpec.Texture5}]");
+            Debug.Log($"[SetDungeon] Sending requester generation spec to host: mapId={requestSpec.ID}, regionIndex={requestSpec.RegionIndex}, locationIndex={requestSpec.LocationIndex}, level={requestSpec.RequesterLevel}, seed={requestSpec.MonsterSeed}, textures=[{requestSpec.Texture0},{requestSpec.Texture1},{requestSpec.Texture2},{requestSpec.Texture3},{requestSpec.Texture4},{requestSpec.Texture5}]");
 
-            player.CmdRequestDungeonFromHostWithGenerationSpec(
+            string requesterBlockLayout = BuildAuthoritativeBlockLayoutString(location);
+            Debug.Log($"[DungeonLayoutAuthority] Requester sending physical layout: blocks={(location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0)}, hash={StableStringHash(requesterBlockLayout)}, dungeon='{location.RegionName}/{location.Name}'");
+
+            player.CmdRequestDungeonFromHostWithGenerationSpecExactLayout(
                 location.RegionName,
                 location.Name,
+                requestSpec.RegionIndex,
+                requestSpec.LocationIndex,
+                requestSpec.ID,
+                requesterBlockLayout,
                 myNetId,
                 requestSpec.RequesterLevel,
                 requestSpec.MonsterSeed,
@@ -1204,8 +1501,7 @@ public void SetDungeon(DFLocation location, bool importEnemies = true)
     DaggerfallDungeon[] existingDungeons = FindObjectsOfType<DaggerfallDungeon>();
     foreach (var dungeon in existingDungeons)
     {
-        if (dungeon.Summary.LocationName == location.Name &&
-            dungeon.Summary.RegionName == location.RegionName)
+        if (dungeon.Summary.ID == location.MapTableData.MapId)
         {
             Debug.Log($"[SetDungeon] Dungeon already exists: {dungeonSceneName}");
             if (!dungeon.isSet)
@@ -1251,6 +1547,8 @@ DaggerfallDungeon.DungeonNetworkData data = new DaggerfallDungeon.DungeonNetwork
     IsNetworkDungeonInstance = dungeonComp.IsNetworkDungeonInstance,
     DungeonInstanceId = dungeonComp.DungeonInstanceId,
 };
+WriteExactLocationIdentityToNetworkData(ref data, dungeonComp.Summary.LocationData);
+WriteAuthoritativeBlockLayoutToNetworkData(ref data, dungeonComp.Summary.LocationData);
 dungeonComp.WriteGenerationSpecToNetworkData(ref data);
 dungeonComp.WriteWorldAnchorToNetworkData(ref data);
 Debug.Log($"[SetDungeon] Sync spec prepared: level={data.RequesterLevel}, seed={data.MonsterSeed}, textures=[{data.Texture0},{data.Texture1},{data.Texture2},{data.Texture3},{data.Texture4},{data.Texture5}]");
@@ -1527,6 +1825,22 @@ else if (multiplayerActive && (assignedY >= 0f || Mathf.Approximately(assignedY,
     {
         LayoutDungeon(location, importEnemies);
 
+        if (NetworkServer.active && !NetworkClient.active)
+        {
+            Collider[] dungeonColliders = GetComponentsInChildren<Collider>(true);
+            int activeSolid = 0;
+            int activeMeshes = 0;
+            foreach (Collider dungeonCollider in dungeonColliders)
+            {
+                if (!dungeonCollider.enabled || !dungeonCollider.gameObject.activeInHierarchy || dungeonCollider.isTrigger)
+                    continue;
+                activeSolid++;
+                if (dungeonCollider is MeshCollider)
+                    activeMeshes++;
+            }
+            Debug.Log($"[DedicatedDungeonCollision] dungeon='{name}' position={transform.position} fullSize={!DaggerfallUnity.Settings.SmallerDungeons} colliders={dungeonColliders.Length} activeSolid={activeSolid} activeMesh={activeMeshes}");
+        }
+
         if (importEnemies)
             StampImportedDungeonEnemyAnchors("GenerateDungeon-after-layout-before-isSet");
     }
@@ -1554,6 +1868,8 @@ DaggerfallDungeon.DungeonNetworkData data = new DaggerfallDungeon.DungeonNetwork
     IsNetworkDungeonInstance = IsNetworkDungeonInstance,
     DungeonInstanceId = DungeonInstanceId,
 };
+WriteExactLocationIdentityToNetworkData(ref data, summary.LocationData);
+WriteAuthoritativeBlockLayoutToNetworkData(ref data, summary.LocationData);
 WriteGenerationSpecToNetworkData(ref data);
 WriteWorldAnchorToNetworkData(ref data);
 Debug.Log($"[GenerateDungeon] Sync spec prepared: level={data.RequesterLevel}, seed={data.MonsterSeed}, textures=[{data.Texture0},{data.Texture1},{data.Texture2},{data.Texture3},{data.Texture4},{data.Texture5}]");

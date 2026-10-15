@@ -1379,6 +1379,13 @@ namespace DaggerfallWorkshop.Game.Items
             int itemLevel = player.Level;
             Genders playerGender = player.Gender;
             Races race = player.Race;
+            if (Mirror.NetworkServer.active && enemyEntity.EntityBehaviour != null)
+            {
+                SetupDemoEnemy setup = enemyEntity.EntityBehaviour.GetComponent<SetupDemoEnemy>();
+                if (setup != null)
+                    setup.ResolveEquipmentGenerationContext(ref itemLevel, ref playerGender, ref race);
+            }
+            int equipmentPlayerLevel = itemLevel;
             int chance = 0;
 
             // City watch never have items above iron or steel
@@ -1469,7 +1476,7 @@ namespace DaggerfallWorkshop.Game.Items
             }
 
             // Chance for poisoned weapon
-            if (player.Level > 1)
+            if (equipmentPlayerLevel > 1)
             {
                 DaggerfallUnityItem weapon = enemyEntity.ItemEquipTable.GetItem(EquipSlots.RightHand);
                 if (weapon != null && (enemyEntity.EntityType == EntityTypes.EnemyClass || enemyEntity.MobileEnemy.ID == (int)MobileTypes.Orc

@@ -247,9 +247,32 @@ namespace DaggerfallWorkshop
                 }
             }
 
+            // Multiplayer: report accepted player-originated root triggers from the action
+            // system itself, rather than only from PlayerActivate. This also covers hidden
+            // WalkOn/WalkInto dungeon triggers and weapon Attack triggers. Door-triggered
+            // actions keep using the existing door synchronizer to avoid duplicate replays,
+            // and ActionObject is an internal linked-node trigger already covered by the root.
+            bool reportSharedExternalTrigger =
+                triggerType == TriggerTypes.Direct ||
+                triggerType == TriggerTypes.WalkOn ||
+                triggerType == TriggerTypes.WalkInto ||
+                triggerType == TriggerTypes.Attack;
+            Vector3 originalActionPosition = reportSharedExternalTrigger
+                ? transform.position
+                : Vector3.zero;
+
             //increment activation counter
             activationCount++;
             Play(prev);
+
+            if (reportSharedExternalTrigger)
+            {
+                DoorsCatcher.NotifyActionActivated(
+                    this,
+                    originalActionPosition,
+                    triggerType);
+            }
+
             return;
         }
 

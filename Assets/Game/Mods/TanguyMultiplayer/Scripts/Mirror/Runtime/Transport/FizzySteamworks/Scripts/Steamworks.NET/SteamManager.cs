@@ -39,6 +39,7 @@ public class SteamManager : MonoBehaviour {
 	protected bool m_bInitialized = false;
 	public static bool Initialized {
 		get {
+            if (Mirror.DfuDedicatedServerOptions.Requested) return false;
 			return Instance.m_bInitialized;
 		}
 	}
@@ -61,6 +62,7 @@ public class SteamManager : MonoBehaviour {
 #endif
 
 	protected virtual void Awake() {
+        if (Mirror.DfuDedicatedServerOptions.Requested) { enabled = false; return; }
 		// Only one instance of SteamManager at a time!
 		if (s_instance != null) {
 			Destroy(gameObject);

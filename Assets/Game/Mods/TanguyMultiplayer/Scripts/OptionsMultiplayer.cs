@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -12,6 +12,7 @@ public class OptionsMultiplayer : MonoBehaviour
     }
 
 
+    // Default for newly created parties; live time policy is in MultiplayerPartyManager.
 	public static bool timeHost = true;
 	public static bool displayName = true;
 	public static bool useHighestLevel = false;
@@ -149,6 +150,31 @@ public class OptionsMultiplayer : MonoBehaviour
         PlayerPrefs.Save();
         localQuestSyncSettingsLoaded = true;
         usingRemoteQuestSyncSettings = false;
+    }
+
+    public static void ApplyDedicatedSettings(DedicatedServerConfig config)
+    {
+        // In-memory server policy only: do not save it into playable-client prefs.
+        config.Validate();
+        timeHost = config.partyDefaults.leaderControlsTime;
+        defaultQuestSyncMode = config.partyDefaults.questSync == "off" ? QuestSyncMode.Off :
+            config.partyDefaults.questSync == "share-only" ? QuestSyncMode.SharedOnly : QuestSyncMode.Full;
+        displayName = config.multiplayer.displayNames;
+        useHighestLevel = config.multiplayer.useHighestLevel;
+        sendLocation = config.multiplayer.sendLocations;
+        sendMessage = config.multiplayer.sendMessages;
+        SetMobileNpcSync(config.multiplayer.mobileNpcSync);
+        partyTravelInsideDungeon = config.multiplayer.partyTravelInsideDungeon;
+        reviveHoldSeconds = config.respawn.reviveHoldSeconds;
+        manualRespawnSeconds = config.respawn.manualRespawnSeconds;
+        reviveHealthPercent = config.respawn.reviveHealthPercent;
+        respawnHealthPercent = config.respawn.respawnHealthPercent;
+        reviveFatiguePercent = config.respawn.reviveFatiguePercent;
+        respawnFatiguePercent = config.respawn.respawnFatiguePercent;
+        respawnOutsideDungeon = config.respawn.respawnOutsideDungeon;
+        // Export() must not replace this policy with the last client's PlayerPrefs.
+        localRespawnSettingsLoaded = localQuestSyncSettingsLoaded = true;
+        usingRemoteRespawnSettings = usingRemoteQuestSyncSettings = false;
     }
 
     public static void ClampRespawnSettings()

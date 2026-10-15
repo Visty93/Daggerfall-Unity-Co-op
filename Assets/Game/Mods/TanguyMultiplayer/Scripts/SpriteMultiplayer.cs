@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using DaggerfallWorkshop.Game;
@@ -52,6 +52,24 @@ public class SpriteMultiplayer : MonoBehaviour
     // This never changes the real local PlayerEntity or TransportManager state.
     int lycanthropeVisualState = 0;
     bool lycanthropeIdleFrozen = false;
+
+    // Cosmetic only. No network, physics, controller or authority changes here.
+    bool paperdollVisualActive;
+    public bool IsMountedVisualActive { get { return horseMounted; } }
+    public bool IsDownedVisualActive { get { return downedVisualActive; } }
+
+    public void SetPaperdollVisualActive(bool active)
+    {
+        if (paperdollVisualActive == active)
+            return;
+        paperdollVisualActive = active;
+        // Preserve normal corpse suppression. This only touches the existing
+        // DaggerfallMobileUnit renderers; the new paperdoll is a sibling visual.
+        if (hideMobileUnitWhileDowned && downedVisualActive)
+            SetMobileUnitRenderersVisible(false);
+        else
+            SetMobileUnitRenderersVisible(!active);
+    }
 
     public bool IsLycanthropeVisualActive
     {
@@ -242,6 +260,7 @@ public class SpriteMultiplayer : MonoBehaviour
         lycanthropeIdleFrozen = true;
 
         RestoreBaseLocalPosition();
+        if (paperdollVisualActive) SetMobileUnitRenderersVisible(false);
 
         if (downedVisualActive)
             ApplyDownedCorpseVisual();
@@ -288,6 +307,7 @@ public class SpriteMultiplayer : MonoBehaviour
         // this visual child after a class/sprite change can push mage-style sprites a foot
         // or two below the root on some clients. Keep the prefab's original local offset.
         RestoreBaseLocalPosition();
+        if (paperdollVisualActive) SetMobileUnitRenderersVisible(false);
 
         // If a profile refresh arrives while this remote player is downed, keep the
         // corpse visual active and hidden mobile sprite hidden. The refreshed type/gender
@@ -517,7 +537,7 @@ public class SpriteMultiplayer : MonoBehaviour
         else
             ApplyCurrentProfile(true);
 
-        SetMobileUnitRenderersVisible(true);
+        SetMobileUnitRenderersVisible(!paperdollVisualActive);
 
         if (sprite != null)
         {
@@ -639,6 +659,10 @@ public class SpriteMultiplayer : MonoBehaviour
                 continue;
 
             if (downedCorpseVisual != null && r.transform.IsChildOf(downedCorpseVisual.transform))
+                continue;
+            // The paperdoll is a completely separate presentation renderer.
+            // Do not hide it if the mobile unit and paperdoll share a parent.
+            if (r.gameObject.name == "MP Paperdoll (visual only)")
                 continue;
 
             r.enabled = visible;

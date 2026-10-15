@@ -11,6 +11,8 @@
         "Assets/Game/Mods/TanguyMultiplayer/Prefabs/PlayerMultiplayer.prefab",
         "Assets/Game/Mods/TanguyMultiplayer/Scripts/EntityCatcher.cs",
         "Assets/Game/Mods/TanguyMultiplayer/Scripts/ModInitiator.cs",
+        "Assets/Game/Mods/TanguyMultiplayer/Scripts/ModCompatibilityPolicy.cs",
+        "Assets/Game/Mods/TanguyMultiplayer/Scripts/ModCompatibilityAuthenticator.cs",
         "Assets/Game/Mods/TanguyMultiplayer/Scripts/PlayerMultiplayer.cs",
         "Assets/Game/Mods/TanguyMultiplayer/Scripts/Sprite8dir.cs",
         "Assets/Game/Mods/TanguyMultiplayer/Scripts/SteamLobby.cs",

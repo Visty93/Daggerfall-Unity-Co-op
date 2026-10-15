@@ -1222,11 +1222,47 @@ namespace Wenzil.Console
                     if (spawnMarker.targetResources == null || spawnMarker.targetResources.Count == 0)
                         return error;
 
-                    Vector3 dungeonBlockPosition = new Vector3(
-                        spawnMarker.dungeonX * RDBLayout.RDBSide,
-                        0,
-                        spawnMarker.dungeonZ * RDBLayout.RDBSide);
-                    Vector3 markerLocalPosition = dungeonBlockPosition + spawnMarker.flatPosition;
+                    // A quest marker can have been compiled against the opposite Small/Full
+                    // layout from the physical network dungeon created by another player.
+                    // Keep QuestMachine and the quest's stored marker untouched; only resolve
+                    // a runtime placement marker against the live authoritative RDB layout.
+                    if (closestDungeon.IsNetworkDungeonInstance &&
+                        (spawnMarker.markerType == MarkerTypes.QuestSpawn ||
+                         spawnMarker.markerType == MarkerTypes.QuestItem))
+                    {
+                        QuestMarker resolvedMarker;
+                        string markerResolution;
+                        string stableMarkerKey =
+                            spawnMarker.questUID.ToString() + "|" +
+                            (spawnMarker.placeSymbol != null ? spawnMarker.placeSymbol.Name : string.Empty) + "|" +
+                            spawnMarker.markerID.ToString() + "|tele2qmarker";
+
+                        if (GameObjectHelper.TryResolveNetworkDungeonQuestMarker(
+                            closestDungeon,
+                            spawnMarker,
+                            spawnMarker.markerType,
+                            stableMarkerKey,
+                            out resolvedMarker,
+                            out markerResolution))
+                        {
+                            Debug.Log(
+                                $"[DungeonQuestMarkerResolve] tele2qmarker resolved marker mode={markerResolution} " +
+                                $"requested=({spawnMarker.dungeonX},{spawnMarker.dungeonZ})/{spawnMarker.markerID} " +
+                                $"resolved=({resolvedMarker.dungeonX},{resolvedMarker.dungeonZ})/{resolvedMarker.markerID} " +
+                                $"dungeon='{closestDungeon.Summary.LocationName}'");
+                            spawnMarker = resolvedMarker;
+                        }
+                        else
+                        {
+                            Debug.LogWarning(
+                                $"[DungeonQuestMarkerResolve] tele2qmarker could not resolve marker against " +
+                                $"authoritative dungeon '{closestDungeon.Summary.LocationName}'. " +
+                                $"reason={markerResolution}. Using stored quest marker coordinates.");
+                        }
+                    }
+
+                    Vector3 markerLocalPosition =
+                        GameObjectHelper.GetDungeonQuestMarkerLocalPosition(spawnMarker);
 
                     // Quest marker coordinates are dungeon-local. Convert them through the selected
                     // live dungeon root so MP Y slots (-500, -800, -1100, ...) are respected.

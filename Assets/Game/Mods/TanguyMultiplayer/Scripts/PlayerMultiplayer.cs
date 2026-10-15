@@ -2223,6 +2223,7 @@ public void CmdSpawnExternallySuppliedFoe(
     setup.ExternalVisualFemaleTexture = visualFemaleTexture >= 0 ? visualFemaleTexture : -1;
     setup.ExternalVisualRangedFlags = visualRangedFlags;
 
+    setup.ConfigureEquipmentRequester(netId);
     setup.ApplyEnemySettingsWithScalingLevel(
         enemyType,
         reaction,
@@ -2711,6 +2712,7 @@ private void Srv_SpawnSingleQuestFoeInternal(
         if (setupEnemy != null)
         {
             var gender = (MobileGender)mobileGenderInt;
+            setupEnemy.ConfigureEquipmentRequester(netId);
             setupEnemy.ApplyEnemySettings(foeType, reaction, gender);
 
             // Make the server's spawn-time motor state match the requested reaction before NetworkServer.Spawn().
@@ -3162,6 +3164,7 @@ public void CmdCreatePrivateQuestFoesWithPositions(
             if (setupEnemy != null)
             {
                 MobileGender gender = (UnityEngine.Random.value < 0.55f) ? MobileGender.Male : MobileGender.Female;
+                setupEnemy.ConfigureEquipmentRequester(netId);
                 setupEnemy.ApplyEnemySettingsWithScalingLevel(foeType, reaction, gender, (byte)(alliedToPlayer ? 1 : 0), alliedToPlayer, spawnScalingLevel);
 
                 // CreateFoe / send-foe waves are explicitly requested with their reaction.
@@ -4608,6 +4611,144 @@ public void CmdRequestDungeonFromHostWithGenerationSpec(
         Vector3.zero);
 }
 
+// Exact-location variant used by current dungeon entry. Names are retained for diagnostics,
+// but RegionIndex + LocationIndex + MapId are the authoritative identity. This prevents
+// same-named locations in one region from resolving to a completely different dungeon.
+[Command(requiresAuthority = false)]
+public void CmdRequestDungeonFromHostWithGenerationSpecExact(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    uint requesterNetId,
+    int requesterLevel,
+    int monsterSeed,
+    int texture0,
+    int texture1,
+    int texture2,
+    int texture3,
+    int texture4,
+    int texture5,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestDungeonFromHostWithGenerationSpecExact");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        true,
+        requesterLevel,
+        monsterSeed,
+        texture0,
+        texture1,
+        texture2,
+        texture3,
+        texture4,
+        texture5,
+        false,
+        Vector3.zero,
+        false,
+        0,
+        0,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId);
+}
+
+
+// First-creator layout-authoritative variant. The compact layout string contains the
+// requester's actual RDB block names/X/Z/start flag after DFU has applied that player's
+// quest-specific Small/Full dungeon state. The server uses it only when creating a new
+// network dungeon; an already-existing dungeon keeps the first creator's layout.
+[Command(requiresAuthority = false)]
+public void CmdRequestDungeonFromHostWithGenerationSpecExactLayout(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    string requestedBlockLayout,
+    uint requesterNetId,
+    int requesterLevel,
+    int monsterSeed,
+    int texture0,
+    int texture1,
+    int texture2,
+    int texture3,
+    int texture4,
+    int texture5,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestDungeonFromHostWithGenerationSpecExactLayout");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        true,
+        requesterLevel,
+        monsterSeed,
+        texture0,
+        texture1,
+        texture2,
+        texture3,
+        texture4,
+        texture5,
+        false,
+        Vector3.zero,
+        false,
+        0,
+        0,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId,
+        requestedBlockLayout);
+}
+
+[Command(requiresAuthority = false)]
+public void CmdRequestDungeonFromHostExactLayout(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    string requestedBlockLayout,
+    uint requesterNetId,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestDungeonFromHostExactLayout");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        false,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        false,
+        Vector3.zero,
+        false,
+        0,
+        0,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId,
+        requestedBlockLayout);
+}
+
 // Saved/local dungeon conversion request. This carries the requesting player's
 // dungeon-local position plus an optional saved door/action snapshot. The host
 // accepts that snapshot only if this request creates the dungeon; later loaders
@@ -4676,9 +4817,16 @@ public void RequestSavedDungeonFromHost(
 
         Debug.Log($"[NetworkDungeonConversion] Requesting host dungeon '{location.RegionName}/{location.Name}' requester={netId} local={dungeonLocalPosition} anchor={requestAnchorWorldX}/{requestAnchorWorldZ} level={requesterLevel} reason={reason}");
 
-        CmdRequestSavedDungeonFromHostWithGenerationSpec(
+        string requestedBlockLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(location);
+        Debug.Log($"[DungeonLayoutAuthority] Saved-dungeon requester sending physical layout: blocks={(location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0)}, hash={DaggerfallDungeon.StableStringHash(requestedBlockLayout)}, dungeon='{location.RegionName}/{location.Name}'");
+
+        CmdRequestSavedDungeonFromHostWithGenerationSpecExactLayout(
             location.RegionName,
             location.Name,
+            location.RegionIndex,
+            location.LocationIndex,
+            location.MapTableData.MapId,
+            requestedBlockLayout,
             netId,
             dungeonLocalPosition,
             requestAnchorWorldX,
@@ -4746,6 +4894,111 @@ public void CmdRequestSavedDungeonFromHostWithGenerationSpec(
         initialSavedActionState);
 }
 
+[Command(requiresAuthority = false)]
+public void CmdRequestSavedDungeonFromHostWithGenerationSpecExact(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    uint requesterNetId,
+    Vector3 dungeonLocalPosition,
+    int anchorWorldX,
+    int anchorWorldZ,
+    int requesterLevel,
+    int monsterSeed,
+    int texture0,
+    int texture1,
+    int texture2,
+    int texture3,
+    int texture4,
+    int texture5,
+    string initialSavedActionState,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestSavedDungeonFromHostWithGenerationSpecExact");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        true,
+        requesterLevel,
+        monsterSeed,
+        texture0,
+        texture1,
+        texture2,
+        texture3,
+        texture4,
+        texture5,
+        false,
+        Vector3.zero,
+        true,
+        anchorWorldX,
+        anchorWorldZ,
+        true,
+        dungeonLocalPosition,
+        initialSavedActionState,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId);
+}
+
+
+[Command(requiresAuthority = false)]
+public void CmdRequestSavedDungeonFromHostWithGenerationSpecExactLayout(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    string requestedBlockLayout,
+    uint requesterNetId,
+    Vector3 dungeonLocalPosition,
+    int anchorWorldX,
+    int anchorWorldZ,
+    int requesterLevel,
+    int monsterSeed,
+    int texture0,
+    int texture1,
+    int texture2,
+    int texture3,
+    int texture4,
+    int texture5,
+    string initialSavedActionState,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestSavedDungeonFromHostWithGenerationSpecExactLayout");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        true,
+        requesterLevel,
+        monsterSeed,
+        texture0,
+        texture1,
+        texture2,
+        texture3,
+        texture4,
+        texture5,
+        false,
+        Vector3.zero,
+        true,
+        anchorWorldX,
+        anchorWorldZ,
+        true,
+        dungeonLocalPosition,
+        initialSavedActionState,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId,
+        requestedBlockLayout);
+}
+
 
 private static bool IsTeleportPcStartMarkerSentinel(Vector3 marker)
 {
@@ -4791,9 +5044,16 @@ private void RequestTeleportPcDungeonFromHost(DFLocation location, Vector3 marke
 
         Debug.Log($"[TeleportPcMP][ClientRequest] Requesting network dungeon '{location.RegionName}/{location.Name}' markerLocal={markerLocalPosition} requester={netId} level={requesterLevel} seed={monsterSeed} explicitAnchor={anchorWorldX}/{anchorWorldZ} hasAnchor={hasExplicitAnchor} reason={reason}");
 
-        CmdRequestTeleportPcDungeonFromHostWithGenerationSpec(
+        string requestedBlockLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(location);
+        Debug.Log($"[DungeonLayoutAuthority] TeleportPc requester sending physical layout: blocks={(location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0)}, hash={DaggerfallDungeon.StableStringHash(requestedBlockLayout)}, dungeon='{location.RegionName}/{location.Name}'");
+
+        CmdRequestTeleportPcDungeonFromHostWithGenerationSpecExactLayout(
             location.RegionName,
             location.Name,
+            location.RegionIndex,
+            location.LocationIndex,
+            location.MapTableData.MapId,
+            requestedBlockLayout,
             netId,
             markerLocalPosition,
             requesterLevel,
@@ -4811,7 +5071,19 @@ private void RequestTeleportPcDungeonFromHost(DFLocation location, Vector3 marke
     catch (System.Exception ex)
     {
         Debug.LogError($"[TeleportPcMP][ClientRequest] Failed to build dungeon generation spec. Falling back to legacy TeleportPc request. error={ex}");
-        CmdRequestTeleportPcDungeonFromHost(location.RegionName, location.Name, netId, markerLocalPosition, hasExplicitAnchor, anchorWorldX, anchorWorldZ);
+        string fallbackBlockLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(location);
+        CmdRequestTeleportPcDungeonFromHostExactLayout(
+            location.RegionName,
+            location.Name,
+            location.RegionIndex,
+            location.LocationIndex,
+            location.MapTableData.MapId,
+            fallbackBlockLayout,
+            netId,
+            markerLocalPosition,
+            hasExplicitAnchor,
+            anchorWorldX,
+            anchorWorldZ);
     }
 }
 
@@ -4848,6 +5120,49 @@ public void CmdRequestTeleportPcDungeonFromHost(
         anchorWorldZ,
         false,
         Vector3.zero);
+}
+
+[Command(requiresAuthority = false)]
+public void CmdRequestTeleportPcDungeonFromHostExact(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    uint requesterNetId,
+    Vector3 markerLocalPosition,
+    bool hasExplicitAnchor,
+    int anchorWorldX,
+    int anchorWorldZ,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestTeleportPcDungeonFromHostExact");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        true,
+        markerLocalPosition,
+        hasExplicitAnchor,
+        anchorWorldX,
+        anchorWorldZ,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId);
 }
 
 [Command(requiresAuthority = false)]
@@ -4891,6 +5206,149 @@ public void CmdRequestTeleportPcDungeonFromHostWithGenerationSpec(
         anchorWorldZ,
         false,
         Vector3.zero);
+}
+
+[Command(requiresAuthority = false)]
+public void CmdRequestTeleportPcDungeonFromHostWithGenerationSpecExact(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    uint requesterNetId,
+    Vector3 markerLocalPosition,
+    int requesterLevel,
+    int monsterSeed,
+    int texture0,
+    int texture1,
+    int texture2,
+    int texture3,
+    int texture4,
+    int texture5,
+    bool hasExplicitAnchor,
+    int anchorWorldX,
+    int anchorWorldZ,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestTeleportPcDungeonFromHostWithGenerationSpecExact");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        true,
+        requesterLevel,
+        monsterSeed,
+        texture0,
+        texture1,
+        texture2,
+        texture3,
+        texture4,
+        texture5,
+        true,
+        markerLocalPosition,
+        hasExplicitAnchor,
+        anchorWorldX,
+        anchorWorldZ,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId);
+}
+
+
+[Command(requiresAuthority = false)]
+public void CmdRequestTeleportPcDungeonFromHostExactLayout(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    string requestedBlockLayout,
+    uint requesterNetId,
+    Vector3 markerLocalPosition,
+    bool hasExplicitAnchor,
+    int anchorWorldX,
+    int anchorWorldZ,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestTeleportPcDungeonFromHostExactLayout");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        false,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        true,
+        markerLocalPosition,
+        hasExplicitAnchor,
+        anchorWorldX,
+        anchorWorldZ,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId,
+        requestedBlockLayout);
+}
+
+[Command(requiresAuthority = false)]
+public void CmdRequestTeleportPcDungeonFromHostWithGenerationSpecExactLayout(
+    string regionName,
+    string locationName,
+    int regionIndex,
+    int locationIndex,
+    int mapId,
+    string requestedBlockLayout,
+    uint requesterNetId,
+    Vector3 markerLocalPosition,
+    int requesterLevel,
+    int monsterSeed,
+    int texture0,
+    int texture1,
+    int texture2,
+    int texture3,
+    int texture4,
+    int texture5,
+    bool hasExplicitAnchor,
+    int anchorWorldX,
+    int anchorWorldZ,
+    NetworkConnectionToClient sender = null)
+{
+    uint resolvedRequesterNetId = ResolveDungeonRequesterNetId(requesterNetId, sender, "CmdRequestTeleportPcDungeonFromHostWithGenerationSpecExactLayout");
+
+    HandleDungeonRequestFromHost(
+        regionName,
+        locationName,
+        resolvedRequesterNetId,
+        true,
+        requesterLevel,
+        monsterSeed,
+        texture0,
+        texture1,
+        texture2,
+        texture3,
+        texture4,
+        texture5,
+        true,
+        markerLocalPosition,
+        hasExplicitAnchor,
+        anchorWorldX,
+        anchorWorldZ,
+        false,
+        Vector3.zero,
+        null,
+        true,
+        regionIndex,
+        locationIndex,
+        mapId,
+        requestedBlockLayout);
 }
 
 private uint ResolveDungeonRequesterNetId(uint suppliedRequesterNetId, NetworkConnectionToClient sender, string caller)
@@ -5025,6 +5483,8 @@ private DaggerfallDungeon.DungeonNetworkData BuildDungeonNetworkDataForRequester
         IsNetworkDungeonInstance = dungeon.IsNetworkDungeonInstance,
         DungeonInstanceId = dungeon.DungeonInstanceId
     };
+    DaggerfallDungeon.WriteExactLocationIdentityToNetworkData(ref data, dungeon.Summary.LocationData);
+    DaggerfallDungeon.WriteAuthoritativeBlockLayoutToNetworkData(ref data, dungeon.Summary.LocationData);
 
     dungeon.WriteGenerationSpecToNetworkData(ref data);
 
@@ -5142,17 +5602,31 @@ private void HandleDungeonRequestFromHost(
     int teleportPcAnchorWorldZ,
     bool savedLocalPositionRequest,
     Vector3 savedDungeonLocalPosition,
-    string initialSavedActionState = null)
+    string initialSavedActionState = null,
+    bool hasExactLocationIdentity = false,
+    int requestedRegionIndex = -1,
+    int requestedLocationIndex = -1,
+    int requestedMapId = 0,
+    string requestedBlockLayout = null)
 {
     string requestKind = savedLocalPositionRequest ? "SavedLocalPosition" : (teleportPcRequest ? "TeleportPc" : "NormalEntry");
     int resolvedRequesterLevel = ResolveServerPlayerLevelForSpawn(requesterNetId, requesterLevel, "HandleDungeonRequestFromHost-" + requestKind);
     bool vampireCemeteryWakeRequest = teleportPcRequest && IsTeleportPcStartMarkerSentinel(teleportPcLocalMarker);
-    Debug.Log($"[CmdRequestDungeonFromHost] Host received dungeon request: {regionName} - {locationName}. kind={requestKind}, hasGenerationSpec={hasGenerationSpec}, requesterNetId={requesterNetId}, suppliedRequesterLevel={requesterLevel}, resolvedRequesterLevel={resolvedRequesterLevel}, monsterSeed={monsterSeed}, textures=[{texture0},{texture1},{texture2},{texture3},{texture4},{texture5}], vampireWake={vampireCemeteryWakeRequest}");
+    Debug.Log($"[CmdRequestDungeonFromHost] Host received dungeon request: {regionName} - {locationName}. kind={requestKind}, exactIdentity={hasExactLocationIdentity}, requestedMapId={requestedMapId}, requestedRegionIndex={requestedRegionIndex}, requestedLocationIndex={requestedLocationIndex}, requestedLayoutHash={(string.IsNullOrEmpty(requestedBlockLayout) ? 0 : DaggerfallDungeon.StableStringHash(requestedBlockLayout))}, hasGenerationSpec={hasGenerationSpec}, requesterNetId={requesterNetId}, suppliedRequesterLevel={requesterLevel}, resolvedRequesterLevel={resolvedRequesterLevel}, monsterSeed={monsterSeed}, textures=[{texture0},{texture1},{texture2},{texture3},{texture4},{texture5}], vampireWake={vampireCemeteryWakeRequest}");
 
-    DFLocation sceneLocation = DaggerfallUnity.Instance.ContentReader.MapFileReader.GetLocation(regionName, locationName);
-    if (!sceneLocation.Loaded || !sceneLocation.HasDungeon)
+    DFLocation sceneLocation;
+    string locationResolution;
+    if (!DaggerfallDungeon.TryResolveNetworkDungeonLocation(
+            hasExactLocationIdentity,
+            requestedRegionIndex,
+            requestedLocationIndex,
+            requestedMapId,
+            regionName,
+            locationName,
+            out sceneLocation,
+            out locationResolution))
     {
-        Debug.LogError($"[CmdRequestDungeonFromHost] ERROR: Dungeon {regionName} - {locationName} could not be found.");
+        Debug.LogError($"[CmdRequestDungeonFromHost] ERROR: Dungeon {regionName} - {locationName} could not be resolved safely. exactIdentity={hasExactLocationIdentity}, requestedMapId={requestedMapId}, requestedRegionIndex={requestedRegionIndex}, requestedLocationIndex={requestedLocationIndex}, reason={locationResolution}");
 
         PlayerMultiplayer failedRequester;
         NetworkConnection failedConnection;
@@ -5160,6 +5634,8 @@ private void HandleDungeonRequestFromHost(
             failedRequester.TargetSavedDungeonRequestFailed(failedConnection, "dungeon-location-not-found");
         return;
     }
+
+    Debug.Log($"[DungeonLocationIdentity] Host resolved request via {locationResolution}: mapId={sceneLocation.MapTableData.MapId}, regionIndex={sceneLocation.RegionIndex}, locationIndex={sceneLocation.LocationIndex}, name='{sceneLocation.RegionName}/{sceneLocation.Name}'");
 
     // Saved-dungeon conversion must reproduce the same location texture table as a
     // normal DFU SetDungeon()/UseLocationDungeonTextureTable() call on the host. Do not
@@ -5223,8 +5699,7 @@ private void HandleDungeonRequestFromHost(
         if (!IsUsableHostNetworkDungeon(existing))
             continue;
 
-        if (string.Equals(existing.Summary.RegionName, regionName, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(existing.Summary.LocationName, locationName, StringComparison.OrdinalIgnoreCase))
+        if (existing.Summary.ID == sceneLocation.MapTableData.MapId)
         {
             Debug.Log($"[CmdRequestDungeonFromHost] Dungeon already exists: {dungeonSceneName}. Syncing existing spec with requester.");
 
@@ -5276,8 +5751,29 @@ private void HandleDungeonRequestFromHost(
         }
     }
 
-    // Load location on the host. This can work even when the host is nowhere near the exterior entrance.
+    // Load location metadata on the host, then overwrite only the physical block array
+    // with the first requester's actual Small/Full layout. Existing dungeons returned above
+    // deliberately ignore later requesters' layouts.
     DFLocation location = sceneLocation;
+    if (!string.IsNullOrEmpty(requestedBlockLayout))
+    {
+        string layoutApplyResult;
+        if (!DaggerfallDungeon.TryApplyAuthoritativeBlockLayout(requestedBlockLayout, ref location, out layoutApplyResult))
+        {
+            Debug.LogError($"[DungeonLayoutAuthority] Refusing new dungeon because requester layout could not be applied. dungeon='{regionName}/{locationName}' requester={requesterNetId} reason={layoutApplyResult}");
+            PlayerMultiplayer failedRequester;
+            NetworkConnection failedConnection;
+            if (savedLocalPositionRequest && TryGetRequesterPlayerAndConnection(requesterNetId, out failedRequester, out failedConnection))
+                failedRequester.TargetSavedDungeonRequestFailed(failedConnection, "authoritative-layout-invalid");
+            return;
+        }
+
+        Debug.Log($"[DungeonLayoutAuthority] Host applied first-creator layout. dungeon='{location.RegionName}/{location.Name}' requester={requesterNetId} blocks={(location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0)} hash={DaggerfallDungeon.StableStringHash(requestedBlockLayout)}");
+    }
+    else
+    {
+        Debug.LogWarning($"[DungeonLayoutAuthority] Legacy request supplied no block layout for new dungeon '{regionName}/{locationName}'. Host-local layout will be used.");
+    }
 
     // Host-authoritative Y allocation. Do not use object count; destroyed dungeons make count-based slots unsafe.
     float assignedY = DaggerfallDungeon.GetNextAvailableDungeonY();
@@ -5444,6 +5940,8 @@ private IEnumerator WaitForDungeonGeneration(
         IsNetworkDungeonInstance = dungeon.IsNetworkDungeonInstance,
         DungeonInstanceId = dungeon.DungeonInstanceId
     };
+    DaggerfallDungeon.WriteExactLocationIdentityToNetworkData(ref dungeonData, location);
+    DaggerfallDungeon.WriteAuthoritativeBlockLayoutToNetworkData(ref dungeonData, dungeon.Summary.LocationData);
     dungeon.WriteGenerationSpecToNetworkData(ref dungeonData);
     // World-anchor data is just as authoritative as Y/generation data. Without it,
     // a client can generate the correct dungeon locally but PositionMultiplayer falls
@@ -5507,12 +6005,11 @@ private IEnumerator DelayedDungeonSpawn(
 
     Debug.Log($"[DelayedDungeonSpawn] Found prefab. Applying host data for {dungeonData.LocationName}. hostY={dungeonData.PositionY}");
 
-    DFLocation location = DaggerfallUnity.Instance.ContentReader.MapFileReader
-        .GetLocation(dungeonData.RegionName, dungeonData.LocationName);
-
-    if (!location.Loaded)
+    DFLocation location;
+    string locationResolution;
+    if (!DaggerfallDungeon.TryResolveNetworkDungeonLocation(dungeonData, out location, out locationResolution))
     {
-        Debug.LogError($"[DelayedDungeonSpawn] ERROR: Could not load location for {dungeonData.RegionName} - {dungeonData.LocationName}");
+        Debug.LogError($"[DelayedDungeonSpawn] ERROR: Could not resolve exact location for {dungeonData.RegionName} - {dungeonData.LocationName}. mapId={dungeonData.ID}, regionIndex={dungeonData.RegionIndex}, locationIndex={dungeonData.LocationIndex}, exactIdentity={dungeonData.HasExactLocationIdentity}, reason={locationResolution}");
         if (savedLocalPositionEnter)
         {
             PlayerEnterExit playerEnterExit = GameManager.Instance != null ? GameManager.Instance.PlayerEnterExit : null;
@@ -5521,6 +6018,17 @@ private IEnumerator DelayedDungeonSpawn(
         }
         yield break;
     }
+
+    Debug.Log($"[DungeonLocationIdentity] Client resolved dungeon via {locationResolution}: mapId={location.MapTableData.MapId}, regionIndex={location.RegionIndex}, locationIndex={location.LocationIndex}, name='{location.RegionName}/{location.Name}'");
+
+    string blockLayoutResolution;
+    if (!DaggerfallDungeon.TryApplyAuthoritativeBlockLayout(dungeonData, ref location, out blockLayoutResolution))
+    {
+        Debug.LogError($"[DelayedDungeonSpawn] ERROR: Host authoritative dungeon block layout was invalid. dungeon='{dungeonData.RegionName}/{dungeonData.LocationName}' expectedBlocks={dungeonData.AuthoritativeBlockCount} expectedHash={dungeonData.AuthoritativeBlockLayoutHash} reason={blockLayoutResolution}");
+        yield break;
+    }
+
+    Debug.Log($"[DungeonLayoutAuthority] Client applied host physical layout. dungeon='{dungeonData.RegionName}/{dungeonData.LocationName}' blocks={(location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0)} hash={dungeonData.AuthoritativeBlockLayoutHash} source={blockLayoutResolution}");
 
     var summary = new DaggerfallDungeon.DungeonSummary
     {
@@ -5773,11 +6281,15 @@ public void TargetEnterTeleportPcDungeon(NetworkConnection target, DaggerfallDun
 
     try
     {
-        DFLocation location = DaggerfallUnity.Instance.ContentReader.MapFileReader
-            .GetLocation(dungeonData.RegionName, dungeonData.LocationName);
+        DFLocation location;
+        string locationResolution;
+        bool locationLoaded = DaggerfallDungeon.TryResolveNetworkDungeonLocation(
+            dungeonData,
+            out location,
+            out locationResolution);
 
         PlayerEnterExit playerEnterExit = GameManager.Instance != null ? GameManager.Instance.PlayerEnterExit : null;
-        if (playerEnterExit != null && location.Loaded)
+        if (playerEnterExit != null && locationLoaded)
         {
             playerEnterExit.RegisterMultiplayerQuestDungeonTeleportMarker(
                 location,
@@ -5787,7 +6299,7 @@ public void TargetEnterTeleportPcDungeon(NetworkConnection target, DaggerfallDun
         }
         else
         {
-            Debug.LogWarning($"[TeleportPcMP][TargetEnter] Could not register quest marker before delayed spawn. playerEnterExit={(playerEnterExit != null)}, locationLoaded={location.Loaded}");
+            Debug.LogWarning($"[TeleportPcMP][TargetEnter] Could not register quest marker before delayed spawn. playerEnterExit={(playerEnterExit != null)}, locationLoaded={locationLoaded}, resolution={locationResolution}");
         }
     }
     catch (System.Exception ex)
@@ -5807,14 +6319,22 @@ public void TargetEnterSavedDungeon(
     Debug.Log($"[NetworkDungeonConversion][TargetEnter] RECEIVED: {dungeonData.LocationName} at Y={dungeonData.PositionY}, requesterNetId={dungeonData.RequesterNetId}, thisNetId={netId}, isLocalPlayer={isLocalPlayer}, local={dungeonLocalPosition}");
 
     PlayerEnterExit playerEnterExit = GameManager.Instance != null ? GameManager.Instance.PlayerEnterExit : null;
-    DFLocation location = DaggerfallUnity.Instance.ContentReader.MapFileReader.GetLocation(
-        dungeonData.RegionName,
-        dungeonData.LocationName);
+    DFLocation location;
+    string locationResolution;
+    bool locationLoaded = DaggerfallDungeon.TryResolveNetworkDungeonLocation(
+        dungeonData,
+        out location,
+        out locationResolution);
 
     bool requesterMatches = isLocalPlayer && netId == dungeonData.RequesterNetId;
     bool conversionPending = playerEnterExit != null &&
-                             location.Loaded &&
+                             locationLoaded &&
                              playerEnterExit.HasPendingNetworkDungeonConversionFor(location);
+
+    if (!locationLoaded)
+    {
+        Debug.LogError($"[NetworkDungeonConversion][TargetEnter] Could not resolve exact dungeon location. mapId={dungeonData.ID}, regionIndex={dungeonData.RegionIndex}, locationIndex={dungeonData.LocationIndex}, reason={locationResolution}");
+    }
 
     // Replace the locally calculated pending value with the host dungeon's own
     // authoritative anchor as soon as the TargetRpc arrives. The hold remains active
@@ -5934,6 +6454,8 @@ private void CmdRequestActiveDungeons()
             IsNetworkDungeonInstance = d.IsNetworkDungeonInstance,
             DungeonInstanceId = d.DungeonInstanceId
         };
+        DaggerfallDungeon.WriteExactLocationIdentityToNetworkData(ref data, d.Summary.LocationData);
+        DaggerfallDungeon.WriteAuthoritativeBlockLayoutToNetworkData(ref data, d.Summary.LocationData);
         d.WriteGenerationSpecToNetworkData(ref data);
         // Late/joining clients must receive the stable dungeon world anchor too. Applying
         // DungeonNetworkData without these fields clears HasDungeonWorldAnchor locally and
@@ -5963,10 +6485,14 @@ private void TargetSyncExistingDungeon(NetworkConnection target, DaggerfallDunge
 
             if (playerEnterExit != null)
             {
-                DFLocation location = DaggerfallUnity.Instance.ContentReader.MapFileReader
-                    .GetLocation(data.RegionName, data.LocationName);
+                DFLocation location;
+                string locationResolution;
+                bool locationLoaded = DaggerfallDungeon.TryResolveNetworkDungeonLocation(
+                    data,
+                    out location,
+                    out locationResolution);
 
-                if (location.Loaded && playerEnterExit.HasPendingNetworkDungeonConversionFor(location))
+                if (locationLoaded && playerEnterExit.HasPendingNetworkDungeonConversionFor(location))
                 {
                     ActivatePureClientSavedDungeonAnchor(
                         data.DungeonAnchorWorldX,
@@ -6224,6 +6750,7 @@ public void ServerSpawnSavedInteriorEnemy(
         SetupDemoEnemy setupEnemy = go.GetComponent<SetupDemoEnemy>();
         if (setupEnemy != null)
         {
+            setupEnemy.ConfigureEquipmentRequester(netId);
             setupEnemy.ApplyEnemySettings(entityType, careerIndex, gender, isHostile, alliedToPlayer);
 
             EnemyMotor motor = go.GetComponent<EnemyMotor>();

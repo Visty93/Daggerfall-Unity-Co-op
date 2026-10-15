@@ -33,6 +33,7 @@ namespace Mirror.FizzySteam
 
     private void Awake()
     {
+      if (DfuDedicatedServerOptions.Requested) { enabled = false; return; }
       const string fileName = "steam_appid.txt";
       if (File.Exists(fileName))
       {
@@ -52,6 +53,7 @@ namespace Mirror.FizzySteam
 
     private void OnEnable()
     {
+      if (DfuDedicatedServerOptions.Requested) return;
       Debug.Assert(Channels != null && Channels.Length > 0, "No channel configured for FizzySteamworks.");
       Invoke(nameof(FetchSteamID), 1f);
     }

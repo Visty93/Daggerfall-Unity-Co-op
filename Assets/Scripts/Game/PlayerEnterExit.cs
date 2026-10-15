@@ -101,6 +101,10 @@ namespace DaggerfallWorkshop.Game
         int pendingNetworkDungeonWorldZ = 0;
         int pendingNetworkDungeonRequesterLevel = 1;
         string pendingNetworkDungeonInitialActionState = string.Empty;
+        // Physical block layout the local/save dungeon used before network conversion.
+        // If an already-existing network dungeon for the same MapId uses the opposite
+        // Small/Full layout, a saved/local XYZ cannot be trusted and we keep StartMarker.
+        int pendingNetworkDungeonSourceLayoutHash = 0;
         float pendingNetworkDungeonConversionStartedAt = 0f;
         const float NetworkDungeonConversionTimeout = 30f;
 
@@ -1215,6 +1219,10 @@ namespace DaggerfallWorkshop.Game
                 1,
                 100);
             pendingNetworkDungeonInitialActionState = initialSavedActionState ?? string.Empty;
+            string sourceLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(location);
+            pendingNetworkDungeonSourceLayoutHash = string.IsNullOrEmpty(sourceLayout)
+                ? 0
+                : DaggerfallDungeon.StableStringHash(sourceLayout);
             pendingNetworkDungeonConversionStartedAt = Time.realtimeSinceStartup;
             lastNetworkActiveState = true;
             isRespawning = true;
@@ -1453,6 +1461,26 @@ namespace DaggerfallWorkshop.Game
 
             EnableDungeonParent(false);
 
+            // A saved/local dungeon position is meaningful only inside the exact same RDB
+            // arrangement. If this MapId already existed on the server with the opposite
+            // Small/Full layout, the same local X/Z can be a completely different room or
+            // empty space. Keep the entry StartMarker rather than applying an unsafe XYZ.
+            string liveLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(liveDungeon.Summary.LocationData);
+            int liveLayoutHash = string.IsNullOrEmpty(liveLayout)
+                ? 0
+                : DaggerfallDungeon.StableStringHash(liveLayout);
+            if (pendingNetworkDungeonSourceLayoutHash != 0 &&
+                liveLayoutHash != 0 &&
+                pendingNetworkDungeonSourceLayoutHash != liveLayoutHash)
+            {
+                pendingNetworkDungeonUseStartMarker = true;
+                Debug.LogWarning(
+                    $"[DungeonLayoutAuthority][SavedPosition] Source layout differs from the existing network dungeon. " +
+                    $"Keeping StartMarker instead of stale dungeon-local position. " +
+                    $"sourceHash={pendingNetworkDungeonSourceLayoutHash} liveHash={liveLayoutHash} " +
+                    $"dungeon='{liveDungeon.Summary.RegionName}/{liveDungeon.Summary.LocationName}' reason={reason}");
+            }
+
             Vector3 finalPosition = transform.position;
             if (!pendingNetworkDungeonUseStartMarker)
             {
@@ -1682,6 +1710,7 @@ namespace DaggerfallWorkshop.Game
             pendingNetworkDungeonWorldZ = 0;
             pendingNetworkDungeonRequesterLevel = 1;
             pendingNetworkDungeonInitialActionState = string.Empty;
+            pendingNetworkDungeonSourceLayoutHash = 0;
             pendingNetworkDungeonConversionStartedAt = 0f;
         }
 
@@ -3293,7 +3322,7 @@ public void TransitionDungeonInterior(Transform doorOwner, StaticDoor door, DFLo
 
     foreach (var d in allDungeons)
     {
-        if (d.Summary.RegionName == location.RegionName && d.Summary.LocationName == location.Name)
+        if (d != null && d.Summary.ID == location.MapTableData.MapId)
         {
             dungeon = d;
             break;
@@ -3351,8 +3380,9 @@ public void TransitionDungeonInterior(Transform doorOwner, StaticDoor door, DFLo
         dungeon = obj.GetComponent<DaggerfallDungeon>();
         dungeon.PositionY = assignedY;
 
-        DFLocation dfLocation = DaggerfallUnity.Instance.ContentReader.MapFileReader.GetLocation(
-            location.RegionName, location.Name);
+        // Keep the local requester's already-resolved physical layout. Re-looking the
+        // location up by name here can discard quest-specific Small/Full dungeon state.
+        DFLocation dfLocation = location;
 
         // TeleportPc must use the exact exterior dungeon entrance coordinate before enemy import.
         // Do not call SetDungeonRequesterContext(0) in that case, because it reads the host/local
@@ -3387,11 +3417,16 @@ if (localNetPlayer != null)
         int[] requesterTextureTable = DaggerfallDungeon.BuildLocationDungeonTextureTable(location);
         int monsterSeed = DaggerfallDungeon.BuildStableDungeonMonsterSeed(location);
 
-        Debug.Log($"[TransitionDungeonInterior] Found local player via fallback. Sending requester-authoritative dungeon generation spec. level={requesterLevel}, seed={monsterSeed}, textures=[{requesterTextureTable[0]},{requesterTextureTable[1]},{requesterTextureTable[2]},{requesterTextureTable[3]},{requesterTextureTable[4]},{requesterTextureTable[5]}]. Transition is pending, not failed.");
+        string requesterBlockLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(location);
+        Debug.Log($"[TransitionDungeonInterior] Found local player via fallback. Sending requester-authoritative dungeon generation spec and physical layout. blocks={(location.Dungeon.Blocks != null ? location.Dungeon.Blocks.Length : 0)}, layoutHash={DaggerfallDungeon.StableStringHash(requesterBlockLayout)}, level={requesterLevel}, seed={monsterSeed}, textures=[{requesterTextureTable[0]},{requesterTextureTable[1]},{requesterTextureTable[2]},{requesterTextureTable[3]},{requesterTextureTable[4]},{requesterTextureTable[5]}]. Transition is pending, not failed.");
 
-        localNetPlayer.CmdRequestDungeonFromHostWithGenerationSpec(
+        localNetPlayer.CmdRequestDungeonFromHostWithGenerationSpecExactLayout(
             location.RegionName,
             location.Name,
+            location.RegionIndex,
+            location.LocationIndex,
+            location.MapTableData.MapId,
+            requesterBlockLayout,
             localNetPlayer.netId,
             requesterLevel,
             monsterSeed,
@@ -3404,8 +3439,16 @@ if (localNetPlayer != null)
     }
     catch (System.Exception ex)
     {
-        Debug.LogError($"[TransitionDungeonInterior] Failed to build requester dungeon generation spec. Falling back to legacy request. Exception={ex}");
-        localNetPlayer.CmdRequestDungeonFromHost(location.RegionName, location.Name, localNetPlayer.netId);
+        Debug.LogError($"[TransitionDungeonInterior] Failed to build requester dungeon generation spec. Falling back to exact-identity/layout request without generation spec. Exception={ex}");
+        string fallbackBlockLayout = DaggerfallDungeon.BuildAuthoritativeBlockLayoutString(location);
+        localNetPlayer.CmdRequestDungeonFromHostExactLayout(
+            location.RegionName,
+            location.Name,
+            location.RegionIndex,
+            location.LocationIndex,
+            location.MapTableData.MapId,
+            fallbackBlockLayout,
+            localNetPlayer.netId);
     }
 
     return;
@@ -3898,6 +3941,17 @@ private void HandleDungeonTransition(PlayerEnterExit.TransitionEventArgs args)
                    float.IsPositiveInfinity(marker.z);
         }
 
+        // Ordinary TeleportPc uses this sentinel when the quest's saved marker might belong
+        // to the opposite Small/Full layout. Enter the authoritative network dungeon at its
+        // normal entry marker first; TeleportPc resolves its quest marker against the live
+        // block layout afterwards.
+        private static bool IsMultiplayerDungeonDeferredQuestMarkerSentinel(Vector3 marker)
+        {
+            return float.IsNegativeInfinity(marker.x) &&
+                   float.IsNegativeInfinity(marker.y) &&
+                   float.IsNegativeInfinity(marker.z);
+        }
+
         private bool HasPendingMultiplayerDungeonStartMarkerSentinelFor(DFLocation location)
         {
             return HasPendingTeleportPcDungeonMarkerFor(location) &&
@@ -4021,6 +4075,16 @@ private void HandleDungeonTransition(PlayerEnterExit.TransitionEventArgs args)
                 }
 
                 return movedToWakeMarker;
+            }
+
+            if (IsMultiplayerDungeonDeferredQuestMarkerSentinel(localMarker))
+            {
+                // Do not apply the quest's old Small/Full-layout coordinates here. The
+                // TeleportPc action will resolve the marker by markerID against the actual
+                // authoritative network dungeon after this transition is fully bound.
+                pendingTeleportPcDungeonMarker = false;
+                Debug.Log($"[DungeonQuestMarkerResolve] Deferred TeleportPc marker snap until authoritative dungeon is ready. reason={reason} dungeon='{location.RegionName}/{location.Name}'");
+                return false;
             }
 
             // Consume before moving so a later normal re-entry cannot reuse a stale quest marker.

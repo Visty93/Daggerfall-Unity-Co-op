@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -737,6 +737,8 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
 
     Debug.Log($"[DelayedEnemySpawn] Spawning enemies after dungeon is ready with spawnScalingLevel={spawnScalingLevel}...");
 
+    uint previousEquipmentRequester = SetupDemoEnemy.PushDungeonEquipmentRequester(
+        dungeonParent != null ? dungeonParent.RequesterNetId : 0U);
     int previousDungeonSpawnScalingLevel = SetupDemoEnemy.PushDungeonSpawnScalingLevel(spawnScalingLevel);
     PlayerEntityLevelOverrideState playerLevelOverrideState = PushPlayerEntityLevelOverrideForDungeonEnemyImport(spawnScalingLevel);
     try
@@ -748,6 +750,32 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
     {
         PopPlayerEntityLevelOverrideForDungeonEnemyImport(playerLevelOverrideState);
         SetupDemoEnemy.RestoreDungeonSpawnScalingLevel(previousDungeonSpawnScalingLevel);
+        SetupDemoEnemy.RestoreDungeonEquipmentRequester(previousEquipmentRequester);
+    }
+
+    bool dedicatedSpawn = NetworkServer.active && !NetworkClient.active;
+    if (dedicatedSpawn)
+    {
+        // Keep DFU enemy creation synchronous with block construction. Its enemy
+        // parent nodes are created at world origin and rely on LayoutDungeon moving
+        // the whole block afterwards. Only delay the NETWORK spawn, not the import.
+        yield return null;
+        float readyDeadline = Time.realtimeSinceStartup + 5f;
+        while (go != null)
+        {
+            dungeonParent = go.GetComponentInParent<DaggerfallDungeon>();
+            if (dungeonParent != null && dungeonParent.isSet)
+                break;
+            if (Time.realtimeSinceStartup >= readyDeadline)
+            {
+                Debug.LogError("[DedicatedDungeonSpawnReady] Block never acquired a ready dungeon: " + go.name);
+                yield break;
+            }
+            yield return null;
+        }
+        if (go == null || !NetworkServer.active)
+            yield break;
+        Debug.Log($"[DedicatedDungeonSpawnReady] block='{go.name}' world={go.transform.position} dungeon='{dungeonParent.name}'");
     }
 
     foreach (var enemy in go.GetComponentsInChildren<DaggerfallEnemy>())
@@ -760,7 +788,13 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
             continue;
 
         Transform previousParent = enemy.transform.parent;
-        if (previousParent != null)
+        if (dedicatedSpawn)
+        {
+            // Mirror sends localPosition to a root-level client object. Preserve
+            // the fully positioned world pose and detach BEFORE NetworkServer.Spawn.
+            enemy.transform.SetParent(null, true);
+        }
+        else if (previousParent != null)
         {
             GameManager.Instance.StartCoroutine(MoveEnemyToRootAfterDelay(enemy, previousParent, 10));
         }
@@ -786,6 +820,8 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
             if (setupDemoEnemy != null)
             {
                 setupDemoEnemy.isDungeonEnemy = true;
+                if (dedicatedSpawn)
+                    setupDemoEnemy.syncedInitialY = enemy.transform.position.y;
                 if (NetworkServer.active && spawnScalingLevel > 0 && setupDemoEnemy.SpawnScalingLevel <= 0)
                     setupDemoEnemy.SpawnScalingLevel = Mathf.Clamp(spawnScalingLevel, 1, 100);
 
@@ -825,7 +861,18 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
                 Debug.LogWarning($"[DelayedEnemySpawn] Enemy '{enemy.name}' has no SetupDemoEnemy before NetworkServer.Spawn().");
             }
 
+            if (dedicatedSpawn)
+                Debug.Log($"[DedicatedDungeonSpawnPose] enemy='{enemy.name}' world={enemy.transform.position} local={enemy.transform.localPosition} root={enemy.transform.parent == null}");
             NetworkServer.Spawn(enemy.gameObject);
+            if (dedicatedSpawn && enemyWorldPosition != null && !enemyWorldPosition.initialized)
+            {
+                // The deferred network spawn can occur after Unity Start. The world
+                // tracker returns from Start when !isServer, so it must be initialized
+                // now that Mirror has marked the identity as server-spawned. Otherwise
+                // DynamicEnemyAuthority waits forever for initialized=true.
+                enemyWorldPosition.ResumeRetainedActorNetworking();
+                Debug.Log($"[DedicatedDungeonSpawnTracking] enemy='{enemy.name}' netId={enemy.GetComponent<NetworkIdentity>().netId} initialized={enemyWorldPosition.initialized}");
+            }
             Debug.Log($"[DelayedEnemySpawn] Spawned {enemy.name} on server.");
 
             // Metadata-only: after LayoutDungeon() parents the RDB block, copy the dungeon
@@ -1299,6 +1346,296 @@ private static IEnumerator MoveEnemyToRootAfterDelay(DaggerfallEnemy enemy, Tran
             }
         }
 
+
+        /// <summary>
+        /// Converts a quest marker compiled against either Small or Full dungeon layout
+        /// into a marker that exists in the currently-active network dungeon.
+        ///
+        /// Exact markerID is preferred because markerID belongs to the underlying RDB
+        /// object and survives when Smaller Dungeons moves that RDB to different X/Z.
+        /// If the original RDB/marker is absent from the authoritative layout, choose a
+        /// deterministic same-type marker. As a last playability fallback, use StartMarker.
+        ///
+        /// This does not mutate the Quest, Place, SiteDetails, or saved marker state.
+        /// </summary>
+        public static bool TryResolveNetworkDungeonQuestMarker(
+            DaggerfallDungeon dungeon,
+            QuestMarker requested,
+            MarkerTypes desiredType,
+            string stableKey,
+            out QuestMarker resolved,
+            out string resolution)
+        {
+            resolved = requested;
+            resolution = "unchanged";
+
+            if (dungeon == null || !dungeon.IsNetworkDungeonInstance)
+                return false;
+
+            DFLocation activeLocation = dungeon.Summary.LocationData;
+            if (!activeLocation.Loaded || !activeLocation.HasDungeon ||
+                activeLocation.Dungeon.Blocks == null || activeLocation.Dungeon.Blocks.Length == 0)
+            {
+                resolution = "network-layout-not-ready";
+                return false;
+            }
+
+            const int editorFlatArchive = 199;
+            const int spawnMarkerFlatIndex = 11;
+            const int itemMarkerFlatIndex = 18;
+
+            // Marker identity is the authoritative cross-layout key. Smaller Dungeons
+            // changes the X/Z placement of RDBs, but markerID belongs to the underlying
+            // RDB marker object itself. Do not infer marker provenance from this machine's
+            // Quest.SmallerDungeonsState: a manually/automatically shared Place can carry
+            // the source player's marker coordinates while the recipient quest was parsed
+            // under a different local Smaller Dungeons state.
+            List<QuestMarker> exactMatches = new List<QuestMarker>();
+            List<QuestMarker> compatible = new List<QuestMarker>();
+            List<QuestMarker> sameCoordinateFlatMatches = new List<QuestMarker>();
+            List<QuestMarker> sameFlatPositionMatches = new List<QuestMarker>();
+
+            foreach (DFLocation.DungeonBlock dungeonBlock in activeLocation.Dungeon.Blocks)
+            {
+                DFBlock blockData;
+                try
+                {
+                    blockData = DaggerfallUnity.Instance.ContentReader.BlockFileReader.GetBlock(dungeonBlock.BlockName);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (blockData.RdbBlock.ObjectRootList == null)
+                    continue;
+
+                foreach (DFBlock.RdbObjectRoot group in blockData.RdbBlock.ObjectRootList)
+                {
+                    if (group.RdbObjects == null)
+                        continue;
+
+                    foreach (DFBlock.RdbObject obj in group.RdbObjects)
+                    {
+                        if (obj.Type != DFBlock.RdbResourceTypes.Flat ||
+                            obj.Resources.FlatResource.TextureArchive != editorFlatArchive)
+                        {
+                            continue;
+                        }
+
+                        MarkerTypes markerType;
+                        int record = obj.Resources.FlatResource.TextureRecord;
+                        if (record == spawnMarkerFlatIndex)
+                            markerType = MarkerTypes.QuestSpawn;
+                        else if (record == itemMarkerFlatIndex)
+                            markerType = MarkerTypes.QuestItem;
+                        else
+                            continue;
+
+                        if (markerType != desiredType)
+                            continue;
+
+                        QuestMarker candidate = requested;
+                        candidate.markerType = markerType;
+                        candidate.flatPosition =
+                            new Vector3(obj.XPos, -obj.YPos, obj.ZPos) * MeshReader.GlobalScale;
+                        candidate.dungeonX = dungeonBlock.X;
+                        candidate.dungeonZ = dungeonBlock.Z;
+                        candidate.markerID = (ulong)(blockData.Position + obj.Position);
+
+                        compatible.Add(candidate);
+
+                        bool sameFlatPosition =
+                            QuestMarkerFlatPositionsMatch(candidate.flatPosition, requested.flatPosition);
+
+                        if (sameFlatPosition)
+                        {
+                            sameFlatPositionMatches.Add(candidate);
+
+                            if (candidate.dungeonX == requested.dungeonX &&
+                                candidate.dungeonZ == requested.dungeonZ)
+                            {
+                                sameCoordinateFlatMatches.Add(candidate);
+                            }
+                        }
+
+                        if (requested.markerID != 0UL &&
+                            candidate.markerID == requested.markerID)
+                        {
+                            exactMatches.Add(candidate);
+                        }
+                    }
+                }
+            }
+
+            // A real markerID is the strongest possible identity and is sufficient by
+            // itself. This handles Small -> Full and Full -> Small whenever the source
+            // RDB survived in the authoritative layout, including shared quests whose
+            // recipient has a different local Smaller Dungeons state.
+            if (requested.markerID != 0UL && exactMatches.Count > 0)
+            {
+                for (int i = 0; i < exactMatches.Count; i++)
+                {
+                    if (exactMatches[i].dungeonX == requested.dungeonX &&
+                        exactMatches[i].dungeonZ == requested.dungeonZ)
+                    {
+                        resolved = exactMatches[i];
+                        resolution = "exact-markerid-same-coordinate";
+                        return true;
+                    }
+                }
+
+                int exactIndex = StableDungeonQuestMarkerIndex(
+                    (stableKey ?? string.Empty) + "|exact|" + requested.markerID,
+                    exactMatches.Count);
+                resolved = exactMatches[exactIndex];
+                resolution = "exact-markerid-relocated";
+
+                Debug.Log(
+                    $"[DungeonQuestMarkerResolve] Relocated exact markerID={requested.markerID} " +
+                    $"from block=({requested.dungeonX},{requested.dungeonZ}) to " +
+                    $"({resolved.dungeonX},{resolved.dungeonZ}) dungeon='{dungeon.Summary.LocationName}' " +
+                    $"key='{stableKey}'");
+                return true;
+            }
+
+            // Older saves and a few quest-marker paths can have markerID == 0. In that
+            // case be deliberately conservative: coordinates plus flatPosition are safe,
+            // and a globally-unique same-type flatPosition can be relocated. If neither
+            // can prove identity, preserve the original marker rather than moving a valid
+            // foe/NPC/item to an arbitrary cage or unrelated room.
+            if (requested.markerID == 0UL)
+            {
+                if (sameCoordinateFlatMatches.Count > 0)
+                {
+                    int sameCoordinateIndex = StableDungeonQuestMarkerIndex(
+                        (stableKey ?? string.Empty) + "|zero-id-same-coordinate-flat",
+                        sameCoordinateFlatMatches.Count);
+                    resolved = sameCoordinateFlatMatches[sameCoordinateIndex];
+                    resolution = "zero-markerid-same-coordinate-flatposition";
+                    return true;
+                }
+
+                if (sameFlatPositionMatches.Count == 1)
+                {
+                    resolved = sameFlatPositionMatches[0];
+                    resolution = "zero-markerid-unique-flatposition-relocated";
+
+                    Debug.Log(
+                        $"[DungeonQuestMarkerResolve] Relocated markerID=0 by unique {desiredType} flatPosition " +
+                        $"from block=({requested.dungeonX},{requested.dungeonZ}) to " +
+                        $"({resolved.dungeonX},{resolved.dungeonZ}) dungeon='{dungeon.Summary.LocationName}' " +
+                        $"key='{stableKey}'");
+                    return true;
+                }
+
+                resolved = requested;
+                resolution = sameFlatPositionMatches.Count > 1
+                    ? "zero-markerid-ambiguous-flatposition-keep-original"
+                    : "zero-markerid-no-match-keep-original";
+
+                Debug.LogWarning(
+                    $"[DungeonQuestMarkerResolve] markerID=0 could not be uniquely translated. " +
+                    $"Keeping original marker block=({requested.dungeonX},{requested.dungeonZ}) " +
+                    $"flat={requested.flatPosition} sameFlatMatches={sameFlatPositionMatches.Count} " +
+                    $"dungeon='{dungeon.Summary.LocationName}' key='{stableKey}'.");
+                return true;
+            }
+
+            // If a non-zero markerID was not found, flatPosition is the next strongest
+            // marker-local clue. This also protects against old/odd serialized markers whose
+            // ID cannot be matched even though the same marker flat is still present.
+            if (sameCoordinateFlatMatches.Count > 0)
+            {
+                int sameCoordinateIndex = StableDungeonQuestMarkerIndex(
+                    (stableKey ?? string.Empty) + "|missing-id-same-coordinate-flat",
+                    sameCoordinateFlatMatches.Count);
+                resolved = sameCoordinateFlatMatches[sameCoordinateIndex];
+                resolution = "markerid-absent-same-coordinate-flatposition";
+                return true;
+            }
+
+            if (sameFlatPositionMatches.Count == 1)
+            {
+                resolved = sameFlatPositionMatches[0];
+                resolution = "markerid-absent-unique-flatposition-relocated";
+
+                Debug.Log(
+                    $"[DungeonQuestMarkerResolve] markerID={requested.markerID} not found; relocated by unique " +
+                    $"{desiredType} flatPosition from block=({requested.dungeonX},{requested.dungeonZ}) to " +
+                    $"({resolved.dungeonX},{resolved.dungeonZ}) dungeon='{dungeon.Summary.LocationName}' " +
+                    $"key='{stableKey}'");
+                return true;
+            }
+
+            // A non-zero markerID that is absent from the authoritative dungeon means
+            // the underlying source marker/RDB is probably not present in this physical
+            // layout. After markerID and flatPosition matching both fail, this is the
+            // genuine Full -> Small omitted-block fallback path. Use a deterministic
+            // marker of the same type so the quest remains playable.
+            if (compatible.Count > 0)
+            {
+                int fallbackIndex = StableDungeonQuestMarkerIndex(
+                    (stableKey ?? string.Empty) + "|missing-markerid-fallback|" +
+                    requested.markerID + "|" + desiredType,
+                    compatible.Count);
+                resolved = compatible[fallbackIndex];
+                resolution = "deterministic-same-type-fallback-markerid-absent";
+
+                Debug.LogWarning(
+                    $"[DungeonQuestMarkerResolve] markerID={requested.markerID} is absent from authoritative " +
+                    $"layout. Using deterministic {desiredType} fallback block=({resolved.dungeonX},{resolved.dungeonZ}) " +
+                    $"markerID={resolved.markerID} dungeon='{dungeon.Summary.LocationName}' key='{stableKey}'.");
+                return true;
+            }
+
+            // Last-resort playability fallback when the authoritative layout has no marker
+            // of the requested type at all.
+            GameObject fallbackObject = dungeon.StartMarker != null ? dungeon.StartMarker : dungeon.EnterMarker;
+            if (fallbackObject != null)
+            {
+                resolved = requested;
+                resolved.markerType = desiredType;
+                resolved.markerID = 0UL;
+                resolved.dungeonX = 0;
+                resolved.dungeonZ = 0;
+                resolved.flatPosition = dungeon.transform.InverseTransformPoint(fallbackObject.transform.position);
+                resolution = "dungeon-start-fallback-no-compatible-marker";
+
+                Debug.LogWarning(
+                    $"[DungeonQuestMarkerResolve] markerID={requested.markerID} is absent and no {desiredType} " +
+                    $"markers exist in authoritative layout. Falling back to dungeon start marker. " +
+                    $"dungeon='{dungeon.Summary.LocationName}' key='{stableKey}'.");
+                return true;
+            }
+
+            resolution = "no-compatible-or-start-marker";
+            return false;
+        }
+
+        private static bool QuestMarkerFlatPositionsMatch(Vector3 a, Vector3 b)
+        {
+            // Marker positions are generated directly from integer RDB object coordinates
+            // multiplied by MeshReader.GlobalScale, so a tiny epsilon is sufficient.
+            return (a - b).sqrMagnitude <= 0.0001f;
+        }
+
+        private static int StableDungeonQuestMarkerIndex(string key, int count)
+        {
+            if (count <= 1)
+                return 0;
+
+            int hash = DaggerfallDungeon.StableStringHash(key ?? string.Empty);
+            return (int)((uint)hash % (uint)count);
+        }
+
+        public static Vector3 GetDungeonQuestMarkerLocalPosition(QuestMarker marker)
+        {
+            Vector3 dungeonBlockPosition =
+                new Vector3(marker.dungeonX * RDBLayout.RDBSide, 0, marker.dungeonZ * RDBLayout.RDBSide);
+            return dungeonBlockPosition + marker.flatPosition;
+        }
+
         /// <summary>
         /// Finds SiteLinks matching this interior and walks Place markers to inject quest resources.
         /// Some of this handling will be split and relocated for other builders.
@@ -1392,6 +1729,66 @@ private static IEnumerator MoveEnemyToRootAfterDelay(DaggerfallEnemy enemy, Tran
 
                     QuestNpcDbg("Resource FOUND " + QuestNpcResourceState(resource));
 
+                    QuestMarker placementMarker = marker;
+                    if (siteType == SiteTypes.Dungeon &&
+                        parent != null &&
+                        (NetworkClient.active || NetworkServer.active))
+                    {
+                        DaggerfallDungeon networkDungeon = parent.GetComponent<DaggerfallDungeon>();
+                        if (networkDungeon == null)
+                            networkDungeon = parent.GetComponentInParent<DaggerfallDungeon>();
+
+                        if (networkDungeon != null && networkDungeon.IsNetworkDungeonInstance)
+                        {
+                            // Preserve the Place-selected marker type. DFU deliberately keeps later
+                            // resources at a site's already-selected marker when no explicit marker
+                            // index is supplied. That means a Foe can legitimately be assigned to a
+                            // QuestItem marker (for example C0B3XY09: the Daedra guardian is placed
+                            // at the same selected marker as the Holy Dagger). Choosing marker type
+                            // from resource type here incorrectly remaps that foe to an unrelated
+                            // QuestSpawn marker such as the cage. Only fall back to resource type if
+                            // this marker has no usable dungeon marker type.
+                            MarkerTypes desiredMarkerType = marker.markerType;
+                            if (desiredMarkerType != MarkerTypes.QuestSpawn &&
+                                desiredMarkerType != MarkerTypes.QuestItem)
+                            {
+                                desiredMarkerType =
+                                    resource is Item ? MarkerTypes.QuestItem : MarkerTypes.QuestSpawn;
+                            }
+
+                            string placeName = marker.placeSymbol != null ? marker.placeSymbol.Name : string.Empty;
+                            string targetName = target != null ? target.Name : string.Empty;
+                            string questName = quest != null ? quest.QuestName : string.Empty;
+                            string stableMarkerKey =
+                                questName + "|" + placeName + "|" + targetName + "|" +
+                                marker.markerID + "|" + desiredMarkerType;
+
+                            QuestMarker resolvedMarker;
+                            string markerResolution;
+                            if (TryResolveNetworkDungeonQuestMarker(
+                                networkDungeon,
+                                marker,
+                                desiredMarkerType,
+                                stableMarkerKey,
+                                out resolvedMarker,
+                                out markerResolution))
+                            {
+                                placementMarker = resolvedMarker;
+                                QuestNpcDbg(
+                                    $"Marker RESOLVED mode={markerResolution} target={targetName} " +
+                                    $"requested=({marker.dungeonX},{marker.dungeonZ})/{marker.markerID} " +
+                                    $"resolved=({placementMarker.dungeonX},{placementMarker.dungeonZ})/{placementMarker.markerID}");
+                            }
+                            else
+                            {
+                                Debug.LogWarning(
+                                    $"[DungeonQuestMarkerResolve] Could not resolve marker for quest='{questName}' " +
+                                    $"target='{targetName}' dungeon='{networkDungeon.Summary.LocationName}' " +
+                                    $"reason={markerResolution}. Keeping original marker.");
+                            }
+                        }
+                    }
+
                     // Items need a site-aware duplicate check in multiplayer. Resources.FindObjectsOfTypeAll()
                     // also returns inactive QuestResourceBehaviours left behind by a dungeon/interior
                     // transition. Treating any same UID+symbol item anywhere as "already injected" can
@@ -1417,7 +1814,7 @@ private static IEnumerator MoveEnemyToRootAfterDelay(DaggerfallEnemy enemy, Tran
                     if (resource is Person && enableNPCs)
                     {
                         QuestNpcDbg("AddQuestNPC CALL " + QuestNpcResourceState(resource));
-                        AddQuestNPC(siteType, quest, marker, (Person)resource, parent);
+                        AddQuestNPC(siteType, quest, placementMarker, (Person)resource, parent);
                     }
                     else if (resource is Person && !enableNPCs)
                     {
@@ -1427,7 +1824,7 @@ private static IEnumerator MoveEnemyToRootAfterDelay(DaggerfallEnemy enemy, Tran
                     {
                         Foe foe = (Foe)resource;
                         if (foe.KillCount < foe.SpawnCount)
-                            AddQuestFoe(siteType, quest, marker, foe, parent);
+                            AddQuestFoe(siteType, quest, placementMarker, foe, parent);
                         else
                             QuestNpcDbg("Foe SKIP killCount>=spawnCount " + QuestNpcResourceState(resource));
                     }
@@ -1437,7 +1834,7 @@ private static IEnumerator MoveEnemyToRootAfterDelay(DaggerfallEnemy enemy, Tran
                     }
                     else if (resource is Item && enableItems)
                     {
-                        AddQuestItem(siteType, quest, marker, (Item)resource, parent);
+                        AddQuestItem(siteType, quest, placementMarker, (Item)resource, parent);
                     }
                     else if (resource is Item && !enableItems)
                     {

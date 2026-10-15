@@ -750,7 +750,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool anyPlayerWithinDestroy = false;
 
         // Track for deactivate logic: if nobody is within this smaller radius, the
-        // enemy falls back to host ownership and then turns off motor/gravity/visuals
+        // enemy falls back to host/server ownership and then turns off motor/gravity/visuals
         // until a player returns. This prevents client-owned interior enemies from
         // simulating against missing local floors after the owner leaves.
         bool anyPlayerWithinDeactivate = false;
@@ -872,31 +872,28 @@ public class DynamicEnemyAuthority : NetworkBehaviour
             return;
         }
 
-        // No valid candidate in range -> hand to host. Do not remove/reassign/reset every check if
-        // the host already owns it, otherwise NetworkTransform can appear to tick on/off constantly.
-        NetworkConnectionToClient hostConnection = NetworkServer.localConnection as NetworkConnectionToClient;
-        if (hostConnection != null)
+        // Listen hosts retain their existing fallback owner. A dedicated server has
+        // no local connection: removing client authority makes the server the owner.
+        // Do not repeatedly reset NetworkTransform while already on the fallback.
+        NetworkConnectionToClient fallbackOwner = NetworkServer.localConnection as NetworkConnectionToClient;
+        bool ownerChanged = currentOwner != fallbackOwner;
+        if (ownerChanged)
         {
-            if (currentOwner == hostConnection)
-            {
-                SetAuthorityDeactivated(!anyPlayerWithinDeactivate);
-                ShowVisuals();
-                return;
-            }
-
             if (currentOwner != null)
-            {
                 netIdentity.RemoveClientAuthority();
-                currentOwner = null;
-            }
 
-            netIdentity.AssignClientAuthority(hostConnection);
-            currentOwner = hostConnection;
-            SetAuthorityDeactivated(!anyPlayerWithinDeactivate);
-            ApplyAuthorityMotionGate();
-            ResetNetworkTransformBuffers();
-            ShowVisuals();
+            if (fallbackOwner != null)
+                netIdentity.AssignClientAuthority(fallbackOwner);
+
+            currentOwner = fallbackOwner;
         }
+
+        // Run even without a host player, and even if already server-owned.
+        SetAuthorityDeactivated(!anyPlayerWithinDeactivate);
+        ApplyAuthorityMotionGate();
+        if (ownerChanged)
+            ResetNetworkTransformBuffers();
+        ShowVisuals();
     }
 
 
@@ -1106,7 +1103,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool clientOwned = server && id != null && id.connectionToClient != null;
 
         if (server && rb)
-            rb.isKinematic = clientOwned;
+            rb.isKinematic = authorityDeactivated || clientOwned;
     }
 
     

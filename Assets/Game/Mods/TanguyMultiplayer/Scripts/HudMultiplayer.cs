@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using UnityEngine;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.UserInterface;
@@ -32,22 +32,43 @@ public class HudMultiplayer : MonoBehaviour
     bool partyButtonWired;
     bool runtimeModeButtonCreated;
     bool modeButtonWired;
-    GameObject questSyncModeButton;
-    bool runtimeQuestSyncModeButtonCreated;
-    CanvasGroup questSyncModeCanvasGroup;
+    // Appearance controls live in their own local-only submenu. Only the launcher
+    // belongs to the original vertical options list.
+    GameObject paperdollDisplayButton;
+    GameObject paperdollSettingsPanel;
+    GameObject paperdollModeButton;
+    GameObject paperdollTurnButton;
+    GameObject paperdollBobButton;
+    GameObject paperdollAttackButton;
+    // Host-controlled DEFAULT for future parties. Live party policies are only edited
+    // in the Party window by its current leader, never from this menu.
+    GameObject hostQuestDefaultsLauncher;
+    GameObject hostQuestDefaultsPanel;
+    GameObject hostQuestDefaultsModeButton;
+    const string HostQuestDefaultMigrationPref = "DFUCoop.QuestSync.HostDefaultVisibleV1";
+    Text respawnAccessLabel;
+    UnityEngine.UI.Button respawnDefaultsButton;
+    bool wasPauseMenuOpen;
+    bool lastConnectedLayoutState;
+    float lastOptionsCanvasHeight = -1f;
 
     void Start()
     {
         OptionsMultiplayer.EnsureLocalRespawnSettings();
+        // First upgrade from the old, now-hidden setting: do not leave players with
+        // Off or Share-only forever without a visible explanation. Run this once,
+        // only while disconnected, before initializing the new host-only control.
+        MigrateOldHiddenHostQuestDefault();
         OptionsMultiplayer.EnsureLocalQuestSyncSettings();
         ResolveConnectionManager();
         EnsurePartyButton();
         EnsureConnectionModeButton();
         RenamePartyTimeSetting();
         BuildRespawnSettings();
-        BuildQuestSyncModeSetting();
+        BuildPaperdollDisplaySetting();
+        BuildHostQuestDefaultsSetting();
         RefreshLegacyOptionsAvailability();
-        RefreshQuestSyncModeSetting();
+        FitOptionsPanelToCanvas();
         StartCoroutine(Check());
     }
 
@@ -59,12 +80,18 @@ public class HudMultiplayer : MonoBehaviour
         while (true)
         {
             OptionsMultiplayer.EnsureLocalRespawnSettings();
+            MigrateOldHiddenHostQuestDefault();
             OptionsMultiplayer.EnsureLocalQuestSyncSettings();
             ResolveConnectionManager();
             EnsurePartyButton();
             EnsureConnectionModeButton();
 
             bool pauseMenuOpen = isPauseMenu(uiManager);
+            // When the pause window is closed (or a DFU message box becomes the top
+            // window), leave no stale HUD-only submenu hidden behind the next open.
+            if (!pauseMenuOpen && wasPauseMenuOpen)
+                CloseRuntimeOptionsPanels();
+            wasPauseMenuOpen = pauseMenuOpen;
             canvas.enabled = pauseMenuOpen;
             raycaster.enabled = pauseMenuOpen;
 
@@ -72,7 +99,21 @@ public class HudMultiplayer : MonoBehaviour
                 NetworkServer.active || NetworkClient.isConnected;
             bool connectionBusy = connected || NetworkClient.active;
             RefreshLegacyOptionsAvailability();
-            RefreshQuestSyncModeSetting();
+            RefreshPaperdollDisplaySetting();
+            RefreshHostQuestDefaultsSetting();
+            if (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf)
+                RefreshRespawnSettings();
+            bool sessionActive = NetworkServer.active || NetworkClient.active ||
+                NetworkClient.isConnected || PlayerMultiplayer.state != 0;
+            float optionsCanvasHeight = canvas != null && canvas.GetComponent<RectTransform>() != null
+                ? canvas.GetComponent<RectTransform>().rect.height : 0f;
+            if (lastConnectedLayoutState != sessionActive ||
+                Mathf.Abs(lastOptionsCanvasHeight - optionsCanvasHeight) > 1f)
+            {
+                lastConnectedLayoutState = sessionActive;
+                lastOptionsCanvasHeight = optionsCanvasHeight;
+                FitOptionsPanelToCanvas();
+            }
             bool directMode = connectionManager != null &&
                 connectionManager.SelectedMode == MultiplayerManager.ConnectionMode.DirectIP;
 
@@ -80,7 +121,9 @@ public class HudMultiplayer : MonoBehaviour
             {
                 setStatus();
 
-                options.SetActive(!connectionBusy || NetworkServer.active);
+                // Client-side appearance remains accessible while connected.
+                // The other network-wide settings are individually guarded.
+                options.SetActive(true);
                 host.SetActive(!connectionBusy && !directMode);
                 stop.SetActive(connected);
 
@@ -198,7 +241,7 @@ public class HudMultiplayer : MonoBehaviour
         panel.gameObject.AddComponent<UnityEngine.UI.Image>().color = new Color(0.08f, 0.08f, 0.08f, 0.98f);
         respawnSettingsPanel = panel.gameObject;
         SettingsText(panel, "Respawn / travel", new Vector2(530, 32), new Vector2(0, -16), 23);
-        SettingsText(panel, "Host settings - applied to all players", new Vector2(530, 26), new Vector2(0, -50), 16);
+        respawnAccessLabel = SettingsText(panel, "Host settings - applied to all players", new Vector2(530, 26), new Vector2(0, -50), 16);
         string[] names = { "Hold to revive", "Wait before self-respawn", "Revive health", "Respawn health", "Revive fatigue", "Respawn fatigue" };
         int[] min = { 1, 5, 10, 10, 10, 10 }, max = { 10, 30, 50, 50, 50, 50 };
         respawnSliders = new UnityEngine.UI.Slider[6];
@@ -263,6 +306,7 @@ public class HudMultiplayer : MonoBehaviour
         defaultsRect.anchoredPosition = new Vector2(-70, 18);
         defaultsRect.sizeDelta = new Vector2(230, 38);
         var defaultsButton = defaults.GetComponent<UnityEngine.UI.Button>();
+        respawnDefaultsButton = defaultsButton;
         defaultsButton.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
         defaultsButton.onClick.AddListener(() =>
         {
@@ -274,106 +318,342 @@ public class HudMultiplayer : MonoBehaviour
         respawnSettingsPanel.SetActive(false);
     }
 
-    void BuildQuestSyncModeSetting()
+    // One-time migration: the old pre-connection quest mode selector was removed,
+    // leaving prior Off/Share-only preferences invisible. Reset only those old local
+    // preferences to Full, and mark the migration before any new deliberate choice.
+    // Dedicated server JSON values and all active party modes are NEVER altered here.
+    void MigrateOldHiddenHostQuestDefault()
     {
-        if (options == null || existingOptionsPanel == null)
+        if (PlayerPrefs.GetInt(HostQuestDefaultMigrationPref, 0) != 0)
+            return;
+        if (NetworkServer.active || NetworkClient.active || NetworkClient.isConnected ||
+            PlayerMultiplayer.state != 0)
+            return;
+        OptionsMultiplayer.EnsureLocalQuestSyncSettings();
+        OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.Full;
+        OptionsMultiplayer.SaveLocalQuestSyncSettings();
+        PlayerPrefs.SetInt(HostQuestDefaultMigrationPref, 1);
+        PlayerPrefs.Save();
+    }
+
+    // Offline players could become listen hosts, so the default is visible before
+    // hosting. It remains available to an actual listen host, but is hidden from
+    // connected clients and from the headless server (which uses ServerManager).
+    bool CanConfigureHostQuestDefaults()
+    {
+        bool offline = !NetworkServer.active && !NetworkClient.active &&
+            !NetworkClient.isConnected && PlayerMultiplayer.state == 0;
+        bool listenHost = NetworkServer.active && NetworkClient.active &&
+            PlayerMultiplayer.state != 2;
+        return offline || listenHost;
+    }
+
+    void BuildHostQuestDefaultsSetting()
+    {
+        if (options == null || existingOptionsPanel == null || canvas == null)
+            return;
+        Transform parent = existingOptionsPanel.transform;
+        hostQuestDefaultsLauncher = Instantiate(options, parent);
+        hostQuestDefaultsLauncher.name = "Host quest default settings";
+        hostQuestDefaultsLauncher.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
+        var launcherRect = hostQuestDefaultsLauncher.GetComponent<RectTransform>();
+        if (launcherRect != null) launcherRect.sizeDelta = new Vector2(220, 40);
+        var launch = hostQuestDefaultsLauncher.GetComponent<UnityEngine.UI.Button>();
+        if (launch != null)
+        {
+            launch.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
+            launch.onClick.AddListener(OpenHostQuestDefaultsSetting);
+        }
+        SetButtonText(hostQuestDefaultsLauncher, "Quest sync when hosting...");
+
+        RectTransform panel = SettingsRect("Host party defaults panel", canvas.transform,
+            new Vector2(540, 318), Vector2.zero);
+        panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
+        panel.gameObject.AddComponent<UnityEngine.UI.Image>().color =
+            new Color(0.08f, 0.08f, 0.08f, 0.98f);
+        hostQuestDefaultsPanel = panel.gameObject;
+        SettingsText(panel, "Quest sync for new parties", new Vector2(480, 34),
+            new Vector2(0, -16), 23);
+        SettingsText(panel, "Used for new parties when you host a multiplayer game.",
+            new Vector2(490, 26), new Vector2(0, -62), 16);
+        SettingsText(panel,
+            "Existing parties keep their settings. Party leaders can\n" +
+            "change their own party's mode in the Party window.",
+            new Vector2(490, 54), new Vector2(0, -95), 16);
+        hostQuestDefaultsModeButton = CreateAppearanceOptionButton(panel,
+            "Default quest sync selector", "Default quest sync: Full", -171f,
+            CycleHostQuestDefault);
+        GameObject back = CreateAppearanceOptionButton(panel,
+            "Back from host party defaults", "Back", -244f,
+            CloseHostQuestDefaultsSetting);
+        var backRect = back != null ? back.GetComponent<RectTransform>() : null;
+        if (backRect != null) backRect.sizeDelta = new Vector2(150, 40);
+        hostQuestDefaultsPanel.SetActive(false);
+        RefreshHostQuestDefaultsSetting();
+    }
+
+    void RefreshHostQuestDefaultsSetting()
+    {
+        bool show = CanConfigureHostQuestDefaults();
+        if (hostQuestDefaultsLauncher != null && hostQuestDefaultsLauncher.activeSelf != show)
+            hostQuestDefaultsLauncher.SetActive(show);
+        if (!show && hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf)
+        {
+            hostQuestDefaultsPanel.SetActive(false);
+            if (existingOptionsPanel != null) existingOptionsPanel.SetActive(false);
+        }
+        if (hostQuestDefaultsModeButton != null)
+        {
+            string text = "Full";
+            switch (OptionsMultiplayer.DefaultQuestSyncMode)
+            {
+                case OptionsMultiplayer.QuestSyncMode.SharedOnly: text = "Share-only"; break;
+                case OptionsMultiplayer.QuestSyncMode.Off: text = "Off"; break;
+            }
+            SetButtonText(hostQuestDefaultsModeButton, "Default quest sync: " + text);
+        }
+    }
+
+    void CycleHostQuestDefault()
+    {
+        if (!CanConfigureHostQuestDefaults()) return;
+        var next = (OptionsMultiplayer.QuestSyncMode)
+            (((int)OptionsMultiplayer.DefaultQuestSyncMode + 1) % 3);
+        // Changes only the default for NEW parties; this setter does not send
+        // PartyManager mode-change actions or affect the active party.
+        OptionsMultiplayer.questSyncMode = next;
+        // SaveLocalQuestSyncSettings() reads the live party-mode getter while a
+        // listen host is connected, so it would silently persist the WRONG mode.
+        // Save the new default itself instead. This is the existing option key;
+        // it remains independent of the party's current network policy.
+        PlayerPrefs.SetInt("DFUCoop.QuestSync.Mode", (int)next);
+        PlayerPrefs.Save();
+        RefreshHostQuestDefaultsSetting();
+    }
+
+    void OpenHostQuestDefaultsSetting()
+    {
+        if (!CanConfigureHostQuestDefaults() || hostQuestDefaultsPanel == null ||
+            existingOptionsPanel == null) return;
+        RefreshHostQuestDefaultsSetting();
+        existingOptionsPanel.SetActive(false);
+        hostQuestDefaultsPanel.SetActive(true);
+        hostQuestDefaultsPanel.transform.SetAsLastSibling();
+        RectTransform canvasRect = canvas != null ? canvas.GetComponent<RectTransform>() : null;
+        if (canvasRect != null)
+        {
+            float scale = Mathf.Min(1f,
+                Mathf.Min(canvasRect.rect.width / 570f, canvasRect.rect.height / 348f));
+            hostQuestDefaultsPanel.transform.localScale = Vector3.one * scale;
+        }
+    }
+
+    void CloseHostQuestDefaultsSetting()
+    {
+        if (hostQuestDefaultsPanel != null) hostQuestDefaultsPanel.SetActive(false);
+        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(true);
+        FitOptionsPanelToCanvas();
+    }
+
+    // Available offline, for listen-hosts, and for every connected client.
+    // This is local presentation only: it must never update synchronized host settings.
+    void BuildPaperdollDisplaySetting()
+    {
+        if (options == null || existingOptionsPanel == null || canvas == null)
             return;
 
         Transform parent = existingOptionsPanel.transform;
-        questSyncModeButton = Instantiate(options, parent);
-        questSyncModeButton.name = "Quest sync mode";
-        runtimeQuestSyncModeButtonCreated = true;
+        paperdollDisplayButton = Instantiate(options, parent);
+        paperdollDisplayButton.name = "Player appearance settings";
+        paperdollDisplayButton.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
+        RectTransform launcherRect = paperdollDisplayButton.GetComponent<RectTransform>();
+        if (launcherRect != null) launcherRect.sizeDelta = new Vector2(220, 40);
+        var launcherButton = paperdollDisplayButton.GetComponent<UnityEngine.UI.Button>();
+        if (launcherButton != null)
+        {
+            launcherButton.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
+            launcherButton.onClick.AddListener(OpenPaperdollSettings);
+        }
+        SetButtonText(paperdollDisplayButton, "Player appearance...");
+        paperdollDisplayButton.SetActive(true);
 
-        var button = questSyncModeButton.GetComponent<UnityEngine.UI.Button>();
+        RectTransform panel = SettingsRect("Player appearance panel", canvas.transform,
+            new Vector2(510, 435), Vector2.zero);
+        panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
+        panel.gameObject.AddComponent<UnityEngine.UI.Image>().color = new Color(0.08f, 0.08f, 0.08f, 0.98f);
+        paperdollSettingsPanel = panel.gameObject;
+        SettingsText(panel, "Player appearance", new Vector2(450, 34),
+            new Vector2(0, -16), 24);
+        SettingsText(panel, "Local preference - each player can choose independently",
+            new Vector2(450, 25), new Vector2(0, -54), 15);
+
+        paperdollModeButton = CreateAppearanceOptionButton(panel, "Appearance mode",
+            "Others: Animated sprites", -92f, () =>
+            {
+                PlayerAssets.UseRemotePaperdolls = !PlayerAssets.UseRemotePaperdolls;
+                RefreshPaperdollDisplaySetting();
+            });
+        paperdollTurnButton = CreateAppearanceOptionButton(panel, "Paperdoll facing mode",
+            "Paperdoll turn: Camera", -156f, () =>
+            {
+                PlayerAssets.RemotePaperdollTurnMode = (PlayerAssets.RemotePaperdollTurnMode + 1) % 3;
+                RefreshPaperdollDisplaySetting();
+            });
+        paperdollBobButton = CreateAppearanceOptionButton(panel, "Paperdoll bob mode",
+            "Paperdoll bob: On", -220f, () =>
+            {
+                PlayerAssets.RemotePaperdollBobEnabled = !PlayerAssets.RemotePaperdollBobEnabled;
+                RefreshPaperdollDisplaySetting();
+            });
+        paperdollAttackButton = CreateAppearanceOptionButton(panel, "Paperdoll attack motion",
+            "Paperdoll attacks: Off", -284f, () =>
+            {
+                PlayerAssets.RemotePaperdollAttacksEnabled = !PlayerAssets.RemotePaperdollAttacksEnabled;
+                RefreshPaperdollDisplaySetting();
+            });
+        GameObject back = CreateAppearanceOptionButton(panel, "Back to multiplayer options",
+            "Back", -356f, ClosePaperdollSettings);
+        RectTransform backRect = back != null ? back.GetComponent<RectTransform>() : null;
+        if (backRect != null) backRect.sizeDelta = new Vector2(150, 40);
+        paperdollSettingsPanel.SetActive(false);
+        RefreshPaperdollDisplaySetting();
+    }
+
+    GameObject CreateAppearanceOptionButton(Transform parent, string name,
+        string label, float y, UnityEngine.Events.UnityAction click)
+    {
+        var go = Instantiate(options, parent);
+        go.name = name;
+        RectTransform rect = go.GetComponent<RectTransform>();
+        if (rect != null)
+        {
+            rect.anchorMin = rect.anchorMax = new Vector2(0.5f, 1f);
+            rect.pivot = new Vector2(0.5f, 1f);
+            rect.anchoredPosition = new Vector2(0, y);
+            rect.sizeDelta = new Vector2(345, 45);
+            rect.localScale = Vector3.one;
+        }
+        var button = go.GetComponent<UnityEngine.UI.Button>();
         if (button != null)
         {
             button.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
-            button.onClick.AddListener(CycleQuestSyncMode);
+            button.onClick.AddListener(click);
         }
-
-        questSyncModeButton.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
-        questSyncModeButton.GetComponent<RectTransform>().sizeDelta = new Vector2(180, 40);
-        questSyncModeButton.SetActive(true);
-
-        questSyncModeCanvasGroup = questSyncModeButton.GetComponent<CanvasGroup>();
-        if (questSyncModeCanvasGroup == null)
-            questSyncModeCanvasGroup = questSyncModeButton.AddComponent<CanvasGroup>();
-
-        RefreshQuestSyncModeSetting();
+        SetButtonText(go, label);
+        go.SetActive(true);
+        return go;
     }
 
-    bool CanEditQuestSyncMode()
+    void OpenPaperdollSettings()
     {
-        if (NetworkServer.active || NetworkClient.isConnected)
-            return MultiplayerPartyManager.CanChangeLocalQuestSyncMode();
-        return PlayerMultiplayer.state == 0 &&
-            !NetworkServer.active && !NetworkClient.active && !NetworkClient.isConnected;
+        if (paperdollSettingsPanel == null || existingOptionsPanel == null) return;
+        RefreshPaperdollDisplaySetting();
+        existingOptionsPanel.SetActive(false);
+        paperdollSettingsPanel.SetActive(true);
+        paperdollSettingsPanel.transform.SetAsLastSibling();
+        RectTransform canvasRect = canvas != null ? canvas.GetComponent<RectTransform>() : null;
+        if (canvasRect != null)
+        {
+            float scale = Mathf.Min(1f,
+                Mathf.Min(canvasRect.rect.width / 540f, canvasRect.rect.height / 475f));
+            paperdollSettingsPanel.transform.localScale = Vector3.one * scale;
+        }
     }
 
-    void CycleQuestSyncMode()
+    void ClosePaperdollSettings()
     {
-        if (!CanEditQuestSyncMode())
-            return;
-
-        if (NetworkServer.active || NetworkClient.isConnected)
-        {
-            MultiplayerPartyManager.RequestLocalQuestSyncMode(
-                (OptionsMultiplayer.QuestSyncMode)(((int)OptionsMultiplayer.questSyncMode + 1) % 3));
-            return;
-        }
-        OptionsMultiplayer.EnsureLocalQuestSyncSettings();
-        switch (OptionsMultiplayer.questSyncMode)
-        {
-            case OptionsMultiplayer.QuestSyncMode.Full:
-                OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.SharedOnly;
-                break;
-            case OptionsMultiplayer.QuestSyncMode.SharedOnly:
-                OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.Off;
-                break;
-            default:
-                OptionsMultiplayer.questSyncMode = OptionsMultiplayer.QuestSyncMode.Full;
-                break;
-        }
-
-        OptionsMultiplayer.SaveLocalQuestSyncSettings();
-        RefreshQuestSyncModeSetting();
+        if (paperdollSettingsPanel != null) paperdollSettingsPanel.SetActive(false);
+        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(true);
+        FitOptionsPanelToCanvas();
     }
 
-    void RefreshQuestSyncModeSetting()
+    void CloseRuntimeOptionsPanels()
     {
-        if (questSyncModeButton == null)
-            return;
+        // A paused game's top window can change when ESC closes or a DFU modal
+        // message appears. Only reset our own submenus. Never open the legacy
+        // Options panel here: it starts inactive and is opened by its own button.
+        bool wasInSubmenu = (paperdollSettingsPanel != null && paperdollSettingsPanel.activeSelf) ||
+            (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf) ||
+            (hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf);
+        if (paperdollSettingsPanel != null) paperdollSettingsPanel.SetActive(false);
+        if (respawnSettingsPanel != null) respawnSettingsPanel.SetActive(false);
+        if (hostQuestDefaultsPanel != null) hostQuestDefaultsPanel.SetActive(false);
+        if (wasInSubmenu && existingOptionsPanel != null)
+            existingOptionsPanel.SetActive(false);
+    }
 
-        string modeLabel;
-        switch (OptionsMultiplayer.questSyncMode)
+    void RefreshPaperdollDisplaySetting()
+    {
+        if (paperdollModeButton != null)
+            SetButtonText(paperdollModeButton,
+                PlayerAssets.UseRemotePaperdolls ? "Others: Paperdolls" : "Others: Animated sprites");
+        if (paperdollTurnButton != null)
         {
-            case OptionsMultiplayer.QuestSyncMode.SharedOnly:
-                modeLabel = "Shared only";
-                break;
-            case OptionsMultiplayer.QuestSyncMode.Off:
-                modeLabel = "Off";
-                break;
-            default:
-                modeLabel = "Full";
-                break;
+            string facing = "Camera";
+            switch (PlayerAssets.RemotePaperdollTurnMode)
+            {
+                case 1: facing = "Mirrored back"; break;
+                case 2: facing = "Same face back"; break;
+            }
+            SetButtonText(paperdollTurnButton, "Paperdoll turn: " + facing);
+            var button = paperdollTurnButton.GetComponent<UnityEngine.UI.Button>();
+            if (button != null) button.interactable = PlayerAssets.UseRemotePaperdolls;
         }
-
-        SetButtonText(questSyncModeButton, "Quest sync: " + modeLabel);
-
-        bool editable = CanEditQuestSyncMode();
-        var button = questSyncModeButton.GetComponent<UnityEngine.UI.Button>();
-        if (button != null)
-            button.interactable = editable;
-        if (questSyncModeCanvasGroup != null)
+        if (paperdollBobButton != null)
         {
-            questSyncModeCanvasGroup.alpha = editable ? 1f : 0.45f;
-            questSyncModeCanvasGroup.interactable = editable;
+            SetButtonText(paperdollBobButton,
+                PlayerAssets.RemotePaperdollBobEnabled ? "Paperdoll bob: On" : "Paperdoll bob: Off");
+            var button = paperdollBobButton.GetComponent<UnityEngine.UI.Button>();
+            if (button != null) button.interactable = PlayerAssets.UseRemotePaperdolls;
         }
+        if (paperdollAttackButton != null)
+        {
+            SetButtonText(paperdollAttackButton,
+                PlayerAssets.RemotePaperdollAttacksEnabled ? "Paperdoll attacks: On" : "Paperdoll attacks: Off");
+            var button = paperdollAttackButton.GetComponent<UnityEngine.UI.Button>();
+            if (button != null) button.interactable = PlayerAssets.UseRemotePaperdolls;
+        }
+    }
+
+    // The old prefab has a ContentSizeFitter on its vertical options group; as controls
+    // were added it extended beyond the screen and cut off the time option. Centre the
+    // group and bound its height to the canvas instead of relying on the old stretched
+    // rect (+ a large negative SizeDelta) from the six-option layout.
+    void FitOptionsPanelToCanvas()
+    {
+        if (existingOptionsPanel == null || canvas == null) return;
+        RectTransform panel = existingOptionsPanel.GetComponent<RectTransform>();
+        RectTransform available = canvas.GetComponent<RectTransform>();
+        if (panel == null || available == null || available.rect.height <= 0f) return;
+
+        var fitter = existingOptionsPanel.GetComponent<ContentSizeFitter>();
+        if (fitter != null) fitter.enabled = false;
+        panel.anchorMin = panel.anchorMax = new Vector2(0.5f, 0.5f);
+        panel.pivot = new Vector2(0.5f, 0.5f);
+        panel.anchoredPosition = Vector2.zero;
+        float height = 0f;
+        int visible = 0;
+        var group = existingOptionsPanel.GetComponent<VerticalLayoutGroup>();
+        for (int i = 0; i < panel.childCount; i++)
+        {
+            RectTransform child = panel.GetChild(i) as RectTransform;
+            if (child == null || !child.gameObject.activeSelf) continue;
+            float preferred = LayoutUtility.GetPreferredHeight(child);
+            if (preferred <= 0f) preferred = Mathf.Abs(child.sizeDelta.y);
+            height += Mathf.Max(30f, preferred);
+            visible++;
+        }
+        if (group != null)
+            height += group.padding.top + group.padding.bottom + Mathf.Max(0, visible - 1) * group.spacing;
+        height = Mathf.Max(50f, height);
+        panel.sizeDelta = new Vector2(panel.sizeDelta.x, height);
+        float maxHeight = Mathf.Max(200f, available.rect.height - 85f);
+        panel.localScale = Vector3.one * Mathf.Min(1f, maxHeight / height);
     }
 
     void OpenRespawnSettings()
     {
-        if (!CanEditRespawnSettings() || respawnSettingsPanel == null) return;
+        if (respawnSettingsPanel == null || existingOptionsPanel == null) return;
         OptionsMultiplayer.EnsureLocalRespawnSettings();
         RefreshRespawnSettings();
         existingOptionsPanel.SetActive(false);
@@ -398,6 +678,16 @@ public class HudMultiplayer : MonoBehaviour
         }
         respawnToggles[0].isOn = OptionsMultiplayer.respawnOutsideDungeon;
         respawnToggles[1].isOn = OptionsMultiplayer.partyTravelInsideDungeon;
+        bool editable = CanEditRespawnSettings();
+        if (respawnAccessLabel != null)
+            respawnAccessLabel.text = editable
+                ? "Host/default settings - applied to all players"
+                : "Server settings (read-only for clients)";
+        for (int i = 0; i < respawnSliders.Length; i++)
+            if (respawnSliders[i] != null) respawnSliders[i].interactable = editable;
+        for (int i = 0; i < respawnToggles.Length; i++)
+            if (respawnToggles[i] != null) respawnToggles[i].interactable = editable;
+        if (respawnDefaultsButton != null) respawnDefaultsButton.interactable = editable;
         refreshingRespawnSettings = false;
     }
 
@@ -617,7 +907,7 @@ public class HudMultiplayer : MonoBehaviour
             return;
         Text label = button.GetComponentInChildren<Text>(true);
         if (label != null)
-            label.text = "Party leader time";
+            label.text = "Default: leader time";
     }
 
     public void toggleTimeHost()
@@ -773,7 +1063,5 @@ public class HudMultiplayer : MonoBehaviour
         if (runtimeModeButtonCreated && connectionModeButton != null)
             Destroy(connectionModeButton);
 
-        if (runtimeQuestSyncModeButtonCreated && questSyncModeButton != null)
-            Destroy(questSyncModeButton);
     }
 }

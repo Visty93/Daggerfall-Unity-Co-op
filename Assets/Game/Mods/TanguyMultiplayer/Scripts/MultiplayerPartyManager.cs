@@ -44,6 +44,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
     const int ActionKickMember = 5;
     const int ActionPromoteLeader = 6;
     const int ActionSetQuestMode = 7;
+    const int ActionSetLeaderTime = 8;
 
     static MultiplayerPartyManager instance;
 
@@ -62,6 +63,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
         public uint[] leaderNetIds;
         public ulong[] timeEpochs;
         public int[] questSyncModes;
+        public bool[] leaderControlsTime;
         public int[] memberCounts;
         public string[] playerNames;
     }
@@ -85,6 +87,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
         public uint LeaderNetId;
         public ulong TimeEpoch;
         public OptionsMultiplayer.QuestSyncMode QuestMode;
+        public bool LeaderControlsTime = true;
         public int MemberCount;
         public string PlayerName;
     }
@@ -103,6 +106,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
         public uint leaderNetId;
         public ulong timeEpoch = 1UL;
         public OptionsMultiplayer.QuestSyncMode questMode;
+        public bool leaderControlsTime = true;
         public readonly HashSet<uint> members = new HashSet<uint>();
     }
 
@@ -383,6 +387,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
             LeaderNetId = source.LeaderNetId,
             TimeEpoch = source.TimeEpoch,
             QuestMode = source.QuestMode,
+            LeaderControlsTime = source.LeaderControlsTime,
             MemberCount = source.MemberCount,
             PlayerName = source.PlayerName,
         };
@@ -422,6 +427,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
             LeaderNetId = party.leaderNetId,
             TimeEpoch = party.timeEpoch,
             QuestMode = party.questMode,
+            LeaderControlsTime = party.leaderControlsTime,
             MemberCount = party.members.Count,
             PlayerName = ResolveServerPlayerName(netId),
         };
@@ -472,6 +478,10 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
 
         if (isLeader)
         {
+            actions.Add(new ManagementAction { action = ActionSetLeaderTime, targetNetId = 1U,
+                label = "Time: leader controls" + (localState.LeaderControlsTime ? " (current)" : "") });
+            actions.Add(new ManagementAction { action = ActionSetLeaderTime, targetNetId = 0U,
+                label = "Time: any member can advance" + (!localState.LeaderControlsTime ? " (current)" : "") });
             for (uint mode = 0; mode <= 2; mode++)
                 actions.Add(new ManagementAction { action = ActionSetQuestMode, targetNetId = mode,
                     label = "Quest sync: " + QuestModeLabel((OptionsMultiplayer.QuestSyncMode)mode) +
@@ -541,7 +551,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
 
             ManagementAction chosen = actions[index];
             picker.CloseWindow();
-            SendAction(chosen.action, chosen.targetNetId, chosen.action == ActionSetQuestMode ? localState.PartyId : 0UL, 0U);
+            SendAction(chosen.action, chosen.targetNetId, (chosen.action == ActionSetQuestMode || chosen.action == ActionSetLeaderTime) ? localState.PartyId : 0UL, 0U);
         };
         uiManager.PushWindow(picker);
     }
@@ -592,6 +602,44 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
         MarkServerStateDirty();
         BroadcastSnapshot();
         NotifyParty(party, "Quest sync: " + QuestModeLabel(party.questMode) + ". Existing quests keep their participation.");
+    }
+
+    // Defaults are only consulted when creating a party. Live policy belongs to
+    // the server's party record, including when the physical host is a follower.
+    public static bool TryGetLocalLeaderControlsTime(out bool enabled)
+    {
+        enabled = true;
+        PartyClientState state;
+        uint local = GetLocalNetId();
+        if (local == 0U || instance == null) return false;
+        bool found = NetworkServer.active ? instance.TryBuildClientStateFromServer(local, out state) : TryGetClientState(local, out state);
+        if (!found || state == null) return false;
+        enabled = state.LeaderControlsTime;
+        return true;
+    }
+
+    public static bool ServerLeaderControlsTime(uint playerNetId)
+    {
+        PartyClientState state;
+        return !NetworkServer.active || instance == null ||
+            !instance.TryBuildClientStateFromServer(playerNetId, out state) || state.LeaderControlsTime;
+    }
+
+    void ServerSetLeaderTime(ServerMember source, ulong expectedParty, uint enabled)
+    {
+        ServerParty party;
+        if (enabled > 1U || !TryGetParty(source, out party) || party.id != expectedParty || party.leaderNetId != source.netId)
+            return;
+        bool value = enabled != 0U;
+        if (party.leaderControlsTime == value) return;
+        party.leaderControlsTime = value;
+        // Old-mode samples/proposals must never be applied in the new mode.
+        party.timeEpoch++;
+        if (party.timeEpoch == 0UL) party.timeEpoch++;
+        MarkServerStateDirty();
+        BroadcastSnapshot();
+        NotifyParty(party, value ? "Time: leader controls. Other members' local rest time is corrected afterwards." :
+            "Time: any member can advance the party clock. Healing remains local to the resting player.");
     }
 
     static string SafeName(PartyClientState state)
@@ -836,6 +884,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
             id = id,
             leaderNetId = member.netId,
             questMode = OptionsMultiplayer.DefaultQuestSyncMode,
+            leaderControlsTime = OptionsMultiplayer.timeHost,
         };
         party.members.Add(member.netId);
         serverParties[id] = party;
@@ -938,6 +987,9 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
 
         switch (request.action)
         {
+            case ActionSetLeaderTime:
+                ServerSetLeaderTime(source, request.partyId, request.targetNetId);
+                break;
             case ActionSetQuestMode:
                 ServerSetQuestMode(source, request.partyId, request.targetNetId);
                 break;
@@ -1182,6 +1234,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
             leaderNetIds = new uint[ids.Count],
             timeEpochs = new ulong[ids.Count],
             questSyncModes = new int[ids.Count],
+            leaderControlsTime = new bool[ids.Count],
             memberCounts = new int[ids.Count],
             playerNames = new string[ids.Count],
         };
@@ -1198,6 +1251,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
             snapshot.leaderNetIds[i] = party != null ? party.leaderNetId : netId;
             snapshot.timeEpochs[i] = party != null ? party.timeEpoch : 0UL;
             snapshot.questSyncModes[i] = party != null ? (int)party.questMode : 0;
+            snapshot.leaderControlsTime[i] = party == null || party.leaderControlsTime;
             snapshot.memberCounts[i] = party != null ? Mathf.Max(1, party.members.Count) : 1;
             snapshot.playerNames[i] = ResolveServerPlayerName(netId);
         }
@@ -1288,6 +1342,7 @@ public sealed class MultiplayerPartyManager : MonoBehaviour
                 LeaderNetId = message.leaderNetIds != null && i < message.leaderNetIds.Length ? message.leaderNetIds[i] : netId,
                 TimeEpoch = message.timeEpochs != null && i < message.timeEpochs.Length ? message.timeEpochs[i] : 0UL,
                 QuestMode = message.questSyncModes != null && i < message.questSyncModes.Length && message.questSyncModes[i] >= 0 && message.questSyncModes[i] <= 2 ? (OptionsMultiplayer.QuestSyncMode)message.questSyncModes[i] : OptionsMultiplayer.QuestSyncMode.Full,
+                LeaderControlsTime = message.leaderControlsTime == null || i >= message.leaderControlsTime.Length || message.leaderControlsTime[i],
                 MemberCount = message.memberCounts != null && i < message.memberCounts.Length ? Mathf.Max(1, message.memberCounts[i]) : 1,
                 PlayerName = message.playerNames != null && i < message.playerNames.Length ? message.playerNames[i] : "Player " + netId,
             };

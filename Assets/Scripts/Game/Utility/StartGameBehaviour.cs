@@ -117,6 +117,12 @@ namespace DaggerfallWorkshop.Game.Utility
 
         void Start()
         {
+            if (Mirror.DfuDedicatedServerOptions.Requested)
+            {
+                StartMethod = StartMethods.DoNothing;
+                enabled = false;
+                return;
+            }
             ApplyStartSettings();
             SaveLoadManager.OnLoad += SaveLoadManager_OnLoad;
         }

@@ -286,7 +286,7 @@ namespace Mirror
             //
             // (tick rate is applied in StartServer!)
 #if UNITY_SERVER
-            if (autoStartServerBuild)
+            if (autoStartServerBuild && !DfuDedicatedServerOptions.Requested)
             {
                 StartServer();
             }

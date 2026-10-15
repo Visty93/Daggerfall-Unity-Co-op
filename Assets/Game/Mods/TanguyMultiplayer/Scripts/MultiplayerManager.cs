@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using Mirror;
 using Steamworks;
 
@@ -76,6 +76,15 @@ public class MultiplayerManager : MonoBehaviour
     {
         CacheReferences();
 
+        // Authenticate mod lists before Mirror creates a network player.
+        // Installed on both regular clients/listen hosts and headless servers.
+        if (manager != null)
+        {
+            var modAuthenticator = ModCompatibilityAuthenticator.Install(manager);
+            if (!DfuDedicatedServerOptions.Requested)
+                modAuthenticator.UseListenHostPolicy();
+        }
+
         // Never expose Mirror's stock NetworkManagerHUD. It includes a Server Only
         // button, while this mod supports player-hosted Host/Client sessions only.
         if (directHud != null)
@@ -88,6 +97,12 @@ public class MultiplayerManager : MonoBehaviour
     void Start()
     {
         CacheReferences();
+        if (DfuDedicatedServerOptions.Requested)
+        {
+            if (GetComponent<DedicatedServerBootstrap>() == null)
+                gameObject.AddComponent<DedicatedServerBootstrap>();
+            return;
+        }
 
         ConnectionMode initialMode = defaultMode;
         if (initialMode == ConnectionMode.Steam && !SteamAvailable && DirectIPAvailable)
@@ -364,7 +379,7 @@ public class MultiplayerManager : MonoBehaviour
             }
         }
 
-        GUILayout.Label("Server Address");
+        GUILayout.Label("Server Address (host or host:port)");
         directAddress = GUILayout.TextField(directAddress ?? string.Empty);
 
         if (GUILayout.Button("Client"))
@@ -378,11 +393,35 @@ public class MultiplayerManager : MonoBehaviour
                 directAddress = address;
                 manager.networkAddress = address;
                 activeMode = ConnectionMode.DirectIP;
-                manager.StartClient();
+                System.Net.IPAddress literalAddress;
+                if (address.IndexOf(':') >= 0 && !System.Net.IPAddress.TryParse(address, out literalAddress))
+                {
+                    System.Uri endpoint;
+                    if (TryParseDirectClientUri(address, out endpoint))
+                        manager.StartClient(endpoint);
+                    else
+                        DaggerfallWorkshop.Game.DaggerfallUI.MessageBox("Invalid server address. Use host:port, for example localhost:7778 (port 1-65535).");
+                }
+                else
+                    manager.StartClient();
             }
         }
 
         GUILayout.EndArea();
+    }
+
+    public static bool TryParseDirectClientUri(string address, out System.Uri endpoint)
+    {
+        endpoint = null;
+        if (string.IsNullOrWhiteSpace(address)) return false;
+        string value = address.Trim();
+        if (value.IndexOf("://", System.StringComparison.Ordinal) < 0)
+            value = "kcp://" + value;
+        return System.Uri.TryCreate(value, System.UriKind.Absolute, out endpoint) &&
+            endpoint.Scheme == "kcp" && !string.IsNullOrEmpty(endpoint.Host) &&
+            (endpoint.IsDefaultPort || (endpoint.Port >= 1 && endpoint.Port <= 65535)) &&
+            string.IsNullOrEmpty(endpoint.UserInfo) && string.IsNullOrEmpty(endpoint.Query) &&
+            string.IsNullOrEmpty(endpoint.Fragment) && (endpoint.AbsolutePath == "" || endpoint.AbsolutePath == "/");
     }
 
     public void HostSteam()

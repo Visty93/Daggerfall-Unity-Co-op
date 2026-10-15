@@ -397,19 +397,10 @@ namespace DaggerfallWorkshop.Game
                     DaggerfallAction action;
                     if (ActionCheck(hit, out action) && hit.distance <= DefaultActivationDistance)
                     {
-                        int activationCountBefore = action.activationCount;
-                        Vector3 originalActionPosition = action.transform.position;
+                        // DaggerfallAction.Receive() now reports accepted player-originated root
+                        // triggers to DoorsCatcher. Keeping the notification there also covers
+                        // collision and attack triggers without duplicating Direct activations.
                         action.Receive(this.gameObject, DaggerfallAction.TriggerTypes.Direct);
-
-                        // Notify only after DFU accepted the Direct trigger. This preserves the
-                        // normal SP path and avoids networking rejected/cooldown activations.
-                        if (action.activationCount != activationCountBefore)
-                        {
-                            DoorsCatcher.NotifyActionActivated(
-                                action,
-                                originalActionPosition,
-                                DaggerfallAction.TriggerTypes.Direct);
-                        }
                     }
 
                     // Check for lootable object hit

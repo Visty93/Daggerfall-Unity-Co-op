@@ -187,6 +187,100 @@ namespace DaggerfallWorkshop.Game.Utility
         }
 
         /// <summary>
+        /// Cosmetic-only remote player renderer. Uses the receiving client's own
+        /// DFU assets (including texture replacements); never reads or mutates the
+        /// local PlayerEntity, inventory, or racial-effect manager.
+        /// </summary>
+        public void RefreshRemote(string nudeBodyName, string clothedBodyName,
+            string headName, int headRecord, bool upperClothed, bool lowerClothed,
+            int werebeast, IList<DaggerfallUnityItem> appearanceItems)
+        {
+            itemLayout.Clear();
+            RenderTexture previous = RenderTexture.active;
+            RenderTexture.active = target;
+            GL.PushMatrix();
+            try
+            {
+                GL.LoadPixelMatrix(0, target.width, target.height, 0);
+                GL.Clear(true, true, Color.clear);
+
+                if (werebeast == 1 || werebeast == 2)
+                {
+                    // The werewolf/wereboar image lives on DFU's PAPERDOLL
+                    // background layer (the normal character layers are suppressed).
+                    string resource = werebeast == 1 ? "WOLF00I0.IMG" : "BOAR00I0.IMG";
+                    Texture2D source = ImageReader.GetTexture(resource, 0, 0, false);
+                    Texture2D paperdoll = ImageReader.GetSubTexture(source,
+                        new Rect(8, 7, paperDollWidth, paperDollHeight), new DFSize(125, 198));
+                    if (paperdoll != null)
+                        Graphics.DrawTexture(new Rect(0f, 0f, target.width, target.height), paperdoll);
+                }
+                else
+                {
+                    DaggerfallUnityItem cloak1 = null;
+                    DaggerfallUnityItem cloak2 = null;
+                    if (appearanceItems != null)
+                    {
+                        for (int i = 0; i < appearanceItems.Count; i++)
+                        {
+                            DaggerfallUnityItem item = appearanceItems[i];
+                            if (item == null) continue;
+                            if (item.EquipSlot == EquipSlots.Cloak1) cloak1 = item;
+                            if (item.EquipSlot == EquipSlots.Cloak2) cloak2 = item;
+                        }
+                    }
+                    DaggerfallUnityItem interior = cloak2 != null ? cloak2 : cloak1;
+                    if (interior != null)
+                    {
+                        try { DrawTexture(DaggerfallUnity.Instance.ItemHelper.GetCloakInteriorImage(interior), interior); }
+                        catch { /* Missing local replacement: keep the rest of the remote character. */ }
+                    }
+
+                    ImageData unclothed = ImageReader.GetImageData(nudeBodyName, 0, 0, true);
+                    ImageData clothed = ImageReader.GetImageData(clothedBodyName, 0, 0, true);
+                    ImageData head = ImageReader.GetImageData(headName, headRecord, 0, true);
+                    DrawTexture(unclothed);
+
+                    // The viewer's nudity preference is local. Clothing overlays
+                    // use the sender's actual dressed/undressed status.
+                    if (!DaggerfallUnity.Settings.PlayerNudity)
+                    {
+                        if (!upperClothed) BlitUpperBody(clothed);
+                        if (!lowerClothed) BlitLowerBody(clothed);
+                    }
+                    DrawTexture(head);
+
+                    if (appearanceItems != null)
+                    {
+                        // Sort item layers exactly as DFU does for the inventory paperdoll.
+                        // Unknown modded items must not hide the rest of the character.
+                        foreach (DaggerfallUnityItem item in appearanceItems.OrderBy(o => o.drawOrder))
+                        {
+                            try
+                            {
+                                if (item.ItemGroup == ItemGroups.MensClothing ||
+                                    item.ItemGroup == ItemGroups.WomensClothing ||
+                                    item.ItemGroup == ItemGroups.Armor ||
+                                    item.ItemGroup == ItemGroups.Weapons ||
+                                    (item.ItemGroup == ItemGroups.Jewellery && IsEquippedToBody(item)))
+                                    BlitItem(item);
+                            }
+                            catch { /* Unknown replacement or item on this client. */ }
+                        }
+                    }
+                }
+
+                paperDollTexture.ReadPixels(new Rect(0, 0, target.width, target.height), 0, 0);
+                paperDollTexture.Apply();
+            }
+            finally
+            {
+                GL.PopMatrix();
+                RenderTexture.active = previous;
+            }
+        }
+
+        /// <summary>
         /// Gets equip index at position. Must be in unscaled PaperDoll native coordinates.
         /// </summary>
         /// <param name="x">X position to sample.</param>

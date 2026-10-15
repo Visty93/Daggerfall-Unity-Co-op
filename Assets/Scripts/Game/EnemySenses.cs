@@ -1225,7 +1225,8 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
                     }
                 }
 
-                if (detectedTarget && !hasEncounteredPlayer && IsCurrentPlayerTarget(target))
+                if (!(NetworkServer.active && !NetworkClient.active) &&
+                    detectedTarget && !hasEncounteredPlayer && IsCurrentPlayerTarget(target))
                 {
                     hasEncounteredPlayer = true;
 
@@ -1796,4 +1797,3 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
         #endregion
     }
 }
-

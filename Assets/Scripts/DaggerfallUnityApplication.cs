@@ -145,6 +145,16 @@ public static class DaggerfallUnityApplication
 
     static void InitLog()
     {
+        // A server must not open the same Player.log as local playable clients.
+        // Keep Unity's native logger so -logFile captures engine AND game messages,
+        // including the call stacks lost by the custom LogFormat implementation.
+        if (Mirror.DfuDedicatedServerOptions.Requested)
+        {
+            Application.SetStackTraceLogType(LogType.Error, StackTraceLogType.ScriptOnly);
+            Application.SetStackTraceLogType(LogType.Exception, StackTraceLogType.Full);
+            Debug.Log("[DFUDedicated] Server logging initialized; using Unity's -logFile destination.");
+            return;
+        }
         if (Application.isPlaying && Application.installMode != ApplicationInstallMode.Editor)
         {
             Debug.unityLogger.logHandler = new LogHandler();

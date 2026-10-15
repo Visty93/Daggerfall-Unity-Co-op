@@ -299,7 +299,7 @@ namespace DaggerfallWorkshop.Game
                     NetworkConnectionToClient hostConnection =
                         NetworkServer.localConnection as NetworkConnectionToClient;
 
-                    if (hostConnection != null && ni.connectionToClient != hostConnection)
+                    if (ni.connectionToClient != hostConnection)
                         return false;
                 }
 
