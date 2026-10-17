@@ -731,7 +731,9 @@ public class PlayerAssets : NetworkBehaviour
     // Paperdolls are a presentation preference on EACH viewer. The sender transmits
     // only an appearance description; no remote inventory or gameplay objects are touched.
     const string PaperdollPreferenceKey = "DFUCoop.RemotePaperdolls";
-    const int MaxSnapshotCharacters = 8192;
+    // A remote item now includes its template identity and resolved texture indices.
+    // Permit a full set of equipment without silently dropping long snapshots.
+    const int MaxSnapshotCharacters = 16384;
     const int MaxAppearanceItems = 64;
     const float AppearanceCheckSeconds = 0.55f;
     const float AppearanceUploadSeconds = 2.50f;
@@ -818,11 +820,39 @@ public class PlayerAssets : NetworkBehaviour
         public int slot;
         public int group;
         public int groupIndex;
+        // Template identity and resolved appearance are captured from the REAL equipped
+        // item. Modded equipment can use registered item subclasses and overrides;
+        // group + groupIndex alone is not sufficient to reconstruct those visuals.
+        public int templateIndex;
+        public string customTemplateName; // Only populated for custom templates.
+        public int playerTextureArchive;
+        public int inventoryTextureArchive;
+        public int inventoryTextureRecord;
         public int nativeMaterial;
         public int dye;
         public int variant;
         public int drawOrder;
         public int artifactIndex;
+    }
+
+    // If a locally reconstructed item has a different resolved texture (for
+    // example an item subclass has per-instance graphic state), draw the exact
+    // archive/record the sender used through DFU's normal local texture resolver.
+    // No bitmaps or mod files travel over the network.
+    sealed class RemotePaperdollTextureItem : DaggerfallUnityItem
+    {
+        readonly int appearanceArchive;
+        readonly int appearanceRecord;
+
+        public RemotePaperdollTextureItem(DaggerfallUnityItem item, int archive, int record)
+            : base(item)
+        {
+            appearanceArchive = archive;
+            appearanceRecord = record;
+        }
+
+        public override int InventoryTextureArchive { get { return appearanceArchive; } }
+        public override int InventoryTextureRecord { get { return appearanceRecord; } }
     }
 
     [Serializable]
@@ -847,6 +877,15 @@ public class PlayerAssets : NetworkBehaviour
     static readonly Dictionary<uint, PaperdollVisualSnapshot> receivedHumanAppearances =
         new Dictionary<uint, PaperdollVisualSnapshot>();
     static PaperDollRenderer sharedRemotePaperdollRenderer;
+    static readonly HashSet<string> warnedRemotePaperdollItems = new HashSet<string>();
+
+    static void WarnRemotePaperdollItemOnce(int group, int templateIndex, string reason)
+    {
+        string key = group + ":" + templateIndex + ":" + reason;
+        if (warnedRemotePaperdollItems.Add(key))
+            Debug.LogWarning("[PaperdollMP] Skipping incompatible remote equipment, group=" + group +
+                " template=" + templateIndex + " (" + reason + "). Check that both players have the same item mod/version.");
+    }
     string serverLatestAppearanceJson;
     int serverLatestAppearanceRevision;
     float serverNextAppearanceUpload;
@@ -930,6 +969,11 @@ public class PlayerAssets : NetworkBehaviour
             if (item == null || item.slot < 0 || item.slot >= MaxAppearanceItems ||
                 item.group < 0 || item.group > 1024 ||
                 item.groupIndex < 0 || item.groupIndex > 100000 ||
+                item.templateIndex < 0 || item.templateIndex > 100000 ||
+                (item.customTemplateName != null && item.customTemplateName.Length > 128) ||
+                item.playerTextureArchive < 0 || item.playerTextureArchive > 100000 ||
+                item.inventoryTextureArchive < 0 || item.inventoryTextureArchive > 100000 ||
+                item.inventoryTextureRecord < 0 || item.inventoryTextureRecord > 100000 ||
                 item.nativeMaterial < 0 || item.nativeMaterial > 10000 ||
                 item.dye < 0 || item.dye > 256 ||
                 item.variant < 0 || item.variant > 64 ||
@@ -962,6 +1006,7 @@ public class PlayerAssets : NetworkBehaviour
                     hash = hash * 31 + item.UID.GetHashCode();
                     hash = hash * 31 + (int)item.ItemGroup;
                     hash = hash * 31 + item.GroupIndex;
+                    hash = hash * 31 + item.PlayerTextureArchive;
                     hash = hash * 31 + item.nativeMaterialValue;
                     hash = hash * 31 + (int)item.dyeColor;
                     hash = hash * 31 + item.CurrentVariant;
@@ -1007,14 +1052,31 @@ public class PlayerAssets : NetworkBehaviour
         {
             DaggerfallUnityItem item = equipped[i];
             if (item == null) continue;
-            visualItems.Add(new PaperdollVisualItem {
-                slot = i, group = (int)item.ItemGroup,
-                groupIndex = item.GroupIndex,
-                nativeMaterial = item.nativeMaterialValue,
-                dye = (int)item.dyeColor, variant = item.CurrentVariant,
-                drawOrder = item.drawOrder,
-                artifactIndex = item.IsArtifact ? item.ArtifactIndexBitfield : 0,
-            });
+            try
+            {
+                // A modded item getter could fail while loading. Skip just that
+                // visual record, not the entire player's appearance snapshot.
+                int templateIndex = item.TemplateIndex;
+                visualItems.Add(new PaperdollVisualItem {
+                    slot = i, group = (int)item.ItemGroup,
+                    groupIndex = item.GroupIndex,
+                    templateIndex = templateIndex,
+                    customTemplateName = templateIndex > ItemHelper.LastDFTemplate
+                        ? item.ItemTemplate.name : null,
+                    playerTextureArchive = item.PlayerTextureArchive,
+                    inventoryTextureArchive = item.InventoryTextureArchive,
+                    inventoryTextureRecord = item.InventoryTextureRecord,
+                    nativeMaterial = item.nativeMaterialValue,
+                    dye = (int)item.dyeColor, variant = item.CurrentVariant,
+                    drawOrder = item.drawOrder,
+                    artifactIndex = item.IsArtifact ? item.ArtifactIndexBitfield : 0,
+                });
+            }
+            catch (Exception)
+            {
+                WarnRemotePaperdollItemOnce((int)item.ItemGroup, item.GroupIndex,
+                    "local item appearance could not be read");
+            }
         }
         snapshot.items = visualItems.ToArray();
         return snapshot;
@@ -1290,16 +1352,82 @@ public class PlayerAssets : NetworkBehaviour
             {
                 try
                 {
-                    // These objects are never equipped, placed in inventory, or sent to
-                    // gameplay systems. They only satisfy DFU's item-image resolver.
-                    DaggerfallUnityItem item = record.artifactIndex > 0 && (record.artifactIndex & 1) == 1
-                        ? new DaggerfallUnityItem(ItemGroups.Artifacts, record.artifactIndex >> 1)
-                        : new DaggerfallUnityItem((ItemGroups)record.group, record.groupIndex);
+                    // These are temporary, visual-only objects, never equipped,
+                    // added to inventory, or used in gameplay.
+                    ItemGroups itemGroup = (ItemGroups)record.group;
+                    bool custom = record.groupIndex > ItemHelper.LastDFTemplate ||
+                                  record.templateIndex > ItemHelper.LastDFTemplate;
+                    DaggerfallUnityItem item;
+                    if (record.artifactIndex > 0 && (record.artifactIndex & 1) == 1)
+                    {
+                        item = new DaggerfallUnityItem(ItemGroups.Artifacts, record.artifactIndex >> 1);
+                    }
+                    else if (custom)
+                    {
+                        // An older peer may not send templateIndex. Never reinterpret
+                        // its custom groupIndex as a base-game item.
+                        if (record.templateIndex <= ItemHelper.LastDFTemplate ||
+                            record.templateIndex != record.groupIndex)
+                        {
+                            WarnRemotePaperdollItemOnce(record.group, record.templateIndex, "missing custom template identity");
+                            continue;
+                        }
+
+                        // Unknown custom templates must be skipped, not silently
+                        // represented by another locally installed mod's equipment.
+                        var template = DaggerfallUnity.Instance.ItemHelper.GetItemTemplate(record.templateIndex);
+                        if (template.index != record.templateIndex ||
+                            string.IsNullOrEmpty(record.customTemplateName) ||
+                            !string.Equals(template.name, record.customTemplateName, StringComparison.Ordinal))
+                        {
+                            WarnRemotePaperdollItemOnce(record.group, record.templateIndex, "custom item not installed or different template");
+                            continue;
+                        }
+
+                        // DFU's factory invokes the locally registered custom item
+                        // subclass, preserving virtual inventory texture overrides.
+                        item = ItemBuilder.CreateItem(itemGroup, record.templateIndex);
+                        if (item == null || item.ItemGroup != itemGroup ||
+                            item.TemplateIndex != record.templateIndex)
+                        {
+                            WarnRemotePaperdollItemOnce(record.group, record.templateIndex, "custom constructor mismatch");
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        // Keep established vanilla/artifact behavior unchanged.
+                        item = new DaggerfallUnityItem(itemGroup, record.groupIndex);
+                        if (record.templateIndex > 0 && item.TemplateIndex != record.templateIndex)
+                        {
+                            WarnRemotePaperdollItemOnce(record.group, record.templateIndex, "base template mismatch");
+                            continue;
+                        }
+                    }
+
                     item.nativeMaterialValue = record.nativeMaterial;
                     item.dyeColor = (DyeColors)record.dye;
                     item.CurrentVariant = record.variant;
                     item.drawOrder = record.drawOrder;
                     item.EquipSlot = (EquipSlots)record.slot;
+
+                    // Body morphology (e.g. armor for different races/genders)
+                    // can be stored on the actual item, not just its template.
+                    if (record.playerTextureArchive != 0)
+                        item.PlayerTextureArchive = record.playerTextureArchive;
+
+                    // If a mod's per-item state changes the effective texture,
+                    // a newly constructed instance may choose the wrong picture.
+                    // Use the sender's resolved texture coordinates while still
+                    // loading artwork/texture replacements locally on the viewer.
+                    if ((record.inventoryTextureArchive != 0 || record.inventoryTextureRecord != 0) &&
+                        (item.InventoryTextureArchive != record.inventoryTextureArchive ||
+                         item.InventoryTextureRecord != record.inventoryTextureRecord))
+                    {
+                        item = new RemotePaperdollTextureItem(item,
+                            record.inventoryTextureArchive, record.inventoryTextureRecord);
+                        item.EquipSlot = (EquipSlots)record.slot;
+                    }
                     items.Add(item);
                 }
                 catch (Exception)

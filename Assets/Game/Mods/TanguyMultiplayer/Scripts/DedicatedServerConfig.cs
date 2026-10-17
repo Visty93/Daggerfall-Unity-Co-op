@@ -48,6 +48,9 @@ public sealed class DedicatedServerConfig
         public bool sendMessages = true;
         public bool mobileNpcSync = true;
         public bool partyTravelInsideDungeon = true;
+        // Entire world-container bridge: interiors, dungeons, generic exterior, WoD camps.
+        // Does NOT affect networked enemy corpses, quests, or player-dropped loot.
+        public bool worldContainerSync = true;
     }
 
     [Serializable]
@@ -149,6 +152,7 @@ public sealed class DedicatedServerConfig
     {
         Validate();
         OptionsMultiplayer.ApplyDedicatedSettings(this);
+        WorldContainerPolicy.SetDedicatedOption(multiplayer.worldContainerSync);
         DaggerfallUnity.Settings.SmallerDungeons = world.dungeonSize == "small";
     }
 }

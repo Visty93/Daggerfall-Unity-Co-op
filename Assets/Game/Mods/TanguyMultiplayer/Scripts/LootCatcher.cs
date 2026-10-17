@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -23,6 +23,9 @@ public class LootCatcher : NetworkBehaviour
     static uint nextServerLootId = 1;
     static readonly Dictionary<uint, string> serverLootItemsById = new Dictionary<uint, string>();
     static readonly Dictionary<uint, int> serverLootVersionById = new Dictionary<uint, int>();
+    // WorldContainerSync uses the EXISTING loot edit protocol with distinct server IDs.
+    // This set affects only newly registered world containers, never corpses or drops.
+    static readonly HashSet<uint> sessionWorldContainerIds = new HashSet<uint>();
     // Lifetime only. Each player-owned LootCatcher represents one connection.
     static readonly Dictionary<uint, HashSet<LootCatcher>> droppedLootReaders =
         new Dictionary<uint, HashSet<LootCatcher>>();
@@ -80,7 +83,7 @@ public class LootCatcher : NetworkBehaviour
     void DeleteEmptyClosedDrop(uint lootId)
     {
         string items;
-        if (lootEdits.ContainsKey(lootId) || HasDroppedLootReaders(lootId) ||
+        if (sessionWorldContainerIds.Contains(lootId) || lootEdits.ContainsKey(lootId) || HasDroppedLootReaders(lootId) ||
             !serverLootItemsById.TryGetValue(lootId, out items) ||
             !string.IsNullOrEmpty(items))
             return;
@@ -317,6 +320,88 @@ public class LootCatcher : NetworkBehaviour
     public void ApplyLootEditSnapshot(uint id, int version, string items)
     {
         ApplyReplaceLootContents(id, version, items);
+    }
+
+    // Session-world-container registration API. No changes to CmdBeginLootEdit,
+    // CmdCommitLootEdit, grants, commits, snapshots, or LootMultiplayer are necessary.
+    // Intentionally uses the same server dictionaries and network IDs as normal loot.
+    public static uint ServerRegisterWorldContainer(string contents)
+    {
+        if (!NetworkServer.active || nextServerLootId == 0 || nextServerLootId >= 0x80000000u)
+            return 0;
+        uint id = nextServerLootId++;
+        serverLootItemsById[id] = contents ?? string.Empty;
+        serverLootVersionById[id] = 0;
+        sessionWorldContainerIds.Add(id);
+        return id;
+    }
+
+    public static bool ServerReadWorldContainer(uint id, out int version, out string contents)
+    {
+        version = -1;
+        contents = null;
+        return NetworkServer.active && sessionWorldContainerIds.Contains(id) &&
+               serverLootVersionById.TryGetValue(id, out version) &&
+               serverLootItemsById.TryGetValue(id, out contents);
+    }
+
+    public static void ServerForgetWorldContainer(uint id)
+    {
+        if (!NetworkServer.active || !sessionWorldContainerIds.Remove(id)) return;
+        serverLootItemsById.Remove(id);
+        serverLootVersionById.Remove(id);
+        lootEdits.Remove(id);
+    }
+
+    public static void ServerForgetAllWorldContainers()
+    {
+        foreach (uint id in new List<uint>(sessionWorldContainerIds))
+        {
+            serverLootItemsById.Remove(id);
+            serverLootVersionById.Remove(id);
+            lootEdits.Remove(id);
+        }
+        sessionWorldContainerIds.Clear();
+    }
+
+    // Attach the existing LootMultiplayer to an ordinary, LOCAL non-networked
+    // container. The world bridge alone owns area/unload cleanup. Removing
+    // a terrain object must never send the usual dropped-pile deletion notice.
+    public static bool BindWorldContainer(uint id, int version, DaggerfallLoot loot, string contents)
+    {
+        if (!NetworkClient.active || id == 0 || IsCorpseLootId(id) || loot == null ||
+            (loot.ContainerType != LootContainerTypes.RandomTreasure &&
+             loot.ContainerType != LootContainerTypes.HouseContainers))
+            return false;
+        LootCatcher catcher = FindAnyUsableLootCatcher();
+        if (catcher == null) return false;
+        LootMultiplayer bound = loot.GetComponent<LootMultiplayer>();
+        if (bound != null && bound.lootId != 0 && bound.lootId != id) return false;
+        catcher.RegisterLocalLoot(id, version, loot, contents ?? string.Empty);
+        bound = loot.GetComponent<LootMultiplayer>();
+        if (bound != null) bound.SuppressRemovalNotification();
+        catcher.ApplyLootEditSnapshot(id, version, contents ?? string.Empty);
+        return true;
+    }
+
+    public static void UnbindWorldContainer(uint id, DaggerfallLoot loot)
+    {
+        if (id == 0 || IsCorpseLootId(id)) return;
+        DaggerfallLoot registered;
+        if (!localLootById.TryGetValue(id, out registered) ||
+            (registered != null && registered != loot)) return;
+        if (loot != null)
+        {
+            var sync = loot.GetComponent<LootMultiplayer>();
+            if (sync != null && sync.lootId == id)
+            {
+                sync.SuppressRemovalNotification();
+                UnityEngine.Object.Destroy(sync);
+            }
+        }
+        localLootById.Remove(id);
+        localLootItemsById.Remove(id);
+        localLootVersionById.Remove(id);
     }
 
     void ReleaseDisconnectedEdits()

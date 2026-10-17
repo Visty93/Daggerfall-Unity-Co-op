@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -677,6 +677,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 lootTargetStartCount = remoteItems.Count;
                 lootTarget.OnInventoryOpen();
                 LootMultiplayer.InventoryOpened(lootTarget);
+                WorldContainerSync.InventoryOpened(lootTarget);
                 if (lootTarget.playerOwned && lootTarget.TextureArchive > 0)
                 {
                     dropIconArchive = lootTarget.TextureArchive;
@@ -787,6 +788,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             {
                 // Remove loot container if empty
                 bool networkOwnsCleanup = LootMultiplayer.InventoryClosed(lootTarget);
+                WorldContainerSync.InventoryClosed(lootTarget);
                 if (lootTarget.Items.Count == 0 && !networkOwnsCleanup)
                     GameObjectHelper.RemoveLootContainer(lootTarget);
 

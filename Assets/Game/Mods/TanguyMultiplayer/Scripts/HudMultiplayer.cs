@@ -1,4 +1,4 @@
-using System.Collections;
+﻿using System.Collections;
 using UnityEngine;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.UserInterface;
@@ -45,6 +45,11 @@ public class HudMultiplayer : MonoBehaviour
     GameObject hostQuestDefaultsLauncher;
     GameObject hostQuestDefaultsPanel;
     GameObject hostQuestDefaultsModeButton;
+    // Extensible Loot settings submenu. The only setting currently available
+    // is world-container synchronization. Do not add standalone UI components.
+    GameObject lootLauncher;
+    GameObject lootPanel;
+    GameObject worldContainerSyncButton;
     const string HostQuestDefaultMigrationPref = "DFUCoop.QuestSync.HostDefaultVisibleV1";
     Text respawnAccessLabel;
     UnityEngine.UI.Button respawnDefaultsButton;
@@ -67,6 +72,7 @@ public class HudMultiplayer : MonoBehaviour
         BuildRespawnSettings();
         BuildPaperdollDisplaySetting();
         BuildHostQuestDefaultsSetting();
+        BuildLootSettings();
         RefreshLegacyOptionsAvailability();
         FitOptionsPanelToCanvas();
         StartCoroutine(Check());
@@ -101,6 +107,7 @@ public class HudMultiplayer : MonoBehaviour
             RefreshLegacyOptionsAvailability();
             RefreshPaperdollDisplaySetting();
             RefreshHostQuestDefaultsSetting();
+            RefreshLootSettings();
             if (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf)
                 RefreshRespawnSettings();
             bool sessionActive = NetworkServer.active || NetworkClient.active ||
@@ -316,6 +323,112 @@ public class HudMultiplayer : MonoBehaviour
         });
         SetButtonText(defaults, "Restore defaults");
         respawnSettingsPanel.SetActive(false);
+    }
+
+    // Submenu deliberately lives in HudMultiplayer, beside the existing
+    // Respawn/Travel and Paperdoll submenus. The launcher is always available,
+    // including on clients, so the active policy can be read without changing it.
+    // Compact, host-controlled loot submenu. One setting for now; more can be
+    // added here later without a separate UI component or a prefab change.
+    void BuildLootSettings()
+    {
+        if (options == null || existingOptionsPanel == null || canvas == null)
+            return;
+
+        Transform parent = existingOptionsPanel.transform;
+        lootLauncher = Instantiate(options, parent);
+        lootLauncher.name = "Loot settings";
+        lootLauncher.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
+        var launchRect = lootLauncher.GetComponent<RectTransform>();
+        if (launchRect != null) launchRect.sizeDelta = new Vector2(220, 40);
+        var launchButton = lootLauncher.GetComponent<UnityEngine.UI.Button>();
+        if (launchButton != null)
+        {
+            launchButton.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
+            launchButton.onClick.AddListener(OpenLootSettings);
+        }
+        SetButtonText(lootLauncher, "Loot settings...");
+        lootLauncher.SetActive(true);
+
+        RectTransform panel = SettingsRect("Loot settings panel", canvas.transform,
+            new Vector2(480, 230), Vector2.zero);
+        panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
+        panel.gameObject.AddComponent<UnityEngine.UI.Image>().color =
+            new Color(0.08f, 0.08f, 0.08f, 0.98f);
+        lootPanel = panel.gameObject;
+
+        SettingsText(panel, "Loot settings", new Vector2(440, 30),
+            new Vector2(0, -12), 19);
+
+        worldContainerSyncButton = CreateAppearanceOptionButton(panel,
+            "Container inventory sync selector", "Container loot sync: On", -60f,
+            ToggleWorldContainerSync);
+        var toggleRect = worldContainerSyncButton != null
+            ? worldContainerSyncButton.GetComponent<RectTransform>() : null;
+        if (toggleRect != null) toggleRect.sizeDelta = new Vector2(325, 38);
+
+        // Brief player-facing summary of the container sync scope.
+        SettingsText(panel,
+            "Synchronizes interior containers and dungeon/exterior\n" +
+            "loot piles. Enemy corpse loot, quest items, and shop\n" +
+            "offers are unaffected.",
+            new Vector2(450, 69), new Vector2(0, -111), 13);
+
+        GameObject back = CreateAppearanceOptionButton(panel,
+            "Back from loot settings", "Back", -185f,
+            CloseLootSettings);
+        var backRect = back != null ? back.GetComponent<RectTransform>() : null;
+        if (backRect != null) backRect.sizeDelta = new Vector2(125, 34);
+        lootPanel.SetActive(false);
+        RefreshLootSettings();
+    }
+
+    bool CanEditWorldContainerOption()
+    {
+        return PlayerMultiplayer.state == 0 && !NetworkServer.active &&
+            !NetworkClient.active && !NetworkClient.isConnected;
+    }
+
+    void RefreshLootSettings()
+    {
+        if (worldContainerSyncButton == null) return;
+        bool editable = CanEditWorldContainerOption();
+        SetButtonText(worldContainerSyncButton,
+            "Container loot sync: " + (WorldContainerPolicy.Enabled ? "On" : "Off"));
+        var button = worldContainerSyncButton.GetComponent<UnityEngine.UI.Button>();
+        if (button != null) button.interactable = editable;
+    }
+
+    void OpenLootSettings()
+    {
+        if (lootPanel == null || existingOptionsPanel == null) return;
+        RefreshLootSettings();
+        existingOptionsPanel.SetActive(false);
+        lootPanel.SetActive(true);
+        lootPanel.transform.SetAsLastSibling();
+        RectTransform canvasRect = canvas != null ? canvas.GetComponent<RectTransform>() : null;
+        if (canvasRect != null)
+        {
+            // Keep this much smaller than the existing full-size settings menus.
+            float scale = Mathf.Min(0.8f,
+                Mathf.Min(canvasRect.rect.width / 510f, canvasRect.rect.height / 265f));
+            lootPanel.transform.localScale = Vector3.one * scale;
+        }
+    }
+
+    void CloseLootSettings()
+    {
+        if (lootPanel != null) lootPanel.SetActive(false);
+        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(true);
+        FitOptionsPanelToCanvas();
+    }
+
+    void ToggleWorldContainerSync()
+    {
+        // Server setting is chosen before connecting, never changed mid-session.
+        if (!CanEditWorldContainerOption()) return;
+        WorldContainerPolicy.SetLocalPreference(!WorldContainerPolicy.Enabled);
+        RefreshLootSettings();
     }
 
     // One-time migration: the old pre-connection quest mode selector was removed,
@@ -574,10 +687,12 @@ public class HudMultiplayer : MonoBehaviour
         // Options panel here: it starts inactive and is opened by its own button.
         bool wasInSubmenu = (paperdollSettingsPanel != null && paperdollSettingsPanel.activeSelf) ||
             (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf) ||
-            (hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf);
+            (hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf) ||
+            (lootPanel != null && lootPanel.activeSelf);
         if (paperdollSettingsPanel != null) paperdollSettingsPanel.SetActive(false);
         if (respawnSettingsPanel != null) respawnSettingsPanel.SetActive(false);
         if (hostQuestDefaultsPanel != null) hostQuestDefaultsPanel.SetActive(false);
+        if (lootPanel != null) lootPanel.SetActive(false);
         if (wasInSubmenu && existingOptionsPanel != null)
             existingOptionsPanel.SetActive(false);
     }

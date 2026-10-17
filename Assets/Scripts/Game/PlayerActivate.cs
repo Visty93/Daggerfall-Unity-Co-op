@@ -1031,6 +1031,15 @@ namespace DaggerfallWorkshop.Game
                 return;
             }
             Random.InitState(Time.frameCount);
+            // Only RandomTreasure / HouseContainers in an MP area are handled.
+            // CorpseMarker and DroppedLoot bypass WorldContainerSync entirely.
+            if ((loot.ContainerType == LootContainerTypes.RandomTreasure ||
+                 loot.ContainerType == LootContainerTypes.HouseContainers) &&
+                !global::WorldContainerSync.AllowActivate(loot, () =>
+                    OnLootSpawned?.Invoke(this, new ContainerLootSpawnedEventArgs {
+                        ContainerType = loot.ContainerType, Loot = loot.Items }),
+                    () => ActivateLootContainer(hit, loot)))
+                return;
             UserInterfaceManager uiManager = DaggerfallUI.Instance.UserInterfaceManager;
             switch (loot.ContainerType)
             {
@@ -1066,7 +1075,10 @@ namespace DaggerfallWorkshop.Game
                         break;
                     }
                     // Stock house container on first access
-                    if (loot.stockedDate < DaggerfallLoot.CreateStockedDate(DaggerfallUnity.Instance.WorldTime.Now))
+                    // World-container snapshots already have their shared stocking state.
+                    // Vanilla/SP furniture keeps the original stock-on-open path.
+                    if (!global::WorldContainerSync.IsBound(loot) &&
+                        loot.stockedDate < DaggerfallLoot.CreateStockedDate(DaggerfallUnity.Instance.WorldTime.Now))
                     {
                         loot.StockHouseContainer(playerEnterExit.BuildingDiscoveryData);
                         OnLootSpawned?.Invoke(this, new ContainerLootSpawnedEventArgs { ContainerType = loot.ContainerType, Loot = loot.Items });
