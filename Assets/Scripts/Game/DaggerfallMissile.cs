@@ -154,6 +154,38 @@ namespace DaggerfallWorkshop.Game
         /// </summary>
         public bool VisualOnly { get; set; }
 
+        // Network enemy projectiles have one simulator. Observers have cosmetics only;
+        // actual impacts are delivered as events independent of sprite animation.
+        public bool OwnerDrivenEnemyProjectile { get; set; }
+        public bool OwnerDrivenEnemyVisual { get; set; }
+        private global::DynamicEnemyAuthority presentationAuthority;
+        public System.Func<bool> OwnerSimulationValid { get; set; }
+        public System.Action<DaggerfallEntityBehaviour> OwnerImpact { get; set; }
+
+        public static DaggerfallEntityBehaviour ResolveEnemyCombatVictim(DaggerfallEntityBehaviour victim)
+        {
+            if (victim == null) return null;
+            if (GameManager.Instance != null && victim == GameManager.Instance.PlayerEntityBehaviour &&
+                (Mirror.NetworkClient.active || Mirror.NetworkServer.active))
+            {
+                global::PlayerMultiplayer local = global::PlayerMultiplayer.GetLocalPlayer();
+                return local != null ? local.GetComponent<DaggerfallEntityBehaviour>() : null;
+            }
+            global::PlayerMultiplayer shell = victim.GetComponentInParent<global::PlayerMultiplayer>();
+            return shell != null ? shell.GetComponent<DaggerfallEntityBehaviour>() : victim;
+        }
+
+        public void GetOwnerLaunchAim(out Vector3 position, out Vector3 aim)
+        {
+            // Called before Start(), so obtain the senses reference explicitly.
+            if (caster != null) enemySenses = caster.GetComponent<EnemySenses>();
+            position = GetAimPosition();
+            aim = GetAimDirection();
+            if (aim.sqrMagnitude < 0.0001f) aim = caster != null ? caster.transform.forward : Vector3.forward;
+            aim.Normalize();
+        }
+
+
         /// <summary>
         /// Local-player-only payload missiles are used on the owning client for enemy
         /// spells aimed at that client. They can assign payloads only to the local
@@ -187,6 +219,20 @@ namespace DaggerfallWorkshop.Game
 
         private void Start()
         {
+            if (OwnerDrivenEnemyVisual && caster != null)
+            {
+                presentationAuthority = caster.GetComponent<global::DynamicEnemyAuthority>();
+                if (presentationAuthority != null && presentationAuthority.IsLocalPresentationSuspended)
+                {
+                    Destroy(gameObject);
+                    return;
+                }
+            }
+            if (OwnerDrivenEnemyProjectile && (OwnerSimulationValid == null || !OwnerSimulationValid()))
+            {
+                Destroy(gameObject);
+                return;
+            }
             // Setup light and shadows
             myLight = GetComponent<Light>();
             myLight.enabled = EnableLight;
@@ -229,6 +275,13 @@ namespace DaggerfallWorkshop.Game
                 UseSpellBillboardAnims();
             }
 
+            if (VisualOnly && elementType != ElementTypes.None &&
+                (targetType == TargetTypes.ByTouch || targetType == TargetTypes.AreaAroundCaster))
+            {
+                UseSpellBillboardAnims(1, true);
+                myBillboard.FramesPerSecond = ImpactBillboardFramesPerSecond;
+            }
+
             // Setup senses
             if (caster && caster != GameManager.Instance.PlayerEntityBehaviour)
             {
@@ -249,7 +302,7 @@ namespace DaggerfallWorkshop.Game
                 // Network observer arrows already receive an explicit eye-level custom
                 // origin, so do not add the normal player/enemy model offset a second time.
                 Vector3 adjust;
-                if (VisualOnly && CustomAimPosition != Vector3.zero)
+                if (VisualOnly && !OwnerDrivenEnemyVisual && CustomAimPosition != Vector3.zero)
                 {
                     adjust = Vector3.zero;
                 }
@@ -288,7 +341,7 @@ namespace DaggerfallWorkshop.Game
             // trigger so they can still play an impact animation, but disable solid mesh collision.
             if (VisualOnly)
                 MakeVisualOnlyCollisionSafe();
-            else if (LocalPlayerOnlyPayload)
+            else if (LocalPlayerOnlyPayload || OwnerDrivenEnemyProjectile)
                 MakeLocalPlayerOnlyCollisionSafe();
         }
 
@@ -374,8 +427,21 @@ namespace DaggerfallWorkshop.Game
                     continue;
                 }
 
-                if (col is MeshCollider)
-                    col.enabled = false;
+                MeshCollider mesh = col as MeshCollider;
+                if (mesh != null)
+                {
+                    // The arrow model's collider is its actual hitbox (offset from
+                    // the missile root). Keep it for the one gameplay simulator.
+                    // Disabling every mesh here made owner arrows cosmetic too.
+                    bool ownerArrowHitbox = OwnerDrivenEnemyProjectile && isArrow &&
+                        goModel != null && mesh.gameObject == goModel;
+                    if (ownerArrowHitbox)
+                    {
+                        mesh.convex = true;
+                        mesh.isTrigger = true;
+                    }
+                    mesh.enabled = ownerArrowHitbox;
+                }
             }
         }
 
@@ -388,6 +454,9 @@ namespace DaggerfallWorkshop.Game
         {
             if (candidate == null)
                 return null;
+
+            if (OwnerDrivenEnemyProjectile)
+                return ResolveEnemyCombatVictim(candidate);
 
             DaggerfallEntityBehaviour localPlayer = GetLocalPlayerEntityBehaviour();
 
@@ -422,7 +491,7 @@ namespace DaggerfallWorkshop.Game
         {
             // Keep arrow hit entities separate from spell payload resolution. The
             // final bow check handles the local SP/MP identity pair explicitly.
-            DaggerfallEntityBehaviour payloadTarget = isArrow ? candidate : ResolvePayloadTarget(candidate);
+            DaggerfallEntityBehaviour payloadTarget = isArrow && !OwnerDrivenEnemyProjectile ? candidate : ResolvePayloadTarget(candidate);
             if (payloadTarget == null || payloadTarget == caster || targetEntities.Contains(payloadTarget))
                 return false;
 
@@ -441,6 +510,16 @@ namespace DaggerfallWorkshop.Game
 
         private void Update()
         {
+            if (OwnerDrivenEnemyVisual && presentationAuthority != null && presentationAuthority.IsLocalPresentationSuspended)
+            {
+                Destroy(gameObject);
+                return;
+            }
+            if (OwnerDrivenEnemyProjectile && (OwnerSimulationValid == null || !OwnerSimulationValid()))
+            {
+                Destroy(gameObject); // In-flight attacks cancel on ownership loss.
+                return;
+            }
             // Execute based on target type
             if (!missileReleased)
             {
@@ -479,7 +558,7 @@ namespace DaggerfallWorkshop.Game
                 if (!impactAssigned)
                 {
                     PlayImpactSound();
-                    RaiseOnCompleteEvent();
+                    if (!OwnerDrivenEnemyVisual) RaiseOnCompleteEvent();
                     if (!isArrow)
                         AssignPayloadToTargets();
                     impactAssigned = true;
@@ -522,6 +601,11 @@ namespace DaggerfallWorkshop.Game
 
         void DoCollision(Collision collision, Collider other)
         {
+            if (OwnerDrivenEnemyProjectile && (OwnerSimulationValid == null || !OwnerSimulationValid()))
+            {
+                Destroy(gameObject);
+                return;
+            }
             // Missile collision should only happen once
             if (impactDetected)
                 return;
@@ -530,6 +614,13 @@ namespace DaggerfallWorkshop.Game
             // should pass through enemy / remote-player colliders and only stop for
             // the local PlayerAdvanced or world geometry.
             DaggerfallEntityBehaviour entityBehaviour = GetEntityBehaviourFromHit(collision, other);
+            if (OwnerDrivenEnemyProjectile)
+            {
+                global::PlayerMultiplayer shell = other != null ?
+                    other.GetComponentInParent<global::PlayerMultiplayer>() :
+                    (collision != null ? collision.gameObject.GetComponentInParent<global::PlayerMultiplayer>() : null);
+                if (shell != null) entityBehaviour = shell.GetComponent<DaggerfallEntityBehaviour>();
+            }
             if (LocalPlayerOnlyPayload && entityBehaviour != null && ResolvePayloadTarget(entityBehaviour) == null)
                 return;
 
@@ -539,7 +630,7 @@ namespace DaggerfallWorkshop.Game
             // Always suppress normal payload assignment to the fake shell, otherwise
             // hostile/non-friendly effects could affect only the visual enemy child.
             global::PlayerMultiplayer playerTarget = null;
-            bool hitPlayerMultiplayer = !VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
+            bool hitPlayerMultiplayer = !OwnerDrivenEnemyProjectile && !VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
                 global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerFromHit(collision, other, out playerTarget);
             if (hitPlayerMultiplayer)
             {
@@ -583,7 +674,12 @@ namespace DaggerfallWorkshop.Game
 
             if (isArrow)
             {
-                if (other != null)
+                if (OwnerDrivenEnemyProjectile)
+                {
+                    if (targetEntities.Count > 0 && OwnerImpact != null)
+                        OwnerImpact(targetEntities[0]);
+                }
+                else if (other != null)
                     AssignBowDamageToTarget(other);
 
                 // Destroy 3d arrow
@@ -622,6 +718,15 @@ namespace DaggerfallWorkshop.Game
         // Touch can hit a single target at close range
         void DoTouch()
         {
+            if (VisualOnly)
+            {
+                transform.position = CustomAimPosition != Vector3.zero ? CustomAimPosition :
+                    (caster != null ? caster.transform.position : transform.position);
+                if (myCollider) myCollider.enabled = false;
+                missileReleased = true;
+                impactDetected = true;
+                return;
+            }
             transform.position = caster.transform.position;
 
             // Touch does not use default missile collider
@@ -634,7 +739,7 @@ namespace DaggerfallWorkshop.Game
             bool foundPlayerMultiplayerTarget = false;
 
             global::PlayerMultiplayer playerTarget = null;
-            if (!VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
+            if (!OwnerDrivenEnemyProjectile && !VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
                 global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerTargetInTouchRange(touchAimPosition, touchAimDirection, out playerTarget))
             {
                 foundPlayerMultiplayerTarget = true;
@@ -644,6 +749,14 @@ namespace DaggerfallWorkshop.Game
                     impactPosition += controller.center;
 
                 global::PlayerSpellMultiplayerBridge.TryForwardLocalFriendlyPlayerSpell(payload, playerTarget, impactPosition, "touch");
+            }
+
+            if (OwnerDrivenEnemyProjectile &&
+                global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerTargetInTouchRange(
+                    touchAimPosition, touchAimDirection, out playerTarget) && playerTarget != null)
+            {
+                foundPlayerMultiplayerTarget = true;
+                TryAddPayloadTarget(playerTarget.GetComponent<DaggerfallEntityBehaviour>());
             }
 
             // If the touch hit a PlayerMultiplayer shell, never fall through to the
@@ -675,6 +788,13 @@ namespace DaggerfallWorkshop.Game
         // AOE can strike any number of targets within range with an option to exclude caster
         void DoAreaOfEffect(Vector3 position, bool ignoreCaster = false)
         {
+            if (VisualOnly)
+            {
+                transform.position = position;
+                impactDetected = true;
+                missileReleased = true;
+                return;
+            }
             List<DaggerfallEntityBehaviour> entities = new List<DaggerfallEntityBehaviour>();
 
             transform.position = position;
@@ -685,7 +805,7 @@ namespace DaggerfallWorkshop.Game
             for (int i = 0; i < overlaps.Length; i++)
             {
                 global::PlayerMultiplayer playerTarget = null;
-                if (!VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
+                if (!OwnerDrivenEnemyProjectile && !VisualOnly && !LocalPlayerOnlyPayload && !isArrow &&
                     global::PlayerSpellMultiplayerBridge.TryGetPlayerMultiplayerFromCollider(overlaps[i], out playerTarget) &&
                     playerTarget != null && playerTarget.netId != 0 && !forwardedPlayerTargets.Contains(playerTarget.netId))
                 {
@@ -700,6 +820,11 @@ namespace DaggerfallWorkshop.Game
                 }
 
                 DaggerfallEntityBehaviour aoeEntity = overlaps[i].GetComponentInParent<DaggerfallEntityBehaviour>();
+                if (OwnerDrivenEnemyProjectile)
+                {
+                    global::PlayerMultiplayer shell = overlaps[i].GetComponentInParent<global::PlayerMultiplayer>();
+                    if (shell != null) aoeEntity = shell.GetComponent<DaggerfallEntityBehaviour>();
+                }
 
                 if (ignoreCaster && aoeEntity == caster)
                     continue;
@@ -829,6 +954,13 @@ namespace DaggerfallWorkshop.Game
             if (VisualOnly)
                 return;
 
+            if (OwnerDrivenEnemyProjectile)
+            {
+                if (OwnerImpact != null)
+                    foreach (DaggerfallEntityBehaviour victim in targetEntities)
+                        OwnerImpact(victim);
+                return; // The receiving authority applies the spell once.
+            }
             if (payload == null || targetEntities.Count == 0)
                 return;
 

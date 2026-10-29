@@ -361,7 +361,10 @@ public override void Update(DaggerfallEntityBehaviour sender)
             }
 
             // Generate loot table items
-            DaggerfallLoot.GenerateItems(mobileEnemy.LootTableKey, items);
+            using (SetupDemoEnemy.BeginEnemyLootGeneration(this, levelOverride))
+            {
+                DaggerfallLoot.GenerateItems(mobileEnemy.LootTableKey, items);
+            }
 
             // Enemy classes and some monsters use equipment
             if (careerIndex == (int)MonsterCareers.Orc || careerIndex == (int)MonsterCareers.OrcShaman)

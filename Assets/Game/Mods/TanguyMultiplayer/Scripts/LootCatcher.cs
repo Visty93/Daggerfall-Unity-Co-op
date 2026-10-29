@@ -514,6 +514,565 @@ public class LootCatcher : NetworkBehaviour
 
         string authoritativeItems = SerializeLootItems(corpseLoot);
         catcher.ServerPublishCorpseLoot(corpseLootId, corpseLoot, authoritativeItems);
+        CaptureCorpse(enemy, corpseLootId, corpseLoot);
+    }
+
+    // Appearance/location only. Inventory remains in the existing authoritative ledger.
+    public struct CorpseAppearance
+    {
+        public uint id;
+        public ulong sequence;
+        public string area; // D:instance, B:region/location/key, or E (DF world coordinates)
+        public Vector3 localPosition;
+        public double worldX, worldZ;
+        public float exteriorY;
+        public float groundProbeY;
+        public int mapPixelX, mapPixelY;
+        public int archive, record;
+        public ulong loadId;
+        public string entityName;
+        public bool isEnemyClass;
+    }
+    sealed class CorpseLedger
+    {
+        public DaggerfallDungeon dungeon; // only dungeon lifetime depends on this Unity object
+        public readonly List<CorpseAppearance> corpses = new List<CorpseAppearance>();
+    }
+    sealed class PendingCorpse
+    {
+        public CorpseAppearance appearance;
+        public int version;
+        public string items;
+    }
+    // Exterior buckets are 409.6 Unity units wide, expressed in DF world units.
+    // A 225-unit query touches at most 3x3 buckets; no scan of all world corpses.
+    const double CorpseCellDF = 16384.0;
+    const double CorpseReplayRadiusDF = 225.0 * 40.0;
+    static readonly Dictionary<string, CorpseLedger> corpseLedgers = new Dictionary<string, CorpseLedger>();
+    static readonly HashSet<uint> capturedCorpseIds = new HashSet<uint>();
+    static ulong corpseSequence;
+    static readonly HashSet<uint> retiredCorpseIds = new HashSet<uint>();
+    static readonly Dictionary<string, float> emptyCorpsePixels = new Dictionary<string, float>();
+    static float nextCorpseCleanup;
+
+    readonly Queue<PendingCorpse> pendingCorpses = new Queue<PendingCorpse>();
+    string replayArea;
+    Transform replayRoot;
+    int replayWorldX, replayWorldZ;
+    uint replayRequest;
+    ulong replayCursor;
+    bool replayWaiting;
+    float replayNextRequest, replayDeadline, serverNextCorpseRequest;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+    static void InstallCorpseReplayReset()
+    {
+        Mirror.NetworkManager.SessionStopped -= ResetCorpseReplaySession;
+        Mirror.NetworkManager.SessionStopped += ResetCorpseReplaySession;
+    }
+    static void ResetCorpseReplaySession()
+    {
+        corpseLedgers.Clear(); capturedCorpseIds.Clear(); retiredCorpseIds.Clear(); emptyCorpsePixels.Clear(); nextCorpseCleanup = 0; corpseSequence = 0;
+        currentCorpseAreaFrame = -1; cachedCorpseArea = null; cachedCorpseRoot = null;
+        // Enemy IDs can be reused in a new session. Other container types are untouched.
+        foreach (uint id in new List<uint>(localLootById.Keys))
+            if (IsCorpseLootId(id)) localLootById.Remove(id);
+        foreach (uint id in new List<uint>(localLootItemsById.Keys))
+            if (IsCorpseLootId(id)) localLootItemsById.Remove(id);
+        foreach (uint id in new List<uint>(localLootVersionById.Keys))
+            if (IsCorpseLootId(id)) localLootVersionById.Remove(id);
+        foreach (uint id in new List<uint>(serverLootItemsById.Keys))
+            if (IsCorpseLootId(id)) serverLootItemsById.Remove(id);
+        foreach (uint id in new List<uint>(serverLootVersionById.Keys))
+            if (IsCorpseLootId(id)) serverLootVersionById.Remove(id);
+        pendingCorpseItemsById.Clear(); pendingCorpseVersionById.Clear();
+        serverPendingUnknownCorpseItemsById.Clear(); clientInitializedCorpses.Clear();
+    }
+    static string CorpseLocationText(string value)
+    {
+        value = (value ?? string.Empty).Trim();
+        return value.Length <= 96 ? value : value.Substring(0, 96);
+    }
+    public static string CorpseBuildingArea(string region, string location, int key)
+    {
+        if (key == 0 || string.IsNullOrEmpty(region) || string.IsNullOrEmpty(location)) return null;
+        // Lengths delimit names rather than relying on a character not occurring in them.
+        region = CorpseLocationText(region); location = CorpseLocationText(location);
+        return "B:" + region.Length + ":" + region + location.Length + ":" + location + ":" + key;
+    }
+    static int currentCorpseAreaFrame = -1;
+    static string cachedCorpseArea;
+    static Transform cachedCorpseRoot;
+    public static string CurrentCorpseArea(out Transform root)
+    {
+        // Every corpse culler can share the local context lookup in this frame.
+        if (currentCorpseAreaFrame != Time.frameCount)
+        {
+            cachedCorpseArea = ComputeCurrentCorpseArea(out cachedCorpseRoot);
+            currentCorpseAreaFrame = Time.frameCount;
+        }
+        root = cachedCorpseRoot;
+        return cachedCorpseArea;
+    }
+    static string ComputeCurrentCorpseArea(out Transform root)
+    {
+        root = null;
+        try
+        {
+        var game = GameManager.Instance;
+        var enter = game != null ? game.PlayerEnterExit : null;
+        if (enter == null || game.PlayerGPS == null || game.PlayerObject == null) return null;
+        if (enter.IsPlayerInsideDungeon)
+        {
+            var dungeon = enter.Dungeon;
+            if (dungeon == null || !dungeon.isSet || string.IsNullOrEmpty(dungeon.DungeonInstanceId)) return null;
+            root = dungeon.transform;
+            return "D:" + dungeon.DungeonInstanceId;
+        }
+        if (enter.IsPlayerInsideBuilding)
+        {
+            if (enter.Interior == null) return null;
+            int key = enter.BuildingDiscoveryData.buildingKey;
+            if (key == 0) key = enter.Interior.EntryDoor.buildingKey;
+            var gps = game.PlayerGPS;
+            string region = gps.CurrentLocalizedRegionName;
+            if (string.IsNullOrEmpty(region)) region = gps.CurrentRegionName;
+            string location = gps.CurrentLocalizedLocationName;
+            if (string.IsNullOrEmpty(location) && gps.HasCurrentLocation) location = gps.CurrentLocation.Name;
+            root = enter.Interior.transform;
+            return CorpseBuildingArea(region, location, key);
+        }
+        root = game.StreamingTarget != null ? game.StreamingTarget.transform : null;
+        return root != null ? "E" : null;
+        }
+        catch
+        {
+            // PlayerGPS/building discovery can be between locations during loading.
+            // Retry next frame; do not terminate the replay coroutine permanently.
+            root = null;
+            return null;
+        }
+    }
+    static string ServerCorpseArea(PositionMultiplayer position)
+    {
+        if (position == null || !position.EnemyInterestLocationKnown) return null;
+        switch (position.EnemyInterestState)
+        {
+            case PositionMultiplayer.PartyLocationState.DungeonInterior:
+                return string.IsNullOrEmpty(position.EnemyInterestDungeonId) ? null : "D:" + position.EnemyInterestDungeonId;
+            case PositionMultiplayer.PartyLocationState.BuildingInterior:
+                return CorpseBuildingArea(position.EnemyInterestRegion, position.EnemyInterestLocation, position.EnemyInterestBuildingKey);
+            case PositionMultiplayer.PartyLocationState.Wilderness:
+            case PositionMultiplayer.PartyLocationState.ExteriorLocation: return "E";
+            default: return null;
+        }
+    }
+    static string CorpseCellKey(int x, int z) { return "E:" + x + ":" + z; }
+    static string CorpseCellKey(double x, double z)
+    { return CorpseCellKey((int)Math.Floor(x / CorpseCellDF), (int)Math.Floor(z / CorpseCellDF)); }
+
+    // Unity 2019 FindObjectsOfType omits inactive hierarchies. The host retains
+    // remote layouts beneath disabled area parents, so corpse recording must include
+    // them. Filter out prefab/assets: only components in loaded scenes are eligible.
+    // Called on corpse capture/failure only, never from the replay polling loop.
+    static IEnumerable<T> FindLoadedCorpseLayouts<T>() where T : Component
+    {
+        foreach (T candidate in Resources.FindObjectsOfTypeAll<T>())
+            if (candidate != null && candidate.gameObject.scene.IsValid() && candidate.gameObject.scene.isLoaded)
+                yield return candidate;
+    }
+
+    static string DescribeLoadedCorpseLayouts(string area)
+    {
+        var entries = new List<string>();
+        if (area.StartsWith("D:", StringComparison.Ordinal))
+        {
+            foreach (var layout in FindLoadedCorpseLayouts<DaggerfallDungeon>())
+                entries.Add("D:" + layout.DungeonInstanceId + " active=" + layout.gameObject.activeInHierarchy);
+        }
+        else
+        {
+            foreach (var layout in FindLoadedCorpseLayouts<DaggerfallInteriorNetwork>())
+                entries.Add(CorpseBuildingArea(layout.regionName, layout.locationName, layout.buildingKey) +
+                    " active=" + layout.gameObject.activeInHierarchy +
+                    " hasLayout=" + (layout.GetComponentInChildren<DaggerfallInterior>(true) != null));
+        }
+        return entries.Count == 0 ? "<none>" : string.Join("; ", entries.ToArray());
+    }
+
+    static void CaptureCorpse(GameObject enemy, uint id, DaggerfallLoot loot)
+    {
+        if (!NetworkServer.active || enemy == null || loot == null || capturedCorpseIds.Contains(id) || retiredCorpseIds.Contains(id)) return;
+        var world = enemy.GetComponent<EnemyWorldPosition>();
+        if (world == null) return;
+        string area;
+        Transform root = null;
+        DaggerfallDungeon dungeon = null;
+        if (!string.IsNullOrEmpty(world.PresentationDungeonInstanceId))
+        {
+            area = "D:" + world.PresentationDungeonInstanceId;
+            CorpseLedger known;
+            if (corpseLedgers.TryGetValue(area, out known)) dungeon = known.dungeon;
+            if (dungeon == null)
+                foreach (var candidate in FindLoadedCorpseLayouts<DaggerfallDungeon>())
+                    if (candidate.DungeonInstanceId == world.PresentationDungeonInstanceId) { dungeon = candidate; break; }
+            if (dungeon != null) root = dungeon.transform;
+        }
+        else if (world.isDungeonSpawn) return; // never misclassify an unstamped dungeon as exterior
+        else if (world.isInteriorSpawn)
+        {
+            int key = world.PresentationBuildingKey;
+            string region = world.PresentationRegionName, location = world.PresentationLocationName;
+            // Existing older enemy stamps can be empty when party location sharing was off.
+            // Recover only from an owner/requester which is still inside a building.
+            if (key == 0)
+            {
+                var identity = enemy.GetComponent<NetworkIdentity>();
+                NetworkIdentity player = identity != null && identity.connectionToClient != null
+                    ? identity.connectionToClient.identity : null;
+                if (player == null && world.requesterNetId != 0)
+                    NetworkServer.spawned.TryGetValue(world.requesterNetId, out player);
+                var position = player != null ? player.GetComponent<PositionMultiplayer>() : null;
+                if (position != null && position.EnemyInterestState == PositionMultiplayer.PartyLocationState.BuildingInterior)
+                { key = position.EnemyInterestBuildingKey; region = position.EnemyInterestRegion; location = position.EnemyInterestLocation; }
+            }
+            area = CorpseBuildingArea(region, location, key);
+            if (area == null) return;
+        }
+        else area = "E";
+        if (area.StartsWith("D:", StringComparison.Ordinal) && root == null)
+        {
+            Debug.LogWarning("[CorpseReplay] No matching loaded layout for " + area + "; corpse=" + id +
+                "; loaded scenes (including inactive): " + DescribeLoadedCorpseLayouts(area));
+            return;
+        }
+        if (!area.StartsWith("D:", StringComparison.Ordinal) && !world.initialized) return;
+        var data = new CorpseAppearance {
+            id = id, area = area, sequence = ++corpseSequence,
+            localPosition = root != null ? root.InverseTransformPoint(loot.transform.position) : Vector3.zero,
+            archive = loot.TextureArchive, record = loot.TextureRecord, loadId = loot.LoadID,
+            entityName = loot.entityName, isEnemyClass = loot.isEnemyClass
+        };
+        if (!area.StartsWith("D:", StringComparison.Ordinal))
+        {
+            // Enemy logical coordinates are authoritative across terrain wrapping.
+            // Add only the corpse-to-enemy displacement, not the host's current terrain.
+            data.worldX = world.worldX + (double)(loot.transform.position.x - enemy.transform.position.x) * 40.0;
+            data.worldZ = world.worldZ + (double)(loot.transform.position.z - enemy.transform.position.z) * 40.0;
+            float compensationY = GameManager.Instance.StreamingWorld.WorldCompensation.y;
+            data.exteriorY = loot.transform.position.y - compensationY;
+            data.groundProbeY = enemy.transform.position.y - compensationY;
+        }
+        // Building cleanup uses the city's exterior entrance, never a moving indoor point.
+        int pixelWorldX = world.worldX, pixelWorldZ = world.worldZ;
+        if (world.isInteriorSpawn && !world.isDungeonSpawn)
+        {
+            foreach (var identity in NetworkServer.spawned.Values)
+            {
+                if (identity == null) continue;
+                var playerPosition = identity.GetComponent<PositionMultiplayer>();
+                if (ServerCorpseArea(playerPosition) != area || !playerPosition.EnemyInterestBuildingAnchorValid) continue;
+                pixelWorldX = playerPosition.EnemyInterestBuildingAnchorX;
+                pixelWorldZ = playerPosition.EnemyInterestBuildingAnchorZ;
+                break;
+            }
+        }
+        var pixel = MapsFile.WorldCoordToMapPixel(pixelWorldX, pixelWorldZ);
+        data.mapPixelX = pixel.X; data.mapPixelY = pixel.Y;
+        emptyCorpsePixels.Remove(CorpsePixelKey(pixel.X, pixel.Y));
+        string bucket = area == "E" ? CorpseCellKey(data.worldX, data.worldZ) : area;
+        CorpseLedger ledger;
+        if (!corpseLedgers.TryGetValue(bucket, out ledger) || (area.StartsWith("D:", StringComparison.Ordinal) && ledger.dungeon == null))
+        { ledger = new CorpseLedger { dungeon = dungeon }; corpseLedgers[bucket] = ledger; }
+        capturedCorpseIds.Add(id);
+        ledger.corpses.Add(data);
+        // DFU's normal death handler parents corpses using the LOCAL player's area.
+        // On a listen host this can be an unrelated (soon inactive) interior/exterior,
+        // even though the server enemy died in a remote building or dungeon.
+        // Keep the authoritative marker with its own layout, preserving its world pose.
+        if (root != null && loot.transform.parent != root)
+            loot.transform.SetParent(root, true);
+        var culler = loot.GetComponent<MPCorpseLocalCuller>();
+        if (culler == null) culler = loot.gameObject.AddComponent<MPCorpseLocalCuller>();
+        bool worldPlacement = !area.StartsWith("D:", StringComparison.Ordinal);
+        culler.InitializeForReplay(data.area, data.worldX, data.worldZ, data.exteriorY, worldPlacement);
+        Transform localRoot;
+        bool witnessedHere = NetworkClient.active && CurrentCorpseArea(out localRoot) == area &&
+            Vector3.Distance(GameManager.Instance.PlayerObject.transform.position, enemy.transform.position) <= 200f;
+        if (worldPlacement && !witnessedHere) culler.RequestReplayGrounding(data.groundProbeY);
+    }
+
+    IEnumerator ReplayCorpses()
+    {
+        while (isLocalPlayer && NetworkClient.active)
+        {
+            Transform currentRoot;
+            string current = CurrentCorpseArea(out currentRoot);
+            var game = GameManager.Instance;
+            int wx = current == "E" ? game.PlayerGPS.WorldX : 0;
+            int wz = current == "E" ? game.PlayerGPS.WorldZ : 0;
+            double dx = (double)wx - replayWorldX, dz = (double)wz - replayWorldZ;
+            if (current != replayArea || currentRoot != replayRoot || (current == "E" && dx * dx + dz * dz >= 800.0 * 800.0))
+            {
+                replayArea = current; replayRoot = currentRoot; replayWorldX = wx; replayWorldZ = wz;
+                ++replayRequest; replayCursor = 0; replayWaiting = false;
+                pendingCorpses.Clear(); replayNextRequest = 0f;
+            }
+            if (current != null && NetworkClient.ready)
+            {
+                // Actual client creation queue: packet bunching cannot instantiate a
+                // whole area's corpse history in one client frame.
+                for (int n = 0; n < 2 && pendingCorpses.Count > 0; n++)
+                {
+                    var pending = pendingCorpses.Peek();
+                    if (retiredCorpseIds.Contains(pending.appearance.id)) { pendingCorpses.Dequeue(); continue; }
+                    DaggerfallLoot witnessed;
+                    if (NetworkClient.spawned.ContainsKey(pending.appearance.id & ~CorpseLootIdFlag) &&
+                        (!localLootById.TryGetValue(pending.appearance.id, out witnessed) || witnessed == null)) break;
+                    pendingCorpses.Dequeue();
+                    try { RestoreCorpse(current, currentRoot, pending); }
+                    catch (Exception ex) { Debug.LogError("[CorpseReplay] Could not restore corpse: " + ex); }
+                }
+                float now = Time.realtimeSinceStartup;
+                if (replayWaiting && now >= replayDeadline) replayWaiting = false;
+                if (!replayWaiting && pendingCorpses.Count == 0 && now >= replayNextRequest)
+                {
+                    replayWaiting = true; replayDeadline = now + 5f; replayNextRequest = now + 0.5f;
+                    CmdRequestCorpses(current, replayWorldX, replayWorldZ, replayCursor, ++replayRequest);
+                }
+            }
+            yield return null;
+        }
+    }
+    static int FirstCorpseAfter(List<CorpseAppearance> list, ulong sequence)
+    {
+        int lo = 0, hi = list.Count;
+        while (lo < hi) { int mid = lo + (hi - lo) / 2; if (list[mid].sequence <= sequence) lo = mid + 1; else hi = mid; }
+        return lo;
+    }
+    [Command]
+    void CmdRequestCorpses(string area, int worldX, int worldZ, ulong cursor, uint request)
+    {
+        var position = GetComponent<PositionMultiplayer>();
+        double dx = position != null ? (double)position.x - worldX : 0;
+        double dz = position != null ? (double)position.z - worldZ : 0;
+        if (Time.realtimeSinceStartup < serverNextCorpseRequest || area == null || ServerCorpseArea(position) != area ||
+            (area == "E" && dx * dx + dz * dz > 2000.0 * 2000.0))
+        {
+            // A teleport may arrive before its player-location update. Retry without
+            // advancing the cursor, rather than treating the old location as complete.
+            TargetCorpsePage(connectionToClient, request, cursor);
+            return;
+        }
+        serverNextCorpseRequest = Time.realtimeSinceStartup + 0.25f;
+        var lists = new List<List<CorpseAppearance>>(9);
+        CorpseLedger ledger;
+        if (area == "E")
+        {
+            int minX = (int)Math.Floor((worldX - CorpseReplayRadiusDF) / CorpseCellDF);
+            int maxX = (int)Math.Floor((worldX + CorpseReplayRadiusDF) / CorpseCellDF);
+            int minZ = (int)Math.Floor((worldZ - CorpseReplayRadiusDF) / CorpseCellDF);
+            int maxZ = (int)Math.Floor((worldZ + CorpseReplayRadiusDF) / CorpseCellDF);
+            for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++)
+                if (corpseLedgers.TryGetValue(CorpseCellKey(x, z), out ledger)) lists.Add(ledger.corpses);
+        }
+        else if (corpseLedgers.TryGetValue(area, out ledger))
+        {
+            if (!area.StartsWith("D:", StringComparison.Ordinal) || ledger.dungeon != null) lists.Add(ledger.corpses);
+            // Retain the ledger for occupancy cleanup even if its dungeon was unloaded.
+        }
+        if (cursor > corpseSequence) cursor = 0;
+        int[] offsets = new int[lists.Count];
+        for (int i = 0; i < offsets.Length; i++) offsets[i] = FirstCorpseAfter(lists[i], cursor);
+        int sent = 0;
+        for (int examined = 0; examined < 64 && sent < 8; examined++)
+        {
+            int selected = -1;
+            for (int i = 0; i < lists.Count; i++)
+                if (offsets[i] < lists[i].Count && (selected < 0 || lists[i][offsets[i]].sequence < lists[selected][offsets[selected]].sequence)) selected = i;
+            if (selected < 0) { cursor = corpseSequence; break; }
+            var appearance = lists[selected][offsets[selected]++];
+            cursor = appearance.sequence;
+            dx = appearance.worldX - worldX; dz = appearance.worldZ - worldZ;
+            if (area == "E" && dx * dx + dz * dz > CorpseReplayRadiusDF * CorpseReplayRadiusDF) continue;
+            int version; string items;
+            if (serverLootVersionById.TryGetValue(appearance.id, out version) && serverLootItemsById.TryGetValue(appearance.id, out items))
+            {
+                PartyQuestLootOverlay.ServerReplayCorpse(connectionToClient, appearance.id & ~CorpseLootIdFlag);
+                TargetCorpse(connectionToClient, request, appearance, version, items);
+                sent++;
+            }
+        }
+        TargetCorpsePage(connectionToClient, request, cursor);
+    }
+    [TargetRpc]
+    void TargetCorpse(NetworkConnection target, uint request, CorpseAppearance appearance, int version, string items)
+    {
+        Transform root;
+        if (request != replayRequest || replayArea == null || CurrentCorpseArea(out root) != replayArea || root != replayRoot) return;
+        if (retiredCorpseIds.Contains(appearance.id)) return;
+        pendingCorpses.Enqueue(new PendingCorpse { appearance = appearance, version = version, items = items ?? string.Empty });
+    }
+    [TargetRpc]
+    void TargetCorpsePage(NetworkConnection target, uint request, ulong nextCursor)
+    {
+        if (request != replayRequest) return;
+        replayCursor = nextCursor; replayWaiting = false;
+    }
+    void RestoreCorpse(string area, Transform root, PendingCorpse pending)
+    {
+        var data = pending.appearance;
+        if (retiredCorpseIds.Contains(data.id) || area != data.area || root == null) return;
+        var game = GameManager.Instance;
+        Vector3 position;
+        if (!area.StartsWith("D:", StringComparison.Ordinal))
+        {
+            double dx = (data.worldX - game.PlayerGPS.WorldX) / 40.0, dz = (data.worldZ - game.PlayerGPS.WorldZ) / 40.0;
+            if (area == "E" && dx * dx + dz * dz > 250.0 * 250.0) return;
+            Vector3 player = game.PlayerObject.transform.position;
+            position = new Vector3(player.x + (float)dx,
+                game.StreamingWorld.WorldCompensation.y + data.exteriorY, player.z + (float)dz);
+        }
+        else position = root.TransformPoint(data.localPosition);
+        DaggerfallLoot existing;
+        if (localLootById.TryGetValue(data.id, out existing) && existing != null)
+        {
+            // Reuse witnessed/modded corpses, but do not assume an existing server
+            // marker is already in the local player's active layout. Host death handling
+            // can have created it under a different area, or the layout was rebuilt.
+            // Repair only a mismatched parent; preserve valid local/modded placement.
+            bool misplaced = existing.transform.parent != root && !existing.transform.IsChildOf(root);
+            if (misplaced)
+            {
+                existing.transform.SetParent(root, true);
+                existing.transform.position = position;
+                existing.WorldContext = game.PlayerEnterExit.WorldContext;
+            }
+            var oldCuller = existing.GetComponent<MPCorpseLocalCuller>();
+            if (oldCuller == null) oldCuller = existing.gameObject.AddComponent<MPCorpseLocalCuller>();
+            bool repairWorld = !area.StartsWith("D:", StringComparison.Ordinal) && (misplaced || NetworkServer.active);
+            oldCuller.InitializeForReplay(data.area, data.worldX, data.worldZ, data.exteriorY, repairWorld);
+            if (repairWorld) oldCuller.RequestReplayGrounding(data.groundProbeY);
+            ApplyReplaceLootContents(data.id, pending.version, pending.items);
+            PartyQuestLootOverlay.ReconcileCorpse(existing);
+            return;
+        }
+        var loot = GameObjectHelper.CreateLootContainer(LootContainerTypes.CorpseMarker,
+            InventoryContainerImages.Corpse2, position, root, data.archive, data.record, data.loadId, null, false);
+        if (loot == null) return;
+        loot.customDrop = true; loot.playerOwned = false;
+        loot.entityName = data.entityName; loot.isEnemyClass = data.isEnemyClass;
+        loot.WorldContext = game.PlayerEnterExit.WorldContext;
+        var culler = loot.GetComponent<MPCorpseLocalCuller>();
+        if (culler == null) culler = loot.gameObject.AddComponent<MPCorpseLocalCuller>();
+        culler.InitializeForReplay(data.area, data.worldX, data.worldZ, data.exteriorY, true);
+        if (!area.StartsWith("D:", StringComparison.Ordinal)) culler.RequestReplayGrounding(data.groundProbeY);
+        RegisterLocalCorpseLoot(data.id, pending.version, loot, pending.items, "area-replay");
+        ApplyReplaceLootContents(data.id, pending.version, pending.items);
+        PartyQuestLootOverlay.ReconcileCorpse(loot);
+        if (area == "E" && game.StreamingWorld != null) game.StreamingWorld.TrackLooseObject(loot.gameObject, true);
+    }
+
+    public override void OnStartServer()
+    {
+        base.OnStartServer();
+        StartCoroutine(CleanupUnoccupiedCorpsePixels());
+    }
+
+    static string CorpsePixelKey(int x, int y) { return x + ":" + y; }
+
+    IEnumerator CleanupUnoccupiedCorpsePixels()
+    {
+        while (NetworkServer.active)
+        {
+            // All player catchers share one schedule. Survives the initiating player leaving.
+            if (Time.realtimeSinceStartup >= nextCorpseCleanup)
+            {
+                nextCorpseCleanup = Time.realtimeSinceStartup + 1f;
+                CleanupCorpsePixels();
+            }
+            yield return new WaitForSecondsRealtime(1f);
+        }
+    }
+
+    [Server]
+    void CleanupCorpsePixels()
+    {
+        var occupied = new HashSet<string>();
+        foreach (var connection in NetworkServer.connections.Values)
+        {
+            if (connection == null || connection.identity == null) continue;
+            var position = connection.identity.GetComponent<PositionMultiplayer>();
+            // A join/transition with unknown location must not be interpreted as absence.
+            if (position == null || !position.EnemyInterestLocationKnown || position.x <= 0 || position.z <= 0)
+            { emptyCorpsePixels.Clear(); return; }
+            int x = position.x, z = position.z;
+            if (position.EnemyInterestState == PositionMultiplayer.PartyLocationState.BuildingInterior)
+            {
+                if (!position.EnemyInterestBuildingAnchorValid) { emptyCorpsePixels.Clear(); return; }
+                x = position.EnemyInterestBuildingAnchorX; z = position.EnemyInterestBuildingAnchorZ;
+            }
+            // Dungeon x/z are already its exterior entrance anchor.
+            var pixel = MapsFile.WorldCoordToMapPixel(x, z);
+            occupied.Add(CorpsePixelKey(pixel.X, pixel.Y));
+        }
+        var retired = new List<uint>();
+        var emptyBuckets = new List<string>();
+        var retainedPixels = new HashSet<string>();
+        float now = Time.realtimeSinceStartup;
+        foreach (var entry in corpseLedgers)
+        {
+            var list = entry.Value.corpses;
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                var corpse = list[i];
+                string pixel = CorpsePixelKey(corpse.mapPixelX, corpse.mapPixelY);
+                if (occupied.Contains(pixel)) { emptyCorpsePixels.Remove(pixel); continue; }
+                float since;
+                if (!emptyCorpsePixels.TryGetValue(pixel, out since))
+                { emptyCorpsePixels[pixel] = now; continue; }
+                // Brief transition grace, not a corpse age/expiry timer.
+                if (now - since < 2f) { retainedPixels.Add(pixel); continue; }
+                retired.Add(corpse.id); list.RemoveAt(i);
+            }
+            if (list.Count == 0) emptyBuckets.Add(entry.Key);
+        }
+        foreach (string bucket in emptyBuckets) corpseLedgers.Remove(bucket);
+        foreach (string pixel in new List<string>(emptyCorpsePixels.Keys))
+            if (!retainedPixels.Contains(pixel) && now - emptyCorpsePixels[pixel] >= 2f)
+                emptyCorpsePixels.Remove(pixel);
+        for (int i = 0; i < retired.Count; i++)
+        {
+            uint id = retired[i];
+            retiredCorpseIds.Add(id); capturedCorpseIds.Remove(id);
+            serverLootItemsById.Remove(id); serverLootVersionById.Remove(id);
+            serverPendingUnknownCorpseItemsById.Remove(id); lootEdits.Remove(id);
+            clientInitializedCorpses.Remove(id);
+            ApplyRetireCorpse(id);
+        }
+        for (int i = 0; i < retired.Count; i += 64)
+            RpcRetireCorpses(retired.GetRange(i, Math.Min(64, retired.Count - i)).ToArray());
+    }
+
+    [ClientRpc]
+    void RpcRetireCorpses(uint[] ids)
+    {
+        foreach (uint id in ids) ApplyRetireCorpse(id);
+    }
+
+    static void ApplyRetireCorpse(uint id)
+    {
+        retiredCorpseIds.Add(id);
+        DaggerfallLoot loot;
+        localLootById.TryGetValue(id, out loot);
+        localLootById.Remove(id); localLootItemsById.Remove(id); localLootVersionById.Remove(id);
+        pendingCorpseItemsById.Remove(id); pendingCorpseVersionById.Remove(id);
+        if (loot != null)
+        {
+            var networkLoot = loot.GetComponent<LootMultiplayer>();
+            if (networkLoot != null) networkLoot.SuppressRemovalNotification();
+            GameObjectHelper.RemoveLootContainer(loot);
+        }
     }
 
     void Start()
@@ -531,6 +1090,7 @@ public class LootCatcher : NetworkBehaviour
         locations[2] = pEnterExit.DungeonParent.transform;
 
         StartCoroutine(Check());
+        StartCoroutine(ReplayCorpses());
     }
 
     int getLocationEnabled()
@@ -751,8 +1311,11 @@ public class LootCatcher : NetworkBehaviour
 
         string items = string.Empty;
 
-        foreach (DaggerfallUnityItem item in loot.Items.CloneAll())
+        // Read live instances: CloneAll converts custom subclasses to base items,
+        // losing their GetSaveData override before we can serialize it.
+        for (int itemIndex = 0; itemIndex < loot.Items.Count; itemIndex++)
         {
+            DaggerfallUnityItem item = loot.Items.GetItem(itemIndex);
             if (item == null)
                 continue;
 
@@ -772,6 +1335,23 @@ public class LootCatcher : NetworkBehaviour
                      item.TemplateIndex + "@" +
                      item.NativeMaterialValue + "@" +
                      item.stackCount;
+
+            // Ordinary armor and weapons must survive a network round trip as the same item,
+            // not a newly generated template. Keep quest linking on its existing path.
+            if ((item.ItemGroup == ItemGroups.Armor || item.ItemGroup == ItemGroups.Weapons) && !item.IsQuestItem)
+            {
+                var saved = item.GetSaveData();
+                // UIDs are local and must not make otherwise equal snapshots differ.
+                saved.uid = 0;
+                FullSerializer.fsData equipmentData;
+                var equipmentResult = new FullSerializer.fsSerializer().TrySerialize(
+                    typeof(DaggerfallWorkshop.Game.Serialization.ItemData_v1), saved, out equipmentData);
+                if (equipmentResult.Failed)
+                    throw new InvalidOperationException("Cannot serialize network equipment: " + equipmentResult);
+                items += "@E1@" + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(
+                    FullSerializer.fsJsonPrinter.CompressedJson(equipmentData))) + "#";
+                continue;
+            }
 
             if (item.IsQuestItem && item.QuestUID != 0 && item.QuestItemSymbol != null &&
                 !string.IsNullOrEmpty(item.QuestItemSymbol.Name))
@@ -1247,7 +1827,7 @@ public class LootCatcher : NetworkBehaviour
 
     void RegisterLocalLoot(uint lootId, int version, DaggerfallLoot loot, string serializedItems)
     {
-        if (loot == null)
+        if (loot == null || retiredCorpseIds.Contains(lootId))
             return;
 
         localLootById[lootId] = loot;
@@ -1325,6 +1905,34 @@ public class LootCatcher : NetworkBehaviour
             ItemGroups itemGroup = getItemGroup(groupInt);
             if (itemGroup == ItemGroups.None)
                 continue;
+
+            if (infos.Length > 4 && infos[4] == "E1")
+            {
+                // Do not reapply armor/weapon generation after restoring exact saved state.
+                if (infos.Length != 6 || (itemGroup != ItemGroups.Armor && itemGroup != ItemGroups.Weapons))
+                    throw new InvalidOperationException("Invalid network equipment entry.");
+                object boxedEquipment = null;
+                var equipmentResult = new FullSerializer.fsSerializer().TryDeserialize(
+                    FullSerializer.fsJsonParser.Parse(System.Text.Encoding.UTF8.GetString(
+                        Convert.FromBase64String(infos[5]))),
+                    typeof(DaggerfallWorkshop.Game.Serialization.ItemData_v1), ref boxedEquipment);
+                if (equipmentResult.Failed)
+                    throw new InvalidOperationException("Cannot restore network equipment: " + equipmentResult);
+                var saved = (DaggerfallWorkshop.Game.Serialization.ItemData_v1)boxedEquipment;
+                if (saved == null || saved.itemGroup != itemGroup || saved.isQuestItem ||
+                    saved.nativeMaterialValue != material || saved.stackCount != stackCount)
+                    throw new InvalidOperationException("Network equipment metadata does not match its header.");
+                saved.uid = DaggerfallUnity.NextUID;
+                // DFU's save loader also restores registered custom item classes.
+                var restored = new ItemCollection();
+                restored.DeserializeItems(new[] { saved });
+                var equipment = restored.GetItem(0);
+                if (equipment == null || equipment.TemplateIndex != templateIndex)
+                    throw new InvalidOperationException("Network equipment template mismatch.");
+                loot.Items.AddItem(equipment);
+                addedCount++;
+                continue;
+            }
 
             ulong questUid;
             string questSymbol;
@@ -1408,6 +2016,16 @@ public class LootCatcher : NetworkBehaviour
 
     void RegisterLocalCorpseLoot(uint corpseLootId, int version, DaggerfallLoot corpseLoot, string serializedItems, string reason)
     {
+        if (retiredCorpseIds.Contains(corpseLootId))
+        {
+            if (corpseLoot != null)
+            {
+                var stale = corpseLoot.GetComponent<LootMultiplayer>();
+                if (stale != null) stale.SuppressRemovalNotification();
+                GameObjectHelper.RemoveLootContainer(corpseLoot);
+            }
+            return;
+        }
         if (corpseLoot == null)
             return;
 
@@ -1442,6 +2060,7 @@ public class LootCatcher : NetworkBehaviour
     [Server]
     public void ServerPublishCorpseLoot(uint corpseLootId, DaggerfallLoot corpseLoot, string authoritativeItems)
     {
+        if (retiredCorpseIds.Contains(corpseLootId)) return;
         if (!NetworkServer.active)
             return;
 
@@ -1575,9 +2194,18 @@ public class LootCatcher : NetworkBehaviour
         foreach (string key in expired) corpseQuestWatches.Remove(key);
     }
 
+    static void CachePendingCorpseSnapshot(uint id, int version, string items)
+    {
+        int previous;
+        if (pendingCorpseVersionById.TryGetValue(id, out previous) && previous > version) return;
+        pendingCorpseItemsById[id] = items ?? string.Empty;
+        pendingCorpseVersionById[id] = version;
+    }
+
     [ClientRpc]
     void rpcRegisterCorpseLoot(uint corpseLootId, int version, string authoritativeItems)
     {
+        if (retiredCorpseIds.Contains(corpseLootId)) return;
         try
         {
             WatchCorpseQuestItems(corpseLootId, authoritativeItems);
@@ -1588,8 +2216,7 @@ public class LootCatcher : NetworkBehaviour
                 return;
             }
 
-            pendingCorpseItemsById[corpseLootId] = authoritativeItems ?? string.Empty;
-            pendingCorpseVersionById[corpseLootId] = version;
+            CachePendingCorpseSnapshot(corpseLootId, version, authoritativeItems);
 
             Debug.Log("[LootCatcher] Stored pending corpse loot state. corpseLootId=" + corpseLootId + " version=" + version);
         }
@@ -1669,6 +2296,7 @@ public class LootCatcher : NetworkBehaviour
     [Command]
     void cmdUpdateLootContents(uint lootId, int baseVersion, string newSerializedItems)
     {
+        if (retiredCorpseIds.Contains(lootId)) return;
         if (!serverLootItemsById.ContainsKey(lootId))
         {
             if (IsCorpseLootId(lootId))
@@ -1737,12 +2365,16 @@ public class LootCatcher : NetworkBehaviour
 
     void ApplyReplaceLootContents(uint lootId, int version, string items)
     {
+        if (retiredCorpseIds.Contains(lootId)) return;
         try
         {
             DaggerfallLoot loot = FindLocalLootById(lootId);
             if (loot == null)
             {
-                Debug.LogWarning("[LootCatcher] Could not find local lootId=" + lootId + " to replace contents.");
+                // An unobserved enemy has no local corpse yet. Keep revisions which
+                // arrive while its replay marker is queued so old loot cannot reappear.
+                if (IsCorpseLootId(lootId)) CachePendingCorpseSnapshot(lootId, version, items);
+                else Debug.LogWarning("[LootCatcher] Could not find local lootId=" + lootId + " to replace contents.");
                 return;
             }
 
@@ -1764,9 +2396,24 @@ public class LootCatcher : NetworkBehaviour
             List<DaggerfallUnityItem> localOnlyPrivateQuestItems =
                 IsCorpseLootId(lootId) ? CaptureLocalOnlyPrivateQuestLoot(loot) : null;
 
-            loot.Items.Clear();
-            int added = AddSerializedItemsToLoot(loot, items);
-            int restoredPrivate = RestoreLocalOnlyPrivateQuestLoot(loot, localOnlyPrivateQuestItems);
+            // Physical Items tracks the live item instances. Clearing an identical
+            // inventory replaces their UIDs and can trigger another physical drop.
+            // Compare LIVE serialized contents, not only version/count or a cached
+            // snapshot, so real local removals and server corrections still apply.
+            bool preservePhysicalItems = ExternalLootPickupTracker.Enabled &&
+                string.Equals(SerializeLootItems(loot), items ?? string.Empty, StringComparison.Ordinal);
+            int added;
+            int restoredPrivate = 0;
+            if (preservePhysicalItems)
+            {
+                added = loot.Items.Count;
+            }
+            else
+            {
+                loot.Items.Clear();
+                added = AddSerializedItemsToLoot(loot, items);
+                restoredPrivate = RestoreLocalOnlyPrivateQuestLoot(loot, localOnlyPrivateQuestItems);
+            }
             PartyQuestLootOverlay.ReconcileCorpse(loot);
 
             if (restoredPrivate > 0)
@@ -1786,7 +2433,8 @@ public class LootCatcher : NetworkBehaviour
 
             TryRefreshOpenLootWindow(loot, "replace-contents");
 
-            Debug.Log("[LootCatcher] Applied content replacement for lootId=" + lootId + " version=" + version + " itemCount=" + added);
+            Debug.Log("[LootCatcher] " + (preservePhysicalItems ? "Preserved unchanged physical loot" : "Applied content replacement") +
+                " for lootId=" + lootId + " version=" + version + " itemCount=" + added);
         }
         catch (Exception ex)
         {
@@ -1931,4 +2579,5 @@ public class LootCatcher : NetworkBehaviour
         }
     }
 }
+
 

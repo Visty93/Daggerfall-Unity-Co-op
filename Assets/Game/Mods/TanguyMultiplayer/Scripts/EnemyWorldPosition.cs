@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using DaggerfallConnect.Arena2;
 using DaggerfallConnect.Utility;
 using DaggerfallWorkshop.Game;
@@ -6,6 +6,59 @@ using Mirror;
 
 public class EnemyWorldPosition : NetworkBehaviour
 {
+    // Presentation identity is captured at spawn, not inferred from a moving
+    // requester later. It does not change world coordinates, parenting or authority.
+    [SyncVar] public string PresentationDungeonInstanceId = string.Empty;
+    [SyncVar] public PositionMultiplayer.PartyLocationState PresentationLocationState = PositionMultiplayer.PartyLocationState.Unknown;
+    [SyncVar] public int PresentationBuildingKey;
+    [SyncVar] public string PresentationRegionName = string.Empty;
+    [SyncVar] public string PresentationLocationName = string.Empty;
+
+    [Server]
+    public void SetPresentationDungeon(DaggerfallWorkshop.DaggerfallDungeon dungeon)
+    {
+        if (dungeon == null || string.IsNullOrEmpty(dungeon.DungeonInstanceId)) return;
+        PresentationLocationState = PositionMultiplayer.PartyLocationState.DungeonInterior;
+        PresentationDungeonInstanceId = dungeon.DungeonInstanceId;
+        PresentationBuildingKey = 0;
+        PresentationRegionName = PresentationLocationName = string.Empty;
+    }
+
+    private void CapturePresentationContext(PositionMultiplayer source, bool dungeon, bool interior, bool useParent = true)
+    {
+        if (dungeon)
+        {
+            var parentDungeon = useParent ? GetComponentInParent<DaggerfallWorkshop.DaggerfallDungeon>() : null;
+            if (parentDungeon != null && !string.IsNullOrEmpty(parentDungeon.DungeonInstanceId))
+            {
+                SetPresentationDungeon(parentDungeon);
+                return;
+            }
+            // An already-stamped stationary enemy keeps its own instance identity.
+            if (!string.IsNullOrEmpty(PresentationDungeonInstanceId)) return;
+            if (source != null && source.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.DungeonInterior &&
+                !string.IsNullOrEmpty(source.PartyDungeonInstanceId))
+            {
+                PresentationDungeonInstanceId = source.PartyDungeonInstanceId;
+                PresentationLocationState = PositionMultiplayer.PartyLocationState.DungeonInterior;
+            }
+            return;
+        }
+        PresentationDungeonInstanceId = string.Empty;
+        PresentationBuildingKey = 0;
+        PresentationRegionName = PresentationLocationName = string.Empty;
+        PresentationLocationState = PositionMultiplayer.PartyLocationState.Unknown;
+        if (interior && source != null &&
+            source.PartyCurrentLocationState == PositionMultiplayer.PartyLocationState.BuildingInterior &&
+            source.PartyBuildingKey != 0)
+        {
+            PresentationLocationState = PositionMultiplayer.PartyLocationState.BuildingInterior;
+            PresentationBuildingKey = source.PartyBuildingKey;
+            PresentationRegionName = source.PartyRegionName;
+            PresentationLocationName = source.PartyLocationName;
+        }
+    }
+
     [SyncVar] public int worldX;
 
     [SyncVar] public Vector3 intendedSpawnPos = Vector3.zero; // CreateFoe suggested spawn position
@@ -199,6 +252,11 @@ public class EnemyWorldPosition : NetworkBehaviour
         lastUnityPos = transform.position;
         playerUnityPosition = sender.identity.transform.position;
         spawnEnemyUnityPosition = transform.position;
+        // Bound companions can travel with their owner. Their context is explicitly
+        // updated by the validated owner, unlike stationary dungeon enemies.
+        PresentationDungeonInstanceId = string.Empty;
+        PresentationLocationState = PositionMultiplayer.PartyLocationState.Unknown;
+        CapturePresentationContext(sender.identity.GetComponent<PositionMultiplayer>(), dungeon, interior, false);
         if (changed)
             Debug.Log($"[MPBoundActorContext] enemy='{name}' net={netId} owner={owner} dungeon={dungeon} interior={interior} world={worldX}/{worldZ}", this);
         return true;
@@ -270,6 +328,7 @@ public class EnemyWorldPosition : NetworkBehaviour
     {
         isInteriorSpawn = isInterior;
         requesterNetId = requester;
+        CapturePresentationContext(FindRequesterPosition(), false, isInterior);
         // worldBakedFromRequester stays false until we actually use requester to bake.
     }
 
@@ -283,6 +342,8 @@ public class EnemyWorldPosition : NetworkBehaviour
         isInteriorSpawn = true;
         isDungeonSpawn = true;
         requesterNetId = requester;
+
+        CapturePresentationContext(FindRequesterPosition(), true, true);
 
         // If DaggerfallDungeon already stamped this imported enemy with an exact entrance
         // anchor, do not let a later path overwrite it with requester PositionMultiplayer.
@@ -400,6 +461,7 @@ public class EnemyWorldPosition : NetworkBehaviour
         PromoteSetupDungeonFlagIfPresent();
 
         PositionMultiplayer chosen = FindRequesterPosition();
+        CapturePresentationContext(chosen, isDungeonSpawn, isInteriorSpawn);
 
         // Dungeon enemies are in artificial underground Unity space. Their X/Z DF coords
         // should start at the dungeon requester/entrance anchor, not at requester + local dungeon offset.

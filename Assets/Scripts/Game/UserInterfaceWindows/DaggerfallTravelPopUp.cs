@@ -1,4 +1,4 @@
-﻿// Project:         Daggerfall Unity
+// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -706,9 +706,10 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             const float waitTimeoutSeconds = 25f;
             float timeoutAt = Time.realtimeSinceStartup + waitTimeoutSeconds;
             DaggerfallDungeon targetDungeon = null;
+            bool localLoadRequested = false;
 
-            // Every active network dungeon is already synchronized to all clients.
-            // Wait for this client's copy of the exact target instance to finish layout.
+            // With lazy loading the dungeon metadata already exists, but the physical
+            // RDB layout is built only if this client actually travels into it.
             while (Time.realtimeSinceStartup < timeoutAt)
             {
                 if (!IsPartyDungeonTargetStillValid(targetPlayer, expectedDungeonInstanceId))
@@ -730,7 +731,16 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                     break;
                 }
 
-                if (targetDungeon != null && targetDungeon.isSet && targetDungeon.StartMarker != null)
+                if (targetDungeon != null && !targetDungeon.isSet &&
+                    !localLoadRequested && targetDungeon.Summary.LocationData.Loaded)
+                {
+                    targetDungeon.ScheduleDeferredGeneration(targetDungeon.PositionY);
+                    localLoadRequested = true;
+                    Debug.Log($"[LazyDungeon][PartyTravel] Requested local generation for instance='{expectedDungeonInstanceId}'.");
+                }
+
+                if (targetDungeon != null && targetDungeon.isSet &&
+                    targetDungeon.StartMarker != null && targetDungeon.InitialSavedActionStateReady)
                     break;
 
                 targetDungeon = null;

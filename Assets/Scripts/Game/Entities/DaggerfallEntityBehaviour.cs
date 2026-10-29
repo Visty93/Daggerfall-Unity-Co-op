@@ -158,6 +158,7 @@ public void Rpc_UpdateHealth(int newHealth, uint enemyNetId)
 
 public int ReduceHealth(int amount)
 {
+    WakeObserverForGameplay();
     int baseHealth = Entity != null ? Entity.CurrentHealth : currentHealth;
 
     // Build clients can briefly see networked enemies before the authoritative setup RPC has completed.
@@ -208,6 +209,7 @@ public void CheckMulti()
 
 public void SomethingMultiDeath()
 {
+    WakeObserverForGameplay();
     // Death can be scheduled from several paths in MP. Only schedule it once per local object.
     if (multiplayerDeathEventRaised)
         return;
@@ -340,6 +342,7 @@ private string HealthSyncSide
 private void ApplyHealthLocally(int newHealth, bool suppressClientOutgoing = false)
 {
     if (Entity == null) return;
+    if (newHealth != Entity.CurrentHealth || newHealth <= 0) WakeObserverForGameplay();
 
     Entity.SetHealth(newHealth);
     currentHealth = newHealth;
@@ -450,6 +453,34 @@ void Start()
 		
 		
 
+        // Called only while this exact native component is suspended by the observer policy.
+        // Retains entity type/guard rules, queued health reports, and server health relays.
+        public void TickDormantNetworkObserver(SetupDemoEnemy setupDemoEnemy)
+        {
+            if (enabled || !gameObject.activeInHierarchy) return;
+            // A mod/load changing entity type requires the original lifecycle immediately.
+            if (EntityType != lastEntityType)
+            {
+                WakeObserverForGameplay();
+                Update();
+                return;
+            }
+            if (Entity == null) return;
+            // Native EnemyEntity.Update only implements the class/city-watch lifecycle.
+            // Keep it for class enemies; monster entities have no update work here.
+            if (EntityType == EntityTypes.EnemyClass) Entity.Update(this);
+            if (!this || !gameObject.activeInHierarchy || Entity == null) return;
+            currentHealth = Entity.CurrentHealth;
+            if (currentHealth != lastHealth || hasPendingClientHealthReport)
+                RefreshNetworkHealthState(setupDemoEnemy);
+        }
+
+        private void WakeObserverForGameplay()
+        {
+            var authority = GetComponent<global::DynamicEnemyAuthority>();
+            if (authority != null) authority.WakeObserverRuntime();
+        }
+
         void Update()
         {
             // Change entity type
@@ -467,11 +498,12 @@ void Start()
             Entity.Update(this);
 			
 			
-			 // Check if the DaggerfallEntityBehaviour has the SetupDemoEnemy script
-    SetupDemoEnemy setupDemoEnemy = GetComponent<SetupDemoEnemy>();
-    if (setupDemoEnemy == null)
-        return; // Exit if it's not an enemy with SetupDemoEnemy script
+            RefreshNetworkHealthState(GetComponent<SetupDemoEnemy>());
+        }
 
+        private void RefreshNetworkHealthState(SetupDemoEnemy setupDemoEnemy)
+        {
+            if (setupDemoEnemy == null || Entity == null) return;
     // Get the latest health value
     int newHealth = Entity.CurrentHealth;
 
@@ -613,6 +645,7 @@ public void SyncHealth(int newHealth)
         /// <param name="assignMultiplier">Optionally assign fatigue multiplier.</param>
         public void DamageFatigueFromSource(DaggerfallEntityBehaviour sourceEntityBehaviour, int amount, bool assignMultiplier = false)
         {
+            WakeObserverForGameplay();
             // Remove fatigue amount
             Entity.DecreaseFatigue(amount, assignMultiplier);
 
@@ -629,6 +662,7 @@ public void SyncHealth(int newHealth)
         /// <param name="bloodPosition">Blood splash position.</param>
         public void DamageHealthFromSource(DaggerfallEntityBehaviour sourceEntityBehaviour, int amount, bool showBlood, Vector3 bloodPosition)
         {
+            WakeObserverForGameplay();
             // Remove health amount
             Entity.DecreaseHealth(amount);
 
@@ -651,6 +685,7 @@ public void SyncHealth(int newHealth)
         /// <param name="amount">Amount to damage spell points.</param>
         public void DamageMagickaFromSource(DaggerfallEntityBehaviour sourceEntityBehaviour, int amount)
         {
+            WakeObserverForGameplay();
             // Remove fatigue amount
             Entity.DecreaseMagicka(amount);
 
@@ -663,6 +698,7 @@ public void SyncHealth(int newHealth)
         /// </summary>
         public void HandleAttackFromSource(DaggerfallEntityBehaviour sourceEntityBehaviour)
         {
+            WakeObserverForGameplay();
             // Break "normal power" concealment effects on source
             if (sourceEntityBehaviour && sourceEntityBehaviour.Entity.IsMagicallyConcealedNormalPower)
                 EntityEffectManager.BreakNormalPowerConcealmentEffects(sourceEntityBehaviour);

@@ -47,6 +47,136 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
     bool serverReady, clientReady;
     float nextPublish;
 
+    // External pickup receipts only. QNS can replace the original inventory object,
+    // so retain the quest identity independently of the item's mutable reference.
+    sealed class ExternalConsumption
+    {
+        public uint loot;
+        public DaggerfallUnityItem item;
+        public ulong questUid;
+        public string symbol;
+        public ItemCollection inventory;
+        public float retryAt;
+    }
+    readonly Dictionary<string, ExternalConsumption> externalConsumptions =
+        new Dictionary<string, ExternalConsumption>(StringComparer.Ordinal);
+
+    sealed class InventoryObservation
+    {
+        public uint loot;
+        public ItemCollection inventory;
+        public int count;
+    }
+    readonly Dictionary<string, InventoryObservation> externalInventoryBefore =
+        new Dictionary<string, InventoryObservation>(StringComparer.Ordinal);
+
+    static int QuestInventoryCount(ItemCollection inventory, ulong questUid, string symbol)
+    {
+        if (inventory == null || questUid == 0 || string.IsNullOrEmpty(symbol)) return 0;
+        int count = 0;
+        for (int i = 0; i < inventory.Count; i++)
+        {
+            var item = inventory.GetItem(i);
+            if (item != null && item.IsQuestItem && item.QuestUID == questUid &&
+                item.QuestItemSymbol != null && string.Equals(item.QuestItemSymbol.Name,
+                    symbol, StringComparison.OrdinalIgnoreCase)) count++;
+        }
+        return count;
+    }
+
+    void RememberExternalInventory(uint lootId, string key, ulong questUid, string symbol)
+    {
+        if (!ExternalLootPickupTracker.Enabled) return;
+        var manager = GameManager.Instance;
+        if (manager == null || manager.PlayerEntity == null) return;
+        var inventory = manager.PlayerEntity.Items;
+        externalInventoryBefore[lootId + "|" + key] = new InventoryObservation
+            { loot = lootId, inventory = inventory, count = QuestInventoryCount(inventory, questUid, symbol) };
+    }
+
+    static bool InLocalInventory(ExternalConsumption pickup)
+    {
+        var manager = GameManager.Instance;
+        return manager != null && manager.PlayerEntity != null &&
+            ReferenceEquals(manager.PlayerEntity.Items, pickup.inventory) &&
+            QuestInventoryCount(pickup.inventory, pickup.questUid, pickup.symbol) > 0;
+    }
+
+    internal static bool ExternalConsumptionStillValid(uint loot, string symbol)
+    {
+        if (instance == null) return false;
+        foreach (var pair in instance.externalConsumptions)
+        {
+            ItemState state;
+            if (pair.Value.loot == loot && InLocalInventory(pair.Value) &&
+                instance.localItems.TryGetValue(pair.Key, out state) && !state.consumed &&
+                PartyQuestFoeBinding.IsLocalParty(state.party) &&
+                QuestNetSync.PartyVirtualShouldPublishQuestLoot(pair.Value.questUid) &&
+                string.Equals(state.symbol, symbol, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
+    void ObserveExternalQuestPickup(uint lootId, DaggerfallLoot loot)
+    {
+        if (!ExternalLootPickupTracker.Enabled) return;
+        Dictionary<string, DaggerfallUnityItem> shown;
+        var manager = GameManager.Instance;
+        if (manager == null || manager.PlayerEntity == null ||
+            !displayed.TryGetValue(lootId, out shown)) return;
+        var inventory = manager.PlayerEntity.Items;
+        foreach (var pair in shown)
+        {
+            ItemState state;
+            var item = pair.Value;
+            ulong questUid;
+            if (item == null || !item.IsQuestItem ||
+                !localItems.TryGetValue(pair.Key, out state) || state.consumed ||
+                !PartyQuestFoeBinding.IsLocalParty(state.party) || externalConsumptions.ContainsKey(pair.Key) ||
+                !QuestNetSync.PartyVirtualTryGetLocalQuestUid(state.inst, out questUid) ||
+                questUid != item.QuestUID || !QuestNetSync.PartyVirtualShouldPublishQuestLoot(questUid)) continue;
+            if (Contains(loot, item))
+            {
+                RememberExternalInventory(lootId, pair.Key, questUid, state.symbol);
+                continue;
+            }
+            bool exact = ReferenceEquals(inventory.GetItem(item.UID), item);
+            InventoryObservation before;
+            bool replaced = externalInventoryBefore.TryGetValue(lootId + "|" + pair.Key, out before) &&
+                ReferenceEquals(before.inventory, inventory) && before.count == 0 &&
+                QuestInventoryCount(inventory, questUid, state.symbol) > 0;
+            // Missing source alone (e.g. snapshot replacement), or an already-owned
+            // matching book alone, is not evidence of an external pickup.
+            if (!exact && !replaced) continue;
+            externalConsumptions[pair.Key] = new ExternalConsumption
+                { loot = lootId, item = item, inventory = inventory, questUid = questUid, symbol = state.symbol };
+            Debug.Log("[ExternalQuestPickup] Observed corpse-to-player transfer lootId=" + lootId +
+                " symbol=" + state.symbol + " match=" + (exact ? "exact-object" : "quest-identity") + " questUid=" + questUid);
+        }
+    }
+
+    void SubmitExternalQuestConsumptions()
+    {
+        foreach (var pair in new List<KeyValuePair<string, ExternalConsumption>>(externalConsumptions))
+        {
+            ItemState state;
+            DaggerfallLoot loot;
+            var pickup = pair.Value;
+            if (!localItems.TryGetValue(pair.Key, out state) || state.consumed ||
+                !PartyQuestFoeBinding.IsLocalParty(state.party) || !InLocalInventory(pickup) ||
+                !corpses.TryGetValue(pickup.loot, out loot) || loot == null)
+            {
+                externalConsumptions.Remove(pair.Key);
+                continue;
+            }
+            if (Time.unscaledTime < pickup.retryAt) continue;
+            var sync = loot.GetComponent<LootMultiplayer>();
+            if (sync == null || sync.EditPending) continue;
+            pickup.retryAt = Time.unscaledTime + 1f;
+            sync.BeginExternalQuestConsumption(state.symbol);
+        }
+    }
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     static void Install()
     {
@@ -85,6 +215,8 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
     {
         serverItems.Clear(); localItems.Clear(); reservations.Clear();
         displayed.Clear(); corpses.Clear(); published.Clear();
+        externalConsumptions.Clear();
+        externalInventoryBefore.Clear();
         serverReady = clientReady = false; nextPublish = 0f;
     }
     void Update()
@@ -107,6 +239,9 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
             if (pair.Value == null) { corpses.Remove(pair.Key); displayed.Remove(pair.Key); }
             else Reconcile(pair.Key, pair.Value);
         }
+        SubmitExternalQuestConsumptions();
+        foreach (var pair in new List<KeyValuePair<string, InventoryObservation>>(externalInventoryBefore))
+            if (!corpses.ContainsKey(pair.Value.loot)) externalInventoryBefore.Remove(pair.Key);
     }
     static string Key(ulong party, string inst, string symbol)
     { return party + "|" + inst + "|" + symbol.ToLowerInvariant(); }
@@ -178,6 +313,24 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
         foreach (var c in MultiplayerPartyManager.ServerGetPartyConnectionsByPartyId(state.party))
             if (c != null && c.isReady) c.Send(m);
     }
+    // Re-send existing party-authorized ledger state for a reconstructed corpse.
+    // This does not publish, reroll, bind a quest or reset consumed items.
+    public static void ServerReplayCorpse(NetworkConnection connection, uint enemyId)
+    {
+        if (!NetworkServer.active || instance == null || connection == null || !connection.isReady) return;
+        foreach (var state in instance.serverItems.Values)
+        {
+            if (!state.enemies.Contains(enemyId)) continue;
+            bool belongsToParty = false;
+            foreach (var member in MultiplayerPartyManager.ServerGetPartyConnectionsByPartyId(state.party))
+                if (member == connection) { belongsToParty = true; break; }
+            if (!belongsToParty) continue;
+            connection.Send(new StateMessage { enemy = enemyId, party = state.party,
+                inst = state.inst, symbol = state.symbol,
+                json = state.consumed ? string.Empty : state.json, consumed = state.consumed });
+        }
+    }
+
     void ApplyState(StateMessage m)
     {
         if (!PartyQuestFoeBinding.IsLocalParty(m.party) || string.IsNullOrEmpty(m.inst) || string.IsNullOrEmpty(m.symbol)) return;
@@ -216,6 +369,9 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
         PartyQuestFoeBinding.Binding b;
         var sync = loot.GetComponent<LootMultiplayer>();
         if (!beforeGrantedEdit && sync != null && sync.EditPending) return;
+        // UI edits are protected by EditPending, including delayed quantity dialogs.
+        // Inspect before reconciliation can replace a physically removed book.
+        if (!beforeGrantedEdit && sync != null) ObserveExternalQuestPickup(lootId, loot);
         if (!PartyQuestFoeBinding.TryGetLocal(lootId & 0x7fffffffu, out b))
         {
             // Binding/state may arrive after the corpse. Never expose a locally
@@ -234,7 +390,8 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
         if (PartyQuestFoeBinding.IsLocalParty(b.party) && QuestNetSync.PartyVirtualTryGetLocalQuestUid(b.inst, out uid) &&
             QuestNetSync.PartyVirtualShouldPublishQuestLoot(uid))
             foreach (var pair in localItems)
-                if (!pair.Value.consumed && pair.Value.party == b.party && pair.Value.inst == b.inst && pair.Value.enemies.Contains(b.enemy))
+                if (!pair.Value.consumed && !externalConsumptions.ContainsKey(pair.Key) &&
+                    pair.Value.party == b.party && pair.Value.inst == b.inst && pair.Value.enemies.Contains(b.enemy))
                     desired[pair.Key] = pair.Value;
         foreach (var item in Snapshot(loot))
         {
@@ -245,7 +402,11 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
             if (!retain) loot.Items.RemoveItem(item);
         }
         foreach (string key in new List<string>(keep.Keys))
-            if (!desired.ContainsKey(key)) keep.Remove(key);
+            if (!desired.ContainsKey(key))
+            {
+                keep.Remove(key);
+                externalInventoryBefore.Remove(lootId + "|" + key);
+            }
         foreach (var pair in desired)
         {
             DaggerfallUnityItem item;
@@ -257,6 +418,7 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
             if (item == null) continue;
             loot.Items.AddItem(item);
             keep[pair.Key] = item;
+            RememberExternalInventory(lootId, pair.Key, uid, pair.Value.symbol);
         }
     }
     static DaggerfallUnityItem[] Snapshot(DaggerfallLoot loot)
@@ -386,3 +548,4 @@ public sealed class PartyQuestLootOverlay : MonoBehaviour
             if (pair.Value.player == player) instance.reservations.Remove(pair.Key);
     }
 }
+

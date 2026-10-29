@@ -125,6 +125,8 @@ public sealed class DedicatedServerBootstrap : MonoBehaviour
             if (!NetworkServer.active || !kcp.ServerActive() || NetworkClient.active || NetworkServer.localConnection != null)
                 throw new InvalidOperationException("KCP did not enter server-only mode.");
             Ready = true;
+            try { gameObject.AddComponent<DedicatedServerAdmin>().Initialize(modPolicyDirectory); }
+            catch (Exception adminError) { Debug.LogWarning("[DFUAdmin] Administration unavailable: " + adminError.Message); }
             Debug.Log("[DFUDedicated] READY: KCP UDP port=" + kcp.Port + " maxPlayers=" + manager.maxConnections +
                 " localClient=false. Connect using the existing Direct IP client option. Party time follows each party's selected mode; weather follows its leader.");
         }

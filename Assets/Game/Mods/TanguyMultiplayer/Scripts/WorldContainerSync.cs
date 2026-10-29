@@ -1,4 +1,4 @@
-﻿// Optional multiplayer-only session-scoped container bridge.
+// Optional multiplayer-only session-scoped container bridge.
 // Requires only additive LootCatcher registration methods and a PlayerActivate guard.
 // Unity 2019.4 / Mirror 57. No WoD assembly dependency.
 using System;
@@ -15,6 +15,7 @@ using DaggerfallWorkshop.Game.Questing;
 using DaggerfallWorkshop.Utility;
 using Mirror;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 public struct WcsContainerRequest : NetworkMessage
 {
@@ -449,7 +450,7 @@ public sealed class WorldContainerSync : MonoBehaviour
     static Transform FindCampRoot(DaggerfallLoot loot)
     {
         if (loot == null || GameManager.Instance == null || GameManager.Instance.PlayerEnterExit == null ||
-            GameManager.Instance.PlayerEnterExit.IsPlayerInside) return null;
+            GameManager.Instance.PlayerEnterExit.IsPlayerInside || IsInteriorLoot(loot)) return null;
         Transform first = null;
         for (Transform t = loot.transform.parent; t != null; t = t.parent)
         {
@@ -616,9 +617,16 @@ public sealed class WorldContainerSync : MonoBehaviour
             GameManager.Instance.PlayerObject != null;
     }
 
+    // The local player being outdoors does not make remote dungeon loot exterior loot.
+    static bool IsInteriorLoot(DaggerfallLoot loot)
+    {
+        return loot != null && (loot.GetComponentInParent<DaggerfallDungeon>() != null ||
+            loot.GetComponentInParent<DaggerfallInterior>() != null);
+    }
+
     static bool IsGenericExteriorLoot(DaggerfallLoot loot)
     {
-        return IsOutside() && IsNativeEligible(loot) &&
+        return IsOutside() && IsNativeEligible(loot) && !IsInteriorLoot(loot) &&
             loot.ContainerType == LootContainerTypes.RandomTreasure &&
             loot.GetComponent<WorldContainerReplica>() == null &&
             FindCampRoot(loot) == null;
@@ -1452,6 +1460,9 @@ public sealed class WorldContainerSync : MonoBehaviour
         foreach (var loot in list)
         {
             if (!IsNativeEligible(loot) || loot.GetComponent<WorldContainerReplica>() != null) continue;
+            // A host retains other players' dungeon objects. They are not local discovery candidates.
+            if (IsInteriorLoot(loot) && (currentRoot == null || !loot.transform.IsChildOf(currentRoot)))
+                continue;
             Transform camp = FindCampRoot(loot);
             if (camp != null && loot.ContainerType == LootContainerTypes.RandomTreasure)
             {
@@ -1710,13 +1721,46 @@ public sealed class WorldContainerSync : MonoBehaviour
     // camp whose random configuration contains zero treasure. This infrequent,
     // exterior-only pass recognizes camp prefab ROOTS (never arbitrary terrain
     // containers) so an empty camp can legitimately win the first-loader race.
+    readonly List<GameObject> campSceneRoots = new List<GameObject>();
+    readonly Stack<Transform> campSearch = new Stack<Transform>();
+
+    IEnumerable<Transform> EnumerateExteriorTransforms()
+    {
+        campSearch.Clear();
+        // Include the persistent scene if it contains this helper. GetSceneAt excludes it.
+        Scene persistent = gameObject.scene;
+        bool includedPersistent = false;
+        for (int i = 0; i <= SceneManager.sceneCount; i++)
+        {
+            Scene scene = i < SceneManager.sceneCount ? SceneManager.GetSceneAt(i) : persistent;
+            if (i == SceneManager.sceneCount && includedPersistent) break;
+            if (scene == persistent) includedPersistent = true;
+            if (!scene.IsValid() || !scene.isLoaded) continue;
+            campSceneRoots.Clear();
+            if (campSceneRoots.Capacity < scene.rootCount + 1) campSceneRoots.Capacity = scene.rootCount + 1;
+            scene.GetRootGameObjects(campSceneRoots);
+            foreach (var root in campSceneRoots) campSearch.Push(root.transform);
+            while (campSearch.Count > 0)
+            {
+                Transform t = campSearch.Pop();
+                if (t == null || !t.gameObject.activeInHierarchy) continue;
+                // Skip whole retained hierarchies, not just their loot after enumerating them.
+                if (t.GetComponent<DaggerfallDungeon>() != null || t.GetComponent<DaggerfallInterior>() != null)
+                    continue;
+                yield return t;
+                for (int c = 0; c < t.childCount; c++) campSearch.Push(t.GetChild(c));
+            }
+        }
+        campSceneRoots.Clear();
+    }
+
     void DiscoverEmptyCampRoots()
     {
         var game = GameManager.Instance;
         if (game == null || game.PlayerEnterExit == null ||
             game.PlayerEnterExit.IsPlayerInside || game.PlayerGPS == null ||
             game.PlayerObject == null) return;
-        foreach (Transform t in FindObjectsOfType<Transform>())
+        foreach (Transform t in EnumerateExteriorTransforms())
         {
             if (t == null || !t.gameObject.activeInHierarchy ||
                 t.name.IndexOf("WOD_", StringComparison.OrdinalIgnoreCase) < 0 ||

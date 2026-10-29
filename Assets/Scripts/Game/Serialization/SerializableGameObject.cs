@@ -241,6 +241,14 @@ namespace DaggerfallWorkshop.Game.Serialization
         // Normal singleplayer dungeon saves leave these at defaults.
         public bool savedInsideNetworkDungeon;
         public float savedNetworkDungeonY;
+        public bool hasSavedNetworkDungeonOrigin;
+        public Vector3 savedNetworkDungeonOrigin;
+
+        public Vector3 GetSavedDungeonOrigin()
+        {
+            if (!savedInsideNetworkDungeon) return Vector3.zero;
+            return hasSavedNetworkDungeonOrigin ? savedNetworkDungeonOrigin : new Vector3(0f, savedNetworkDungeonY, 0f);
+        }
 
         // Dungeon-local entry metadata used when an SP/MP dungeon save is loaded while
         // multiplayer is active, or when a local SP dungeon is converted on connect/host.

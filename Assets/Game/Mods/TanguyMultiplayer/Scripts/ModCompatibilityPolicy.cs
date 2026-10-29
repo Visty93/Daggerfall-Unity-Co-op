@@ -267,10 +267,9 @@ public sealed class ModCompatibilityPolicy
             // For required mods not enabled on the server, order is unknowable and not enforced.
         }
         if (errors.Count == 0) return null;
-        int show = Math.Min(errors.Count, 12);
+        int show = errors.Count;
         var message = "Mod compatibility failed (" + errors.Count + " issue(s)):\n";
         for (int i = 0; i < show; i++) message += "- " + errors[i] + "\n";
-        if (errors.Count > show) message += "...plus " + (errors.Count - show) + " more.\n";
         return message.TrimEnd();
     }
 }

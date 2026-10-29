@@ -15,8 +15,8 @@ namespace DaggerfallWorkshop.Game
     [RequireComponent(typeof(EnemyMotor))]
     public class SetupDemoEnemy : NetworkBehaviour
     {
-        // Spawn equipment is generated once by the server. Keep this separate from
-        // corpse inventory and party-private quest items. A retained SyncVar also
+        // Spawn equipment and ordinary inventory are captured once by the server.
+        // Party-private quest items retain their own handling. A retained SyncVar also
         // supplies late joiners without depending on an observer RPC arriving first.
         [SyncVar] private string syncedSpawnEquipment = string.Empty;
         private uint equipmentRequesterNetId;
@@ -44,6 +44,8 @@ namespace DaggerfallWorkshop.Game
             public DaggerfallWorkshop.Game.Serialization.ItemData_v1[] items;
             public ulong[] slots;
             public sbyte[] armor;
+            // Missing in older snapshots: retain equipment-only interpretation.
+            public bool fullInventory;
         }
 
         public void ConfigureEquipmentRequester(uint requesterNetId)
@@ -95,6 +97,90 @@ namespace DaggerfallWorkshop.Game
                 level = scalingLevel;
         }
 
+        // Shared generation inputs for both ordinary enemy loot and default equipment.
+        public struct EnemyLootContext
+        {
+            public int Level;
+            public Genders Gender;
+            public Races Race;
+        }
+
+        static bool warnedMissingServerLootLevel;
+
+        public static EnemyLootContext ResolveEnemyLootContext(EnemyEntity enemy, PlayerEntity localPlayer, int levelOverride = 0)
+        {
+            // A dedicated server's placeholder PlayerEntity is not a loot owner.
+            bool useLocal = !NetworkServer.active || NetworkClient.active;
+            var result = new EnemyLootContext
+            {
+                Level = useLocal && localPlayer != null ? localPlayer.Level : 1,
+                Gender = useLocal && localPlayer != null ? localPlayer.Gender : Genders.Male,
+                Race = useLocal && localPlayer != null ? localPlayer.Race : Races.Breton
+            };
+            if (!NetworkServer.active) return result;
+
+            // Zero is a sentinel: ResolveEquipmentGenerationContext sets a positive
+            // level only when a requester or explicit spawn scaling is available.
+            int resolvedLevel = 0;
+            SetupDemoEnemy setup = enemy != null && enemy.EntityBehaviour != null
+                ? enemy.EntityBehaviour.GetComponent<SetupDemoEnemy>() : null;
+            if (setup != null)
+                setup.ResolveEquipmentGenerationContext(ref resolvedLevel, ref result.Gender, ref result.Race);
+            if (levelOverride > 0)
+                resolvedLevel = Mathf.Clamp(levelOverride, 1, 100);
+
+            if (resolvedLevel > 0)
+                result.Level = resolvedLevel;
+            else if (!NetworkClient.active && !warnedMissingServerLootLevel)
+            {
+                warnedMissingServerLootLevel = true;
+                Debug.LogWarning("[EnemyLootContext] Server enemy has no requester/spawn level. Using explicit level-1 fallback, not the server placeholder player. Further warnings suppressed.");
+            }
+            result.Level = Mathf.Clamp(result.Level, 1, 100);
+            return result;
+        }
+
+        // Only the synchronous enemy loot roll has this context. Do not replace
+        // GameManager.PlayerEntity or change any real player's attributes.
+        [System.ThreadStatic]
+        private static EnemyLootContext? activeEnemyLootContext;
+
+        public struct EnemyLootGenerationScope : System.IDisposable
+        {
+            private readonly EnemyLootContext? previous;
+
+            internal EnemyLootGenerationScope(EnemyLootContext? previousContext)
+            {
+                previous = previousContext;
+            }
+
+            public void Dispose()
+            {
+                activeEnemyLootContext = previous;
+            }
+        }
+
+        public static EnemyLootGenerationScope BeginEnemyLootGeneration(EnemyEntity enemy, int levelOverride)
+        {
+            var scope = new EnemyLootGenerationScope(activeEnemyLootContext);
+            if (NetworkServer.active)
+            {
+                var manager = GameManager.Instance;
+                activeEnemyLootContext = ResolveEnemyLootContext(enemy,
+                    manager != null ? manager.PlayerEntity : null, levelOverride);
+            }
+            return scope;
+        }
+
+        public static EnemyLootContext GetLootRollContext(PlayerEntity player)
+        {
+            if (NetworkServer.active && activeEnemyLootContext.HasValue)
+                return activeEnemyLootContext.Value;
+
+            // Non-enemy and single-player rolls keep the original caller's inputs.
+            return new EnemyLootContext { Level = player.Level, Gender = player.Gender, Race = player.Race };
+        }
+
         // Save restoration can replace inventory on the same EnemyEntity instance.
         public void RefreshEquipmentAfterRestore()
         {
@@ -128,10 +214,17 @@ namespace DaggerfallWorkshop.Game
                     if (seen.Add(item.UID))
                         items.Add(item.GetSaveData());
                 }
+                int equippedCount = items.Count;
+                for (int i = 0; i < enemy.Items.Count; i++)
+                {
+                    var item = enemy.Items.GetItem(i);
+                    if (item != null && !item.IsQuestItem && seen.Add(item.UID))
+                        items.Add(item.GetSaveData());
+                }
                 var snapshot = new SpawnEquipmentData
                 {
                     items = items.ToArray(), slots = slots,
-                    armor = (sbyte[])enemy.ArmorValues.Clone()
+                    armor = (sbyte[])enemy.ArmorValues.Clone(), fullInventory = true
                 };
                 FullSerializer.fsData data;
                 var result = new FullSerializer.fsSerializer().TrySerialize(typeof(SpawnEquipmentData), snapshot, out data);
@@ -139,6 +232,19 @@ namespace DaggerfallWorkshop.Game
                     throw new System.InvalidOperationException(result.ToString());
                 string json = FullSerializer.fsJsonPrinter.CompressedJson(data);
                 // Mirror 57 strings have a 32 KiB UTF-8 limit.
+                // Preserve the existing equipment sync if a mod supplies an unusually
+                // large inventory. Its remaining loot still uses the corpse sync path.
+                if (System.Text.Encoding.UTF8.GetByteCount(json) >= 32768)
+                {
+                    items.RemoveRange(equippedCount, items.Count - equippedCount);
+                    snapshot.items = items.ToArray();
+                    snapshot.fullInventory = false;
+                    result = new FullSerializer.fsSerializer().TrySerialize(typeof(SpawnEquipmentData), snapshot, out data);
+                    if (result.Failed)
+                        throw new System.InvalidOperationException(result.ToString());
+                    json = FullSerializer.fsJsonPrinter.CompressedJson(data);
+                    Debug.LogWarning("[EnemyEquipmentSync] Full spawn inventory exceeds Mirror's string limit; retaining equipment-only sync for '" + name + "'.");
+                }
                 if (System.Text.Encoding.UTF8.GetByteCount(json) >= 32768)
                     throw new System.InvalidOperationException("Spawn equipment exceeds Mirror's string limit.");
                 syncedSpawnEquipment = json;
@@ -158,6 +264,10 @@ namespace DaggerfallWorkshop.Game
             DaggerfallEntityBehaviour behaviour = GetComponent<DaggerfallEntityBehaviour>();
             EnemyEntity enemy = behaviour != null ? behaviour.Entity as EnemyEntity : null;
             if (enemy == null || (ReferenceEquals(equipmentAppliedEntity, enemy) && equipmentAppliedPayload == syncedSpawnEquipment))
+                return;
+            // A delayed initial snapshot must not refill an enemy after its inventory
+            // has already been transferred to a corpse.
+            if (behaviour.CorpseLootContainer != null)
                 return;
             // Remember failures too, so a missing/incompatible mod doesn't log every frame.
             equipmentAppliedEntity = enemy;
@@ -196,8 +306,7 @@ namespace DaggerfallWorkshop.Game
                 var incoming = new DaggerfallWorkshop.Game.Items.ItemCollection();
                 incoming.DeserializeItems(snapshot.items);
 
-                // Only replace rolled equipment. Keep non-equipped inventory and
-                // locally bound quest items under the existing loot/quest systems.
+                // Replace rolled equipment while preserving locally bound quest items.
                 for (int i = 0; i < previous.Length; i++)
                 {
                     var old = enemy.ItemEquipTable.GetItem((DaggerfallWorkshop.Game.Items.EquipSlots)i);
@@ -211,6 +320,17 @@ namespace DaggerfallWorkshop.Game
                         continue;
                     }
                     enemy.Items.RemoveItem(old);
+                }
+                if (snapshot.fullInventory)
+                {
+                    // Local random loot was rolled during SetEnemyCareer too. Replace
+                    // it with the server's ordinary inventory, not a second loot roll.
+                    for (int i = enemy.Items.Count - 1; i >= 0; i--)
+                    {
+                        var oldItem = enemy.Items.GetItem(i);
+                        if (oldItem != null && !oldItem.IsQuestItem)
+                            enemy.Items.RemoveItem(oldItem);
+                    }
                 }
                 for (int i = 0; i < incoming.Count; i++)
                     enemy.Items.AddItem(incoming.GetItem(i), noStack: true);
@@ -1461,14 +1581,31 @@ private IEnumerator WaitForDungeon()
         }
 
 
+        // Preserve equipment/hostility synchronization while per-frame polling is suspended.
+        public void TickDormantNetworkObserver(DaggerfallEntityBehaviour behaviour, EnemyMotor motor)
+        {
+            if (enabled || !gameObject.activeInHierarchy || behaviour == null) return;
+            EnemyEntity enemy = behaviour.Entity as EnemyEntity;
+            // The regular paths already regard an unchanged entity/payload as complete.
+            // Test those cached values before entering serialization/component lookup paths.
+            if (isServer && !equipmentCaptureFailed && enemy != null &&
+                !ReferenceEquals(equipmentCapturedEntity, enemy)) CaptureSpawnEquipment();
+            if (isClientOnly && !string.IsNullOrEmpty(syncedSpawnEquipment) && enemy != null &&
+                (!ReferenceEquals(equipmentAppliedEntity, enemy) || equipmentAppliedPayload != syncedSpawnEquipment))
+                ApplySpawnEquipment();
+            RefreshNetworkHostility(motor);
+        }
+
         private void Update()
         {
             CaptureSpawnEquipment();
             ApplySpawnEquipment();
-            EnemyMotor motor = GetComponent<EnemyMotor>();
-            if (motor == null)
-                return;
+            RefreshNetworkHostility(GetComponent<EnemyMotor>());
+        }
 
+        private void RefreshNetworkHostility(EnemyMotor motor)
+        {
+            if (motor == null) return;
             CurrentMotorIsHostile = motor.IsHostile;
 
             if (isServer)

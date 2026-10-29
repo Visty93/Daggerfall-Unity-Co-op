@@ -1376,15 +1376,10 @@ namespace DaggerfallWorkshop.Game.Items
 
         public void AssignEnemyStartingEquipment(PlayerEntity player, EnemyEntity enemyEntity, int variant)
         {
-            int itemLevel = player.Level;
-            Genders playerGender = player.Gender;
-            Races race = player.Race;
-            if (Mirror.NetworkServer.active && enemyEntity.EntityBehaviour != null)
-            {
-                SetupDemoEnemy setup = enemyEntity.EntityBehaviour.GetComponent<SetupDemoEnemy>();
-                if (setup != null)
-                    setup.ResolveEquipmentGenerationContext(ref itemLevel, ref playerGender, ref race);
-            }
+            var generationContext = DaggerfallWorkshop.Game.SetupDemoEnemy.ResolveEnemyLootContext(enemyEntity, player);
+            int itemLevel = generationContext.Level;
+            Genders playerGender = generationContext.Gender;
+            Races race = generationContext.Race;
             int equipmentPlayerLevel = itemLevel;
             int chance = 0;
 

@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using Mirror;
@@ -12,6 +12,17 @@ using DaggerfallWorkshop.Game.Serialization;
 
 public class PositionMultiplayer : NetworkBehaviour
 {
+    // Mandatory server-only relevance metadata; never exposed through party HUD SyncVars.
+    public bool EnemyInterestLocationKnown { get; private set; }
+    public bool EnemyInterestBuildingAnchorValid { get; private set; }
+    public int EnemyInterestBuildingAnchorX { get; private set; }
+    public int EnemyInterestBuildingAnchorZ { get; private set; }
+    public PartyLocationState EnemyInterestState { get; private set; }
+    public string EnemyInterestDungeonId { get; private set; }
+    public int EnemyInterestBuildingKey { get; private set; }
+    public string EnemyInterestRegion { get; private set; }
+    public string EnemyInterestLocation { get; private set; }
+
     public float hideDistance = 500;
     public float sendDistance = 50;
 
@@ -872,6 +883,18 @@ public class PositionMultiplayer : NetworkBehaviour
         if ((int)state < (int)PartyLocationState.Unknown ||
             (int)state > (int)PartyLocationState.DungeonInterior)
             state = PartyLocationState.Unknown;
+
+        EnemyInterestLocationKnown = state != PartyLocationState.Unknown;
+        EnemyInterestBuildingAnchorValid = state == PartyLocationState.BuildingInterior &&
+            buildingEntranceAnchorValid && buildingEntranceAnchorX > 0 && buildingEntranceAnchorZ > 0;
+        EnemyInterestBuildingAnchorX = EnemyInterestBuildingAnchorValid ? buildingEntranceAnchorX : 0;
+        EnemyInterestBuildingAnchorZ = EnemyInterestBuildingAnchorValid ? buildingEntranceAnchorZ : 0;
+        EnemyInterestState = state;
+        EnemyInterestDungeonId = state == PartyLocationState.DungeonInterior
+            ? SanitizePartyDungeonInstanceId(dungeonInstanceId) : string.Empty;
+        EnemyInterestBuildingKey = state == PartyLocationState.BuildingInterior ? buildingKey : 0;
+        EnemyInterestRegion = SanitizePartyLocationText(regionName);
+        EnemyInterestLocation = SanitizePartyLocationText(locationName);
 
         PartyLocationShared = shared;
         PartyRegionName = shared ? SanitizePartyLocationText(regionName) : string.Empty;

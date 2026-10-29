@@ -27,16 +27,65 @@ public class LootMultiplayer : MonoBehaviour
     float suppressContentUpdatesUntil = 0f;
 
     DaggerfallLoot loot;
+    ExternalLootPickupTracker externalPickups;
+    float nextExternalPickupCheck;
+    ExternalLootPickupTracker ExternalPickups
+    {
+        get { return externalPickups ?? (externalPickups = new ExternalLootPickupTracker(this)); }
+    }
     PartyQuestLootOverlay.LootEditToken partyQuestLootEditToken;
     DaggerfallUnityItem partyQuestLootClickedItem;
     // Local action is frozen from request through commit acknowledgement.
     Action editAction;
     uint editRequest;
     bool editGranted, commitSent;
+    string externalQuestConsumption;
     int deferredVersion = -1;
     string deferredItems;
     public bool EditPending { get { return editRequest != 0; } }
     public bool EditGranted { get { return editGranted && !commitSent; } }
+
+    // Receipt for a completed external quest pickup. Never executes a transfer,
+    // quest click, or Begin/EndLocalLootEdit. Uses the existing server reservation.
+    internal bool BeginExternalQuestConsumption(string symbol)
+    {
+        if (!ExternalLootPickupTracker.Enabled || EditPending || !isActiveAndEnabled ||
+            lootId == 0 || lootCatcher == null || !lootCatcher.isLocalPlayer ||
+            string.IsNullOrEmpty(symbol) || symbol == "*" || symbol == "!" ||
+            !PartyQuestLootOverlay.ExternalConsumptionStillValid(lootId, symbol)) return false;
+        ExternalPickups.Poll(false);
+        externalQuestConsumption = symbol;
+        editAction = null;
+        editGranted = commitSent = false;
+        editRequest = lootCatcher.RequestLootEdit(lootId, lootVersion);
+        Debug.Log("[ExternalQuestPickup] Request consumption lootId=" + lootId + " symbol=" + symbol);
+        lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest, symbol);
+        return true;
+    }
+
+    bool ReceiveExternalQuestGrant(bool accepted, int version, string items)
+    {
+        if (externalQuestConsumption == null) return false;
+        ExternalPickups.Poll(false);
+        if (!accepted)
+        {
+            editRequest = 0;
+            editGranted = commitSent = false;
+            externalQuestConsumption = null;
+            ApplyFinalSnapshot(version, items);
+            Debug.Log("[ExternalQuestPickup] Consumption deferred; awaiting state or retry. lootId=" + lootId);
+            return true;
+        }
+        bool valid = isActiveAndEnabled &&
+            PartyQuestLootOverlay.ExternalConsumptionStillValid(lootId, externalQuestConsumption);
+        commitSent = true;
+        // Return the server's ordinary contents unchanged. Only the reserved quest
+        // symbol is consumed; no unrelated local inventory changes are published.
+        lootCatcher.CommitLootEdit(lootId, editRequest, items,
+            valid ? new[] { externalQuestConsumption } : null);
+        Debug.Log("[ExternalQuestPickup] Consumption commit lootId=" + lootId + " valid=" + valid);
+        return true;
+    }
 
     public bool BeginEdit(Action action)
     {
@@ -47,6 +96,7 @@ public class LootMultiplayer : MonoBehaviour
     // All ordinary loot keeps the original transaction path unchanged.
     public bool BeginEdit(DaggerfallUnityItem clickedItem, Action action)
     {
+        ExternalPickups.Poll(false);
         if (EditPending || lootId == 0 || lootCatcher == null)
             return false;
         string partySelection = PartyQuestLootOverlay.Selection(loot, clickedItem);
@@ -66,6 +116,8 @@ public class LootMultiplayer : MonoBehaviour
     public bool ReceiveEditGrant(uint request, bool accepted, int version, string items)
     {
         if (request != editRequest) return false;
+        if (ReceiveExternalQuestGrant(accepted, version, items)) return true;
+        ExternalPickups.Poll(false);
         if (!accepted)
         {
             editRequest = 0;
@@ -84,6 +136,7 @@ public class LootMultiplayer : MonoBehaviour
         editAction = null;
         try
         {
+            ExternalPickups.InApprovedAction = true;
             if (isActiveAndEnabled && action != null) action();
             else CompleteEdit();
         }
@@ -93,6 +146,11 @@ public class LootMultiplayer : MonoBehaviour
             // an old snapshot that would duplicate an item already transferred.
             Debug.LogError("[LootTransaction] Inventory action failed: " + ex);
             CompleteEdit();
+        }
+        finally
+        {
+            ExternalPickups.InApprovedAction = false;
+            ExternalPickups.Remember(false);
         }
         return true;
     }
@@ -106,13 +164,17 @@ public class LootMultiplayer : MonoBehaviour
         partyQuestLootClickedItem = null;
 
         commitSent = true;
+        // Also covers ordinary inventory actions completing after a split popup.
+        ExternalPickups.Remember(false);
         lootCatcher.CommitLootEdit(lootId, editRequest, LootCatcher.SerializeLootItems(loot), partyConsumed);
     }
 
     public void ReceiveEditCommit(uint request, int version, string items)
     {
         if (request != editRequest) return;
+        ExternalPickups.Poll(false);
         editRequest = 0;
+        externalQuestConsumption = null;
         editGranted = commitSent = false;
         editAction = null;
         partyQuestLootEditToken = null;
@@ -122,6 +184,8 @@ public class LootMultiplayer : MonoBehaviour
 
     public bool DeferSnapshot(int version, string items)
     {
+        // Catch speculative transfers before an incoming snapshot erases evidence.
+        ExternalPickups.Poll(false);
         if (!EditPending) return false;
         if (version >= deferredVersion)
         {
@@ -234,6 +298,7 @@ public class LootMultiplayer : MonoBehaviour
 
         if (loot == null)
             loot = GetComponent<DaggerfallLoot>();
+        if (!applyingNetworkUpdate) ExternalPickups.Remember(false);
     }
 
     public void BeginNetworkApply()
@@ -251,6 +316,7 @@ public class LootMultiplayer : MonoBehaviour
             loot = GetComponent<DaggerfallLoot>();
 
         lastKnownSerializedItems = LootCatcher.SerializeLootItems(loot);
+        ExternalPickups.Remember(true);
     }
 
     public void SuppressRemovalNotification()
@@ -267,8 +333,24 @@ public class LootMultiplayer : MonoBehaviour
     // never echo an incoming snapshot as a new local inventory operation.
     void Update() { }
 
+    void LateUpdate()
+    {
+        if (!ExternalLootPickupTracker.Enabled) return;
+        if (applyingNetworkUpdate || Time.unscaledTime < suppressContentUpdatesUntil ||
+            Time.unscaledTime < nextExternalPickupCheck || !NetworkClient.active || lootId == 0)
+            return;
+        nextExternalPickupCheck = Time.unscaledTime + 0.1f;
+        var manager = DaggerfallWorkshop.Game.GameManager.Instance;
+        if (manager == null) return;
+        var player = manager.PlayerObject;
+        if (player == null || (player.transform.position - transform.position).sqrMagnitude > 64f)
+            return;
+        ExternalPickups.Poll(true);
+    }
+
     void OnDisable()
     {
+        if (externalPickups != null) externalPickups.Poll(false);
         CompleteEdit();
         editAction = null;
         partyQuestLootEditToken = null;
@@ -305,4 +387,5 @@ public class LootMultiplayer : MonoBehaviour
         lootCatcher.NotifyLootRemovedDelayed(lootId, transform.position);
     }
 }
+
 

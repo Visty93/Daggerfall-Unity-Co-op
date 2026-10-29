@@ -831,6 +831,7 @@ public class MobileNpcSync : NetworkBehaviour
 
         List<MobilePersonNPC> remove = null;
         pendingMotionBatch.Clear();
+        if (localRecordsByNpc.Count == 0) return;
 
         bool hasSameTownObserver = HasRemoteNpcObserverInSameTown();
         bool sendMotionThisTick = hasSameTownObserver && Time.time >= nextMotionBatchTime;
@@ -1012,10 +1013,11 @@ public class MobileNpcSync : NetworkBehaviour
         if (localMapId <= 0)
             return false;
 
-        MobileNpcSync[] players = GameObject.FindObjectsOfType<MobileNpcSync>();
-        for (int i = 0; i < players.Length; i++)
+        var spawned = NetworkServer.active ? NetworkServer.spawned : NetworkClient.spawned;
+        foreach (NetworkIdentity identity in spawned.Values)
         {
-            MobileNpcSync other = players[i];
+            if (!identity || !identity.gameObject.activeInHierarchy) continue;
+            MobileNpcSync other = identity ? identity.GetComponent<MobileNpcSync>() : null;
             if (!other || other == this || other.isLocalPlayer)
                 continue;
 
@@ -1527,10 +1529,11 @@ public class MobileNpcSync : NetworkBehaviour
         if (string.IsNullOrEmpty(ownerPlayerId))
             return false;
 
-        MobileNpcSync[] syncs = GameObject.FindObjectsOfType<MobileNpcSync>();
-        for (int i = 0; i < syncs.Length; i++)
+        var spawned = NetworkServer.active ? NetworkServer.spawned : NetworkClient.spawned;
+        foreach (NetworkIdentity identity in spawned.Values)
         {
-            MobileNpcSync sync = syncs[i];
+            if (!identity || !identity.gameObject.activeInHierarchy) continue;
+            MobileNpcSync sync = identity ? identity.GetComponent<MobileNpcSync>() : null;
             if (!sync)
                 continue;
 
@@ -2892,6 +2895,9 @@ public class MobileNpcSync : NetworkBehaviour
         pendingGhostCreates.Clear();
     }
 
+    PlayerEnterExit cachedLocalEnterExit;
+    float nextLocalEnterExitSearch;
+
     bool IsLocalPlayerInExterior()
     {
         PlayerEnterExit playerEnterExit = null;
@@ -2899,8 +2905,15 @@ public class MobileNpcSync : NetworkBehaviour
         if (PlayerMultiplayer.playerObject)
             playerEnterExit = PlayerMultiplayer.playerObject.GetComponent<PlayerEnterExit>();
 
-        if (!playerEnterExit)
-            playerEnterExit = GameObject.FindObjectOfType<PlayerEnterExit>();
+        if (!playerEnterExit && GameManager.Instance)
+            playerEnterExit = GameManager.Instance.PlayerEnterExit;
+        if (playerEnterExit) cachedLocalEnterExit = playerEnterExit;
+        else playerEnterExit = cachedLocalEnterExit;
+        if (!playerEnterExit && Time.realtimeSinceStartup >= nextLocalEnterExitSearch)
+        {
+            nextLocalEnterExitSearch = Time.realtimeSinceStartup + 1f;
+            cachedLocalEnterExit = playerEnterExit = GameObject.FindObjectOfType<PlayerEnterExit>();
+        }
 
         if (!playerEnterExit)
             return false;

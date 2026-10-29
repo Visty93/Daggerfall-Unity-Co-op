@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -41,6 +41,7 @@ namespace DaggerfallWorkshop.Game
         EnemyMotor motor;
         EnemyEntity enemyEntity;
         EnemyWorldPosition worldPosition;
+        DynamicEnemyAuthority cachedAuthorityState;
         bool targetInSight;
         bool playerInSight;
         bool targetInEarshot;
@@ -667,7 +668,15 @@ private static DaggerfallEntityBehaviour FindCachedPlayerEntityByNetId(uint netI
         const float multiplayerTargetYLimit = 180f;                 // safely below the 200Y separation threshold
         const float networkDungeonTargetYThreshold = -300f;         // only real underground network dungeons use Unity/Y-only targeting
 
+        // Preserve the public parameterless API for other scripts and mods.
         public DaggerfallEntityBehaviour FindClosestMultiplayer()
+        {
+            return FindClosestMultiplayerWithFallback(true);
+        }
+
+        // Simulation owners must not retain an unrelated previous player if no
+        // valid player is in this enemy's current world/dungeon context.
+        private DaggerfallEntityBehaviour FindClosestMultiplayerWithFallback(bool allowPreviousPlayer)
         {
             UpdatePlayerCache();
 
@@ -711,10 +720,12 @@ private static DaggerfallEntityBehaviour FindCachedPlayerEntityByNetId(uint netI
             // PlayerMultiplayer proxy only if it is still actually a PlayerMultiplayer.
             if (IsMultiplayerActive())
             {
-                if (player != null)
+                if (allowPreviousPlayer && player != null)
                 {
                     PlayerMultiplayer currentPM = player.GetComponent<PlayerMultiplayer>();
-                    if (currentPM != null && !IsUntargetableMultiplayerPlayer(currentPM))
+                    if (currentPM != null && !IsUntargetableMultiplayerPlayer(currentPM) &&
+                        DaggerfallWorkshop.NetworkDungeonGrid.SharesDungeon(transform.position,
+                            worldPosition != null ? worldPosition.PresentationDungeonInstanceId : null, currentPM))
                         return player;
                 }
 
@@ -742,6 +753,9 @@ private static DaggerfallEntityBehaviour FindCachedPlayerEntityByNetId(uint netI
             // intentionally anchored to the dungeon entrance, so target by Unity/Y slot.
             if (IsActualNetworkDungeonEnemyForTargeting(ewp))
             {
+                if (!DaggerfallWorkshop.NetworkDungeonGrid.SharesDungeon(transform.position,
+                    ewp != null ? ewp.PresentationDungeonInstanceId : null, candidate))
+                    return false;
                 if (absY >= multiplayerTargetYLimit)
                     return false;
 
@@ -898,10 +912,100 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
             if (player == null)
                 Debug.LogWarning("[EnemySenses] (Client) Failed to sync player target.");
         }
+    // With owner-only sensing the server observer no longer retargets remotely
+    // owned enemies. The owning client must select the closest player itself.
+    // This only runs on the simulator and is staggered like the old server scan.
+    private bool hasReportedOwnerPlayerTarget;
+    private bool lastReportedOwnerPlayerValid;
+    private uint lastReportedOwnerPlayerNetId;
+
+    public override void OnStartAuthority()
+    {
+        base.OnStartAuthority();
+        hasReportedOwnerPlayerTarget = false;
+        nextServerRetargetTime = 0f;
+    }
+
+    public override void OnStopAuthority()
+    {
+        base.OnStopAuthority();
+        hasReportedOwnerPlayerTarget = false;
+    }
+
+    private void RefreshClientOwnerPlayerTarget()
+    {
+        DaggerfallEntityBehaviour closest = FindClosestMultiplayerWithFallback(false);
+        if (player != closest)
+        {
+            player = closest;
+            targetPlayer = closest != null ? closest.GetComponent<PlayerMultiplayer>() : null;
+            // The current enemy-vs-enemy target is independent of the player proxy.
+            // Reset only stale player tracking when it really changes.
+            if (closest == null)
+            {
+                playerInSight = false;
+                distanceToPlayer = 0f;
+                wouldBeSpawnedInClassic = false;
+                if (target != null && target.GetComponent<PlayerMultiplayer>() != null)
+                    ClearTargetTracking("client-owner-player-unavailable");
+            }
+        }
+
+        PlayerMultiplayer candidate = closest != null ? closest.GetComponent<PlayerMultiplayer>() : null;
+        bool valid = candidate != null;
+        uint id = valid ? candidate.netId : 0U; // host player 0 is a VALID id
+        if (hasReportedOwnerPlayerTarget && lastReportedOwnerPlayerValid == valid &&
+            (!valid || lastReportedOwnerPlayerNetId == id))
+            return;
+        hasReportedOwnerPlayerTarget = true;
+        lastReportedOwnerPlayerValid = valid;
+        lastReportedOwnerPlayerNetId = id;
+        CmdPublishOwnerPlayerTarget(valid, id);
+    }
+
+    [Command(requiresAuthority = true)]
+    private void CmdPublishOwnerPlayerTarget(bool hasPlayer, uint playerNetId,
+        NetworkConnectionToClient sender = null)
+    {
+        if (!isServer || sender == null)
+            return;
+        NetworkIdentity identity = GetComponent<NetworkIdentity>();
+        if (identity == null || identity.connectionToClient != sender)
+            return;
+
+        DaggerfallEntityBehaviour newPlayer = null;
+        if (hasPlayer)
+        {
+            // Mirror's netId 0 may represent the host player in this project.
+            // Do not use 0 as the absence sentinel; hasPlayer carries that state.
+            PlayerMultiplayer[] candidates = FindObjectsOfType<PlayerMultiplayer>();
+            foreach (PlayerMultiplayer candidate in candidates)
+            {
+                if (candidate == null || candidate.netId != playerNetId ||
+                    !candidate.isActiveAndEnabled || IsUntargetableMultiplayerPlayer(candidate))
+                    continue;
+                newPlayer = candidate.GetComponent<DaggerfallEntityBehaviour>();
+                if (newPlayer != null) break;
+            }
+            if (newPlayer == null)
+                return;
+        }
+
+        // Server only mirrors the selected player identity for other consumers;
+        // it must never resume full sensing or independently choose an AI target.
+        player = newPlayer;
+        targetPlayer = newPlayer != null ? newPlayer.GetComponent<PlayerMultiplayer>() : null;
+        targetNetId = hasPlayer ? playerNetId : 0U;
+    }
+
     private void OnTargetNetIdChanged(uint oldValue, uint newValue)
     {
         if (!isServer) // Only clients need to handle this
         {
+            // The owner has its own authoritative nearest-player search. A
+            // late SyncVar must not overwrite that local AI target selection.
+            if (NetworkClient.active && hasAuthority)
+                return;
             DaggerfallEntityBehaviour syncedPlayer = FindCachedPlayerEntityByNetId(newValue);
             if (syncedPlayer != null)
             {
@@ -920,10 +1024,58 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
 
 	
 
+        // Network settings can replace Entity after Start cached the prefab entity.
+        // Always use the live entity before owner sensing compares teams/stats.
+        private bool RefreshNetworkSensingEntity()
+        {
+            if (!IsMultiplayerActive()) return true;
+            if (entityBehaviour == null)
+                entityBehaviour = GetComponent<DaggerfallEntityBehaviour>();
+            EnemyEntity current = entityBehaviour != null ? entityBehaviour.Entity as EnemyEntity : null;
+            if (current == null) return false;
+            if (!object.ReferenceEquals(enemyEntity, current))
+            {
+                string previousTeam = enemyEntity != null ? enemyEntity.Team.ToString() : "none";
+                enemyEntity = current;
+                ClearTargetTracking("network-entity-replaced");
+                secondaryTarget = null;
+                secondaryTargetPos = ResetPlayerPos;
+                Debug.Log("[WAEntityRefresh] enemy=" + name + " previousTeam=" + previousTeam +
+                    " currentTeam=" + current.Team + " server=" + NetworkServer.active +
+                    " authority=" + hasAuthority);
+            }
+            // Quest binding can also arrive after EnemySenses.Start().
+            if (questBehaviour == null)
+                questBehaviour = GetComponent<QuestResourceBehaviour>();
+            return true;
+        }
+
         void FixedUpdate()
         {
-     if (GameManager.Instance.DisableAI)
+      if (GameManager.Instance.DisableAI)
         return;
+
+    // Global owner-only AI: regular clients, listen hosts and headless servers
+    // all skip full sensing when some OTHER client simulates this enemy.
+    // Unspawned/console/mod-local enemies keep their original sensing.
+    if (motor == null)
+        motor = GetComponent<EnemyMotor>();
+    if (motor != null && !motor.ShouldSimulateMotor())
+    {
+        hasReportedOwnerPlayerTarget = false;
+        return;
+    }
+
+    // Deactivated server-retained enemies must also stay dormant.
+    if (IsMultiplayerActive())
+    {
+        if (cachedAuthorityState == null)
+            cachedAuthorityState = GetComponent<DynamicEnemyAuthority>();
+        if (cachedAuthorityState != null && cachedAuthorityState.IsAuthorityDeactivatedForRetention)
+            return;
+    }
+
+    if (!RefreshNetworkSensingEntity()) return;
 
     ClearPlayerAdvancedTargetInMultiplayer("FixedUpdateStart");
     ClearUntargetableMultiplayerPlayerTargets("FixedUpdateStart");
@@ -938,22 +1090,33 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
         secondaryTargetPos = ResetPlayerPos;
     }
 
-    // Server-only multiplayer retarget check. This is intentionally throttled and staggered.
-    // Do not use enemyUpdateQueue.IndexOf(this) here; that was O(enemy count) per enemy per FixedUpdate.
-    if (NetworkServer.active && Time.time >= nextServerRetargetTime && ((Time.frameCount + updateSlot) % serverRetargetSlots == 0))
+    // Only the simulator selects the player target. Server-owned enemies use
+    // their existing retarget code. Remotely-owned enemies retarget on their
+    // client owner and publish the chosen player ID to the server.
+    // Do not use enemyUpdateQueue.IndexOf(this) here (O(enemy count)).
+    bool clientOwner = NetworkClient.active && !NetworkServer.active && hasAuthority;
+    if ((NetworkServer.active || clientOwner) && Time.time >= nextServerRetargetTime &&
+        ((Time.frameCount + updateSlot) % serverRetargetSlots == 0))
     {
         nextServerRetargetTime = Time.time + serverRetargetInterval;
-        DaggerfallEntityBehaviour closestPlayer = FindClosestMultiplayer();
-        if (closestPlayer != null && player != closestPlayer)
-            SetTarget(closestPlayer);
-        else if (closestPlayer == null)
+        if (NetworkServer.active)
         {
-            player = null;
-            targetPlayer = null;
-            targetNetId = 0;
-            playerInSight = false;
-            distanceToPlayer = 0f;
-            wouldBeSpawnedInClassic = false;
+            DaggerfallEntityBehaviour closestPlayer = FindClosestMultiplayer();
+            if (closestPlayer != null && player != closestPlayer)
+                SetTarget(closestPlayer);
+            else if (closestPlayer == null)
+            {
+                player = null;
+                targetPlayer = null;
+                targetNetId = 0;
+                playerInSight = false;
+                distanceToPlayer = 0f;
+                wouldBeSpawnedInClassic = false;
+            }
+        }
+        else
+        {
+            RefreshClientOwnerPlayerTarget();
         }
     }
 
@@ -1515,6 +1678,7 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
 
         void GetTargets()
         {
+            if (!RefreshNetworkSensingEntity()) return;
             DaggerfallEntityBehaviour highestPriorityTarget = null;
             DaggerfallEntityBehaviour secondHighestPriorityTarget = null;
             float highestPriority = -1;

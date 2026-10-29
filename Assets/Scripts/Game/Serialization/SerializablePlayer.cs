@@ -286,6 +286,8 @@ namespace DaggerfallWorkshop.Game.Serialization
                 {
                     playerPosition.savedInsideNetworkDungeon = true;
                     playerPosition.savedNetworkDungeonY = savedDungeon.PositionY;
+                    playerPosition.hasSavedNetworkDungeonOrigin = true;
+                    playerPosition.savedNetworkDungeonOrigin = savedDungeon.GridPosition;
                 }
 
                 Debug.Log($"[NetworkDungeonSave] Saved dungeon-local player position dungeon='{playerPosition.savedDungeonRegionName}/{playerPosition.savedDungeonLocationName}' mapId={playerPosition.savedDungeonMapId} networkOrRecovered={playerPosition.savedInsideNetworkDungeon} dungeonY={savedDungeon.transform.position.y} local={playerPosition.savedDungeonLocalPosition} world={playerPosition.position} entranceDF={playerPosition.worldPosX}/{playerPosition.worldPosZ}");

@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -234,6 +234,10 @@ namespace DaggerfallWorkshop
         /// </summary>
         public void PlayOneShot(uint soundID, float spatialBlend = 1, float volumeScale = 1f)
         {
+            // Network spell visuals can arrive before Start initializes this source.
+            if (!enabled || !ReadyCheck())
+                return;
+
             int soundIndex = dfUnity.SoundReader.GetSoundIndex(soundID);
             PlayOneShot(soundIndex, spatialBlend, volumeScale);
         }
@@ -338,7 +342,7 @@ namespace DaggerfallWorkshop
             // Ensure we have a DaggerfallUnity reference
             if (dfUnity == null)
                 dfUnity = DaggerfallUnity.Instance;
-            if (!dfUnity.IsReady)
+            if (dfUnity == null || !dfUnity.IsReady || dfUnity.SoundReader == null)
                 return false;
 
             // Get audio source

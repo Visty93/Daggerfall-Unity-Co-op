@@ -21,6 +21,69 @@ public class MPCorpseLocalCuller : MonoBehaviour
     [SerializeField] private bool hasWorldPosition;
     [SerializeField] private bool isDungeonSpawn;
 
+    private string dungeonInstanceId;
+    private string replayArea;
+    private double replayWorldX, replayWorldZ;
+    private float replayExteriorY;
+    // Keep the server's original height separate from the locally grounded height.
+    // Repeated pages contain that original value, not our corrected floor placement.
+    private float replaySourceY;
+    private bool replayGroundingComplete;
+    private bool replayOwnsPosition;
+    private bool replayNeedsGrounding;
+    private float replayGroundProbeY;
+    private int replayGroundAttempts;
+
+    public void RequestReplayGrounding(float compensatedEnemyY)
+    {
+        if ((replayNeedsGrounding || replayGroundingComplete) &&
+            Mathf.Approximately(replayGroundProbeY, compensatedEnemyY)) return;
+        replayGroundingComplete = false;
+        replayGroundProbeY = compensatedEnemyY;
+        replayNeedsGrounding = true;
+        replayGroundAttempts = 0;
+    }
+
+    private void TryGroundReplay(GameManager gm)
+    {
+        if (!replayNeedsGrounding || !replayOwnsPosition) return;
+        float compensation = gm.StreamingWorld.WorldCompensation.y;
+        Vector3 probe = transform.position;
+        probe.y = replayGroundProbeY + compensation + 0.5f;
+        RaycastHit[] hits = Physics.RaycastAll(probe, Vector3.down, 16.5f, ~0, QueryTriggerInteraction.Ignore);
+        float nearest = float.MaxValue;
+        Vector3 ground = Vector3.zero;
+        bool found = false;
+        foreach (var hit in hits)
+        {
+            if (hit.collider == null || hit.normal.y <= 0.1f || hit.distance >= nearest) continue;
+            var target = hit.collider.transform;
+            if (target == transform || target.IsChildOf(transform) ||
+                target.GetComponentInParent<DaggerfallWorkshop.DaggerfallLoot>() != null ||
+                target.GetComponentInParent<DaggerfallWorkshop.Game.Entity.DaggerfallEntityBehaviour>() != null ||
+                target.GetComponentInParent<NetworkIdentity>()?.GetComponent<PlayerMultiplayer>() != null) continue;
+            ground = hit.point; nearest = hit.distance; found = true;
+        }
+        if (found)
+        {
+            // Normal DFU ground placement: billboard centre is half its own height
+            // above the floor. Imported 3D loot uses its original ground pivot.
+            var billboard = GetComponent<DaggerfallWorkshop.Billboard>();
+            float offset = billboard != null ? billboard.Summary.Size.y * 0.5f : 0f;
+            Vector3 placed = transform.position;
+            placed.y = ground.y + offset;
+            transform.position = placed;
+            replayExteriorY = placed.y - compensation;
+            replayNeedsGrounding = false;
+            replayGroundingComplete = true;
+        }
+        else if (++replayGroundAttempts >= 20)
+        {
+            replayNeedsGrounding = false;
+            Debug.LogWarning("[CorpseReplay] Ground unavailable for " + gameObject.name + "; preserving recorded height.");
+        }
+    }
+
     private Renderer[] cachedRenderers;
     private bool[] rendererInitialEnabled;
     private Collider[] cachedColliders;
@@ -39,8 +102,41 @@ public class MPCorpseLocalCuller : MonoBehaviour
         worldX = enemyWorldPosition.worldX;
         worldZ = enemyWorldPosition.worldZ;
         isDungeonSpawn = enemyWorldPosition.isDungeonSpawn;
+        dungeonInstanceId = enemyWorldPosition.PresentationDungeonInstanceId;
         hasWorldPosition = true;
 
+        RefreshCaches();
+        ApplyCullState(ShouldCullForLocalPlayer());
+    }
+
+    // Replay has no living EnemyWorldPosition component to copy from.
+    public void InitializeForDungeon(string instanceId)
+    {
+        dungeonInstanceId = instanceId;
+        isDungeonSpawn = true;
+        RefreshCaches();
+        ApplyCullState(ShouldCullForLocalPlayer());
+    }
+
+    public void InitializeForReplay(string area, double x, double z, float exteriorY, bool positionFromWorld)
+    {
+        // Restore cached enabled states before recaching an already-culled object.
+        // Otherwise a later snapshot could remember "hidden" as its visible state.
+        ApplyCullState(false);
+        bool samePlacement = replayArea == area && replayWorldX == x && replayWorldZ == z &&
+            Mathf.Approximately(replaySourceY, exteriorY);
+        replayOwnsPosition = positionFromWorld || (replayOwnsPosition && replayArea == area);
+        replayArea = area; replayWorldX = x; replayWorldZ = z;
+        if (!samePlacement)
+        {
+            replaySourceY = exteriorY;
+            replayExteriorY = exteriorY;
+            replayGroundingComplete = false;
+            replayNeedsGrounding = false;
+            replayGroundAttempts = 0;
+        }
+        // For the same record retain the grounded Y and any in-progress retry.
+        // Floating-origin shifts still apply through WorldCompensation in placement.
         RefreshCaches();
         ApplyCullState(ShouldCullForLocalPlayer());
     }
@@ -104,10 +200,40 @@ public class MPCorpseLocalCuller : MonoBehaviour
         if (!NetworkClient.active && !NetworkServer.active)
             return false;
 
-        if (!hasWorldPosition)
-            return false;
-
         GameManager gm = GameManager.Instance;
+        if (!string.IsNullOrEmpty(replayArea))
+        {
+            if (NetworkServer.active && !NetworkClient.active) return true;
+            Transform root;
+            if (LootCatcher.CurrentCorpseArea(out root) != replayArea || gm == null || gm.PlayerObject == null) return true;
+            if (replayArea == "E" || replayArea.StartsWith("B:", System.StringComparison.Ordinal))
+            {
+                double dx = (replayWorldX - gm.PlayerGPS.WorldX) * UnityPerDF;
+                double dz = (replayWorldZ - gm.PlayerGPS.WorldZ) * UnityPerDF;
+                // World-coordinate corpse records cover exteriors and exact buildings.
+                // Keep their logical world position correct across local terrain seams.
+                if (replayOwnsPosition && dx * dx + dz * dz <= 250.0 * 250.0)
+                {
+                    Vector3 player = gm.PlayerObject.transform.position;
+                    transform.position = new Vector3(player.x + (float)dx,
+                        gm.StreamingWorld.WorldCompensation.y + replayExteriorY, player.z + (float)dz);
+                }
+                if (dx * dx + dz * dz <= CullDistanceUnity * CullDistanceUnity) TryGroundReplay(gm);
+                return dx * dx + dz * dz > CullDistanceUnity * CullDistanceUnity;
+            }
+            return Vector3.Distance(gm.PlayerObject.transform.position, transform.position) > CullDistanceUnity;
+        }
+        if (!string.IsNullOrEmpty(dungeonInstanceId))
+        {
+            if (NetworkServer.active && !NetworkClient.active) return true;
+            var enter = gm != null ? gm.PlayerEnterExit : null;
+            if (enter == null || !enter.IsPlayerInsideDungeon || enter.Dungeon == null ||
+                enter.Dungeon.DungeonInstanceId != dungeonInstanceId) return true;
+            return gm.PlayerObject != null &&
+                Vector3.Distance(gm.PlayerObject.transform.position, transform.position) > CullDistanceUnity;
+        }
+        if (!hasWorldPosition) return false;
+
         if (gm == null || gm.PlayerObject == null || gm.PlayerGPS == null)
             return false;
 

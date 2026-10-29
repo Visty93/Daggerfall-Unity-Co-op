@@ -75,8 +75,11 @@ namespace DaggerfallWorkshop.Game
             StartWaiting();
         }
 
+        public bool PresentationSuspended { get; set; }
+
         void FixedUpdate()
         {
+            if (PresentationSuspended) return;
             if (IsReady() && player)
             {
                 directionToPlayer = player.transform.position - transform.position;
@@ -101,7 +104,8 @@ namespace DaggerfallWorkshop.Game
 
         public bool PlayAttackSound()
         {
-            if (!IsReady())
+            // Keep the owner's shared sound decision even if it is locally inaudible.
+            if (!IsReady(true))
                 return false;
 
             // Humans must be flagged to play sounds
@@ -209,8 +213,9 @@ namespace DaggerfallWorkshop.Game
 
         #region Private Methods
 
-        private bool IsReady()
+        private bool IsReady(bool allowSuspended = false)
         {
+            if (PresentationSuspended && !allowSuspended) return false;
             if (dfAudioSource == null)
                 return false;
 

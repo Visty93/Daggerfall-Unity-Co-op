@@ -32,6 +32,7 @@ namespace Wenzil.Console
 
         void Start()
         {
+            NetworkDungeonGrid.RegisterCommands();
             ConsoleCommandsDatabase.RegisterCommand(QuitCommand.name, QuitCommand.description, QuitCommand.usage, QuitCommand.Execute);
             ConsoleCommandsDatabase.RegisterCommand(HelpCommand.name, HelpCommand.description, HelpCommand.usage, HelpCommand.Execute);
             ConsoleCommandsDatabase.RegisterCommand(LoadCommand.name, LoadCommand.description, LoadCommand.usage, LoadCommand.Execute);
@@ -1298,34 +1299,9 @@ namespace Wenzil.Console
 
             private static DaggerfallDungeon FindClosestGeneratedDungeon(Vector3 playerPosition)
             {
-                DaggerfallDungeon[] dungeons = UnityEngine.Object.FindObjectsOfType<DaggerfallDungeon>();
-                DaggerfallDungeon closestDungeon = null;
-                float closestYDistance = float.MaxValue;
-                float closestWorldDistance = float.MaxValue;
-
-                foreach (DaggerfallDungeon dungeon in dungeons)
-                {
-                    if (dungeon == null || !dungeon.gameObject.activeInHierarchy || !dungeon.isSet)
-                        continue;
-
-                    if (!dungeon.Summary.LocationData.Loaded)
-                        continue;
-
-                    float yDistance = Mathf.Abs(playerPosition.y - dungeon.transform.position.y);
-                    float worldDistance = (playerPosition - dungeon.transform.position).sqrMagnitude;
-
-                    // Y is the primary discriminator because MP dungeons are vertically stacked.
-                    // Full world distance only makes an exact-Y tie deterministic.
-                    if (yDistance < closestYDistance ||
-                        (Mathf.Approximately(yDistance, closestYDistance) && worldDistance < closestWorldDistance))
-                    {
-                        closestDungeon = dungeon;
-                        closestYDistance = yDistance;
-                        closestWorldDistance = worldDistance;
-                    }
-                }
-
-                return closestDungeon;
+                var current = GameManager.Instance.PlayerEnterExit.Dungeon;
+                if (current != null && current.isSet) return current;
+                return NetworkDungeonGrid.FindAt(playerPosition);
             }
         }
 

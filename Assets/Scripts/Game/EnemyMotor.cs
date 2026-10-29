@@ -35,7 +35,6 @@ namespace DaggerfallWorkshop.Game
         private const float CLIENT_GRAVITY_SPAWN_GRACE = 5.0f;
         private const float CLIENT_GRAVITY_AUTHORITY_GRACE = 3.0f;
         private float clientGravitySuppressedUntil = 0f;
-        private float nextClientRangedAttackRequestTime = 0f;
         private const float CLIENT_RANGED_REQUEST_COOLDOWN = 0.35f;
 
         // Aquatic enemies are not parented under dungeon blocks in MP, so their classic
@@ -277,13 +276,75 @@ namespace DaggerfallWorkshop.Game
         }
 
 
-        private bool ShouldSimulateMotor()
+        // Shared MP simulation predicate for motor, senses, and attack logic.
+        // Networked enemies have ONE simulator; never require observer sensing for combat.
+        private DynamicEnemyAuthority combatAuthority;
+
+        public bool ShouldSimulateCombat()
         {
-            // Singleplayer: normal DFU behaviour.
+            if (!ShouldSimulateMotor()) return false;
+            if (!IsNetworkActive()) return true;
+            if (combatAuthority == null) combatAuthority = GetComponent<DynamicEnemyAuthority>();
+            return combatAuthority == null || !combatAuthority.IsAuthorityDeactivatedForRetention;
+        }
+
+        private void BeginOwnerAttackAnimation(MobileStates state)
+        {
+            if (!ShouldSimulateCombat() || mobile == null || mobile.FreezeAnims) return;
+            if (state == MobileStates.RangedAttack1 || state == MobileStates.RangedAttack2)
+            {
+                if (attack == null) attack = GetComponent<EnemyAttack>();
+                if (attack != null) attack.PrepareOwnerBowAttack();
+            }
+            mobile.ChangeEnemyState(state);
+            if (isServer) RpcOwnerAttackAnimation(state);
+            else if (hasAuthority) CmdOwnerAttackAnimation(state);
+        }
+
+        [Command]
+        private void CmdOwnerAttackAnimation(MobileStates state)
+        {
+            // Presentation relay only: no target lookup, raycast, or spell selection.
+            if (state != MobileStates.Spell && state != MobileStates.RangedAttack1 &&
+                state != MobileStates.RangedAttack2) return;
+            RpcOwnerAttackAnimation(state);
+        }
+
+        [ClientRpc]
+        private void RpcOwnerAttackAnimation(MobileStates state)
+        {
+            if (ShouldSimulateCombat()) return; // Owner already started locally.
+            MobileUnit unit;
+            if (TryGetMobileForNetworkAnimation(out unit, "OwnerAttackVisual"))
+                unit.ChangeEnemyState(state);
+        }
+
+        public bool ShouldSimulateMotor()
+        {
+            // Local-only mod/console enemies and SP enemies retain their normal AI.
             if (!IsNetworkActive())
                 return true;
 
-            // Host/server must still simulate host-owned or server-owned enemies.
+            NetworkIdentity actorIdentity = cachedNetworkIdentity;
+            if (actorIdentity == null)
+            {
+                actorIdentity = GetComponent<NetworkIdentity>();
+                cachedNetworkIdentity = actorIdentity;
+            }
+            if (actorIdentity == null || actorIdentity.netId == 0)
+                return true;
+
+            // Explicit dungeon stress fixture: exercise normal observer branches
+            // without inventing a client connection or disabling native components.
+            if (NetworkServer.active)
+            {
+                if (combatAuthority == null) combatAuthority = GetComponent<DynamicEnemyAuthority>();
+                if (combatAuthority != null && combatAuthority.IsDungeonGridObserverTest)
+                    return false;
+            }
+
+            // Server-owned / listen-host-owned enemies simulate on the server;
+            // client-owned enemies must not also simulate there.
             // When authority belongs to a remote client, the host copy is observer-only.
             if (isServer)
             {
@@ -1215,117 +1276,44 @@ public IEnumerator EnsureEnemyEntityIsSet()
         /// <summary>
         /// Handles ranged attacks with bows and spells.
         /// </summary>
-        bool DoRangedAttack(
-            Vector3 direction,
-            float moveSpeed,
-            float distance,
-            bool isPlayingOneShot)
+        bool DoRangedAttack(Vector3 direction, float moveSpeed, float distance, bool isPlayingOneShot)
         {
             if (!IsNetworkActive())
-            {
-                return DoRangedAttackSinglePlayer(
-                    direction,
-                    moveSpeed,
-                    distance,
-                    isPlayingOneShot);
-            }
-
-            bool inRange =
-                senses.DistanceToTarget > EnemyAttack.minRangedDistance &&
-                senses.DistanceToTarget < EnemyAttack.maxRangedDistance;
-
-            if (!inRange ||
-                !senses.TargetInSight ||
-                !senses.DetectedTarget)
-            {
-                return false;
-            }
-
-            // Evaluate these once. The old MP path could call both helpers more than once
-            // in a single FixedUpdate, rebuilding spell bundles and repeating physics tests.
-            bool canShootBow = CanShootBow();
-            bool canCastRangedSpell =
-                !canShootBow && CanCastRangedSpellHandler();
-
-            if (!canShootBow && !canCastRangedSpell)
+                return DoRangedAttackSinglePlayer(direction, moveSpeed, distance, isPlayingOneShot);
+            if (!ShouldSimulateCombat() || senses.Target == null || !senses.TargetInSight ||
+                !senses.DetectedTarget || senses.DistanceToTarget <= EnemyAttack.minRangedDistance ||
+                senses.DistanceToTarget >= EnemyAttack.maxRangedDistance)
                 return false;
 
+            bool canShoot = CanShootBow();
+            bool canCast = !canShoot && CanCastRangedSpellHandler();
+            if (!canShoot && !canCast)
+                return false;
             if (DaggerfallUnity.Settings.EnhancedCombatAI &&
-                senses.TargetIsWithinYawAngle(22.5f, destination) &&
-                strafeTimer <= 0)
-            {
+                senses.TargetIsWithinYawAngle(22.5f, destination) && strafeTimer <= 0)
                 StrafeDecision();
-            }
-
             if (doStrafe && strafeTimer > 0)
                 AttemptMove(direction, moveSpeed / 4, false, true, distance);
-
-            if (GameManager.ClassicUpdate &&
-                senses.TargetIsWithinYawAngle(22.5f, destination))
-            {
-                if (!isPlayingOneShot)
-                {
-                    // Preserve the existing priority: enemies with a bow use the bow
-                    // branch even if they also have magic.
-                    if (hasBowAttack)
-                    {
-                        if (Random.value < 1f / 32f)
-                        {
-                            if (isServer)
-                            {
-                                PlayBowAttackAnimationLocal();
-                                RpcPlayBowAttackAnimation();
-                            }
-                            else if (hasAuthority &&
-                                     Time.time >=
-                                         nextClientRangedAttackRequestTime)
-                            {
-                                nextClientRangedAttackRequestTime =
-                                    Time.time +
-                                    CLIENT_RANGED_REQUEST_COOLDOWN;
-                                CmdRequestBowAttack(
-                                    GetCurrentTargetNetId());
-                            }
-                        }
-                    }
-                    else if (Random.value < 1f / 40f)
-                    {
-                        if (isServer)
-                        {
-                            EntityEffectBundle spellToCast = SelectedSpell;
-                            bool ready =
-                                spellToCast != null &&
-                                entityEffectManager.SetReadySpell(
-                                    spellToCast);
-
-                            InvalidateRangedSpellEligibility();
-
-                            if (ready)
-                            {
-                                mobile.ChangeEnemyState(
-                                    MobileStates.Spell);
-                                RpcPlaySpellCastAnimation();
-                            }
-                        }
-                        else if (hasAuthority &&
-                                 Time.time >=
-                                     nextClientRangedAttackRequestTime)
-                        {
-                            nextClientRangedAttackRequestTime =
-                                Time.time +
-                                CLIENT_RANGED_REQUEST_COOLDOWN;
-                            CmdRequestSpellCast(
-                                GetCurrentTargetNetId());
-                            InvalidateRangedSpellEligibility();
-                        }
-                    }
-                }
-            }
-            else
+            if (!senses.TargetIsWithinYawAngle(22.5f, destination))
             {
                 TurnToTarget(direction);
+                return true;
             }
+            if (!GameManager.ClassicUpdate || isPlayingOneShot || mobile.FreezeAnims)
+                return true;
 
+            if (hasBowAttack)
+            {
+                if (canShoot && Random.value < 1f / 32f)
+                    BeginOwnerAttackAnimation(mobile.Enemy.HasRangedAttack2 ?
+                        MobileStates.RangedAttack2 : MobileStates.RangedAttack1);
+            }
+            else if (canCast && Random.value < 1f / 40f)
+            {
+                if (SelectedSpell != null && entityEffectManager.SetReadySpell(SelectedSpell))
+                    BeginOwnerAttackAnimation(MobileStates.Spell);
+                InvalidateRangedSpellEligibility();
+            }
             return true;
         }
 
@@ -1376,55 +1364,6 @@ public IEnumerator EnsureEnemyEntityIsSet()
 		
 		
 
-        private uint GetCurrentTargetNetId()
-        {
-            if (senses == null || senses.Target == null)
-                return GetLocalPlayerMultiplayerNetId();
-
-            NetworkIdentity targetIdentity = senses.Target.GetComponent<NetworkIdentity>();
-            if (targetIdentity != null && targetIdentity.netId != 0)
-                return targetIdentity.netId;
-
-            // In this MP mod the local physical player is PlayerAdvanced and has no netId.
-            // Client-owned enemies can target that object locally, but the server/RPC side
-            // needs the matching PlayerMultiplayer netId to know which client should receive
-            // the real local-player spell payload. Without this, the spell request reaches
-            // the server with targetNetId=0 and is often rejected or sent back as visual-only.
-            return GetLocalPlayerMultiplayerNetId();
-        }
-
-        private uint GetLocalPlayerMultiplayerNetId()
-        {
-            try
-            {
-                global::PlayerMultiplayer pm = global::PlayerMultiplayer.localPlayer;
-                if (pm == null || !pm.isLocalPlayer)
-                {
-                    global::PlayerMultiplayer[] players = FindObjectsOfType<global::PlayerMultiplayer>();
-                    for (int i = 0; i < players.Length; i++)
-                    {
-                        if (players[i] != null && players[i].isLocalPlayer)
-                        {
-                            pm = players[i];
-                            global::PlayerMultiplayer.localPlayer = pm;
-                            break;
-                        }
-                    }
-                }
-
-                if (pm != null)
-                {
-                    NetworkIdentity ni = pm.GetComponent<NetworkIdentity>();
-                    if (ni != null)
-                        return ni.netId;
-                }
-            }
-            catch { }
-
-            return 0;
-        }
-
-
         private bool TryGetMobileForNetworkAnimation(out MobileUnit resolvedMobile, string reason)
         {
             resolvedMobile = mobile;
@@ -1453,676 +1392,24 @@ public IEnumerator EnsureEnemyEntityIsSet()
             return true;
         }
 
-        private IEnumerator CoDelayedNetworkSpellCastAnimation()
-        {
-            // RPCs can arrive on observers before MobileUnit has finished setup, especially
-            // around network dungeon spawn / quest popup timing. Retrying for a few frames is
-            // visual-only and prevents Mirror from disconnecting the client for an RPC exception.
-            for (int i = 0; i < 20; i++)
-            {
-                yield return null;
-
-                MobileUnit resolvedMobile;
-                if (!TryGetMobileForNetworkAnimation(out resolvedMobile, "DelayedRpcPlaySpellCastAnimation"))
-                    continue;
-
-                if (resolvedMobile.EnemyState != MobileStates.Spell)
-                    resolvedMobile.ChangeEnemyState(MobileStates.Spell);
-                yield break;
-            }
-        }
-
-        private IEnumerator CoDelayedNetworkBowAttackAnimation()
-        {
-            for (int i = 0; i < 20; i++)
-            {
-                yield return null;
-
-                MobileUnit resolvedMobile;
-                if (!TryGetMobileForNetworkAnimation(out resolvedMobile, "DelayedRpcPlayBowAttackAnimation"))
-                    continue;
-
-                if (resolvedMobile.Enemy.HasRangedAttack1 && !resolvedMobile.Enemy.HasRangedAttack2)
-                    resolvedMobile.ChangeEnemyState(MobileStates.RangedAttack1);
-                else if (resolvedMobile.Enemy.HasRangedAttack2)
-                    resolvedMobile.ChangeEnemyState(MobileStates.RangedAttack2);
-
-                yield break;
-            }
-        }
-
-        private void PlayBowAttackAnimationLocal()
-        {
-            MobileUnit resolvedMobile;
-            if (!TryGetMobileForNetworkAnimation(out resolvedMobile, "PlayBowAttackAnimationLocal"))
-                return;
-
-            if (resolvedMobile.Enemy.HasRangedAttack1 && !resolvedMobile.Enemy.HasRangedAttack2)
-                resolvedMobile.ChangeEnemyState(MobileStates.RangedAttack1);
-            else if (resolvedMobile.Enemy.HasRangedAttack2)
-                resolvedMobile.ChangeEnemyState(MobileStates.RangedAttack2);
-        }
-
-        [Command(requiresAuthority = true)]
-        private void CmdRequestBowAttack(uint targetNetId)
-        {
-            if (!isServer)
-                return;
-
-            if (mobile == null)
-                mobile = GetComponentInChildren<MobileUnit>();
-            if (senses == null)
-                senses = GetComponent<EnemySenses>();
-
-            DaggerfallEntityBehaviour explicitTarget = ResolveRequestedTargetOrOwner(targetNetId);
-            if (explicitTarget != null && senses != null)
-            {
-                senses.Target = explicitTarget;
-                senses.LastKnownTargetPos = explicitTarget.transform.position;
-                senses.PredictedTargetPos = explicitTarget.transform.position;
-                senses.DetectedTarget = true;
-            }
-
-            if (mobile == null || senses == null || senses.Target == null || !hasBowAttack)
-                return;
-
-            // Server sanity check. The owner decides when to request the shot, but the
-            // server still requires a plausible ranged distance before starting the state.
-            float distance = Vector3.Distance(transform.position, senses.Target.transform.position);
-            if (distance < EnemyAttack.minRangedDistance * 0.5f || distance > EnemyAttack.maxRangedDistance + 8f)
-                return;
-
-            if (!CanShootBow())
-                return;
-
-            PlayBowAttackAnimationLocal();
-            RpcPlayBowAttackAnimation();
-        }
-
-        [Command(requiresAuthority = true)]
-        private void CmdRequestSpellCast(uint targetNetId)
-        {
-            if (!isServer)
-                return;
-
-            if (mobile == null)
-                mobile = GetComponentInChildren<MobileUnit>();
-            if (senses == null)
-                senses = GetComponent<EnemySenses>();
-            if (entityEffectManager == null)
-                entityEffectManager = GetComponent<EntityEffectManager>();
-
-            DaggerfallEntityBehaviour explicitTarget = ResolveRequestedTargetOrOwner(targetNetId);
-            if (explicitTarget != null && senses != null)
-            {
-                senses.Target = explicitTarget;
-                senses.LastKnownTargetPos = explicitTarget.transform.position;
-                senses.PredictedTargetPos = explicitTarget.transform.position;
-                senses.DetectedTarget = true;
-            }
-
-            if (mobile == null || senses == null || senses.Target == null || entityEffectManager == null)
-                return;
-
-            float distance = Vector3.Distance(transform.position, senses.Target.transform.position);
-            if (distance > EnemyAttack.maxRangedDistance + 64f)
-                return;
-
-            if (entity == null && entityBehaviour != null)
-                entity = entityBehaviour.Entity as EnemyEntity;
-
-            if (entity == null || entity.CurrentMagicka <= 0)
-            {
-                RpcSyncEnemyMagicka(entity != null ? entity.CurrentMagicka : 0);
-                return;
-            }
-
-            EntityEffectBundle serverSpell = SelectServerRangedSpellForCommand();
-            if (serverSpell == null || !entityEffectManager.SetReadySpell(serverSpell))
-            {
-                RpcSyncEnemyMagicka(entity.CurrentMagicka);
-                return;
-            }
-
-            mobile.ChangeEnemyState(MobileStates.Spell);
-            RpcPlaySpellCastAnimation();
-        }
-
-        [Command(requiresAuthority = true)]
-        private void CmdRequestTouchSpellCast(uint targetNetId)
-        {
-            if (!isServer)
-                return;
-
-            if (mobile == null)
-                mobile = GetComponentInChildren<MobileUnit>();
-            if (senses == null)
-                senses = GetComponent<EnemySenses>();
-            if (entityEffectManager == null)
-                entityEffectManager = GetComponent<EntityEffectManager>();
-            if (attack == null)
-                attack = GetComponent<EnemyAttack>();
-
-            DaggerfallEntityBehaviour explicitTarget = ResolveRequestedTargetOrOwner(targetNetId);
-            if (explicitTarget != null && senses != null)
-            {
-                senses.Target = explicitTarget;
-                senses.LastKnownTargetPos = explicitTarget.transform.position;
-                senses.PredictedTargetPos = explicitTarget.transform.position;
-                senses.DetectedTarget = true;
-            }
-
-            if (mobile == null || senses == null || senses.Target == null || entityEffectManager == null || attack == null)
-                return;
-
-            float distance = Vector3.Distance(transform.position, senses.Target.transform.position);
-            if (distance > attack.MeleeDistance + senses.TargetRateOfApproach + 3.0f)
-                return;
-
-            if (entity == null && entityBehaviour != null)
-                entity = entityBehaviour.Entity as EnemyEntity;
-
-            if (entity == null || entity.CurrentMagicka <= 0)
-            {
-                RpcSyncEnemyMagicka(entity != null ? entity.CurrentMagicka : 0);
-                return;
-            }
-
-            EntityEffectBundle serverSpell = SelectServerTouchSpellForCommand();
-            if (serverSpell == null || !entityEffectManager.SetReadySpell(serverSpell))
-            {
-                RpcSyncEnemyMagicka(entity.CurrentMagicka);
-                return;
-            }
-
-            if (mobile.EnemyState != MobileStates.Spell)
-                mobile.ChangeEnemyState(MobileStates.Spell);
-
-            RpcPlaySpellCastAnimation();
-            TryForwardTouchSpellPayloadToRemotePlayer(serverSpell, "client-owned-command-touch");
-            attack.ResetMeleeTimer();
-        }
-
-        [ClientRpc]
-        private void RpcSyncEnemyMagicka(int currentMagicka)
-        {
-            if (isServer)
-                return;
-
-            if (entityBehaviour == null)
-                entityBehaviour = GetComponent<DaggerfallEntityBehaviour>();
-
-            if (entityBehaviour != null && entityBehaviour.Entity != null)
-            {
-                entityBehaviour.Entity.CurrentMagicka = Mathf.Max(0, currentMagicka);
-                entity = entityBehaviour.Entity as EnemyEntity;
-            }
-        }
-
-        [Server]
-        private DaggerfallEntityBehaviour TryResolveNetworkTarget(uint targetNetId)
-        {
-            if (targetNetId != 0)
-            {
-                NetworkIdentity targetIdentity = null;
-                if (NetworkServer.spawned.TryGetValue(targetNetId, out targetIdentity) && targetIdentity != null)
-                    return targetIdentity.GetComponent<DaggerfallEntityBehaviour>();
-
-                // Host player can be netId 0 in this project, and some edge cases may not be
-                // present in spawned by the time the request is processed. Fall back to scan.
-                NetworkIdentity[] identities = FindObjectsOfType<NetworkIdentity>();
-                for (int i = 0; i < identities.Length; i++)
-                {
-                    NetworkIdentity identity = identities[i];
-                    if (identity != null && identity.netId == targetNetId)
-                        return identity.GetComponent<DaggerfallEntityBehaviour>();
-                }
-            }
-
-            return null;
-        }
-
-        [Server]
-        private DaggerfallEntityBehaviour ResolveRequestedTargetOrOwner(uint targetNetId)
-        {
-            DaggerfallEntityBehaviour target = TryResolveNetworkTarget(targetNetId);
-            if (target != null)
-                return target;
-
-            // If a client-owned enemy was targeting the local PlayerAdvanced, the client may
-            // have had no NetworkIdentity on the target at request time. The owner connection's
-            // PlayerMultiplayer is the correct server-side stand-in for aiming/RPC target id.
-            try
-            {
-                if (connectionToClient != null && connectionToClient.identity != null)
-                    return connectionToClient.identity.GetComponent<DaggerfallEntityBehaviour>();
-            }
-            catch { }
-
-            return null;
-        }
-
-        [Server]
-        private EntityEffectBundle SelectServerRangedSpellForCommand()
-        {
-            if (entity == null && entityBehaviour != null)
-                entity = entityBehaviour.Entity as EnemyEntity;
-
-            if (entity == null || entityBehaviour == null ||
-                entity.CurrentMagicka <= 0)
-            {
-                return null;
-            }
-
-            EnsureSpellSettingsCache();
-            if (cachedRangedSpellSettings.Length == 0)
-                return null;
-
-            for (int attempt = 0;
-                 attempt < cachedRangedSpellSettings.Length;
-                 attempt++)
-            {
-                EffectBundleSettings selected =
-                    cachedRangedSpellSettings[
-                        Random.Range(0, cachedRangedSpellSettings.Length)];
-
-                EntityEffectBundle bundle =
-                    new EntityEffectBundle(selected, entityBehaviour);
-
-                if (!EffectsAlreadyOnTarget(bundle))
-                    return bundle;
-            }
-
-            return new EntityEffectBundle(
-                cachedRangedSpellSettings[
-                    Random.Range(0, cachedRangedSpellSettings.Length)],
-                entityBehaviour);
-        }
-
-        [Server]
-        private EntityEffectBundle SelectServerTouchSpellForCommand()
-        {
-            if (entity == null && entityBehaviour != null)
-                entity = entityBehaviour.Entity as EnemyEntity;
-
-            if (entity == null || entityBehaviour == null ||
-                entity.CurrentMagicka <= 0)
-            {
-                return null;
-            }
-
-            EnsureSpellSettingsCache();
-
-            EffectBundleSettings[] touchSettings =
-                DaggerfallUnity.Settings.EnhancedCombatAI
-                    ? cachedEnhancedTouchSpellSettings
-                    : cachedClassicTouchSpellSettings;
-
-            if (touchSettings.Length == 0)
-                return null;
-
-            for (int attempt = 0; attempt < touchSettings.Length; attempt++)
-            {
-                EffectBundleSettings selected =
-                    touchSettings[Random.Range(0, touchSettings.Length)];
-
-                EntityEffectBundle bundle =
-                    new EntityEffectBundle(selected, entityBehaviour);
-
-                if (!EffectsAlreadyOnTarget(bundle))
-                    return bundle;
-            }
-
-            return new EntityEffectBundle(
-                touchSettings[Random.Range(0, touchSettings.Length)],
-                entityBehaviour);
-        }
-
-	[ClientRpc]
-void RpcPlaySpellCastAnimation()
-{
-    if (isServer) return; // 🔹 **Prevent host from playing twice**
-
-    if (DEBUG_ENEMY_MOTOR) Debug.Log($"[RpcPlaySpellCastAnimation] Syncing spell cast animation on client.");
-
-    MobileUnit resolvedMobile;
-    if (!TryGetMobileForNetworkAnimation(out resolvedMobile, "RpcPlaySpellCastAnimation"))
-    {
-        StartCoroutine(CoDelayedNetworkSpellCastAnimation());
-        return;
-    }
-
-    if (resolvedMobile.EnemyState != MobileStates.Spell)
-        resolvedMobile.ChangeEnemyState(MobileStates.Spell);
-}
-
-[ClientRpc]
-void RpcPlayBowAttackAnimation()
-{
-    if (isServer) return; // 🔹 **Prevent host from playing twice**
-
-    if (DEBUG_ENEMY_MOTOR) Debug.Log($"[RpcPlayBowAttackAnimation] Syncing bow attack animation on client.");
-
-    MobileUnit resolvedMobile;
-    if (!TryGetMobileForNetworkAnimation(out resolvedMobile, "RpcPlayBowAttackAnimation"))
-    {
-        StartCoroutine(CoDelayedNetworkBowAttackAnimation());
-        return;
-    }
-    
-    if (resolvedMobile.Enemy.HasRangedAttack1 && !resolvedMobile.Enemy.HasRangedAttack2)
-        resolvedMobile.ChangeEnemyState(MobileStates.RangedAttack1);
-    else if (resolvedMobile.Enemy.HasRangedAttack2)
-        resolvedMobile.ChangeEnemyState(MobileStates.RangedAttack2);
-}	
-		
-		
-
-        private void DebugMpTouchSpell(string phase, string detail)
-        {
-            if (!DEBUG_MP_TOUCH_SPELL_FORWARDING)
-                return;
-
-            try
-            {
-                string targetName = senses != null && senses.Target != null ? senses.Target.name : "null";
-                NetworkIdentity targetIdentity = senses != null && senses.Target != null ? senses.Target.GetComponent<NetworkIdentity>() : null;
-                uint targetNetId = targetIdentity != null ? targetIdentity.netId : 0;
-                Debug.Log($"[MPTouchSpellForward][{phase}] enemy='{name}' netId={netId} server={isServer} client={isClient} hasAuth={hasAuthority} target='{targetName}' targetNetId={targetNetId} {detail}");
-            }
-            catch
-            {
-                Debug.Log($"[MPTouchSpellForward][{phase}] enemy='{name}' {detail}");
-            }
-        }
-
-        [Server]
-        private bool TryForwardTouchSpellPayloadToRemotePlayer(EntityEffectBundle spell, string reason)
-        {
-            if (!isServer || spell == null || senses == null || senses.Target == null)
-                return false;
-
-            if (spell.Settings.TargetType != TargetTypes.ByTouch && spell.Settings.TargetType != TargetTypes.AreaAroundCaster)
-                return false;
-
-            PlayerMultiplayer targetPlayer = senses.Target.GetComponent<PlayerMultiplayer>();
-            if (targetPlayer == null)
-                targetPlayer = senses.Target.GetComponentInParent<PlayerMultiplayer>();
-
-            if (targetPlayer == null)
-            {
-                DebugMpTouchSpell("ForwardSkip", $"reason={reason} no PlayerMultiplayer on target targetType={spell.Settings.TargetType}");
-                return false;
-            }
-
-            NetworkConnection targetConnection = targetPlayer.connectionToClient;
-            if (targetConnection == null)
-            {
-                DebugMpTouchSpell("ForwardSkip", $"reason={reason} target PlayerMultiplayer has no connection targetNetId={targetPlayer.netId}");
-                return false;
-            }
-
-            // Host/local player already receives the touch spell through the normal server-side PlayerAdvanced path.
-            if (NetworkServer.localConnection != null && targetConnection == NetworkServer.localConnection)
-            {
-                DebugMpTouchSpell("ForwardSkip", $"reason={reason} target is host/local connection targetNetId={targetPlayer.netId}");
-                return false;
-            }
-
-            NetworkIdentity enemyIdentity = GetComponent<NetworkIdentity>();
-            uint enemyNetId = enemyIdentity != null ? enemyIdentity.netId : 0;
-            int spellIndex = GetEnemySpellIndexForForwarding(spell);
-            string spellData = JsonUtility.ToJson(spell.Settings);
-            int effectCount = spell.Settings.Effects != null ? spell.Settings.Effects.Length : -1;
-
-            DebugMpTouchSpell("ForwardSend", $"reason={reason} enemyNetId={enemyNetId} targetNetId={targetPlayer.netId} conn={targetConnection.connectionId} spellIndex={spellIndex} targetType={spell.Settings.TargetType} effects={effectCount}");
-            targetPlayer.TargetApplyEnemyTouchSpellPayload(targetConnection, enemyNetId, spellIndex, spellData);
-            return true;
-        }
-
-        private int GetEnemySpellIndexForForwarding(EntityEffectBundle spell)
-        {
-            if (spell == null || entity == null)
-                return -1;
-
-            EffectBundleSettings[] spells = entity.GetSpells();
-            if (spells == null)
-                return -1;
-
-            for (int i = 0; i < spells.Length; i++)
-            {
-                if (SpellSettingsMatchForForwarding(spells[i], spell.Settings))
-                    return i;
-            }
-
-            return -1;
-        }
-        private bool IsCurrentTouchTargetLocalPlayer(out global::PlayerMultiplayer localTargetPlayer)
-        {
-            localTargetPlayer = null;
-
-            if (senses == null || senses.Target == null)
-                return false;
-
-            // Normal MP case: enemies target the PlayerMultiplayer shell.
-            localTargetPlayer = senses.Target.GetComponent<global::PlayerMultiplayer>();
-            if (localTargetPlayer == null)
-                localTargetPlayer = senses.Target.GetComponentInParent<global::PlayerMultiplayer>();
-
-            if (localTargetPlayer != null)
-                return localTargetPlayer.isLocalPlayer;
-
-            // Safety fallback for old/stale target states: if this client-owned enemy still
-            // has the local PlayerAdvanced as target, this is also the local player.
-            try
-            {
-                return GameManager.Instance != null &&
-                       GameManager.Instance.PlayerEntityBehaviour != null &&
-                       senses.Target == GameManager.Instance.PlayerEntityBehaviour;
-            }
-            catch { }
-
-            return false;
-        }
-
-        private bool TryApplyClientOwnedTouchSpellLocally(uint targetNetId)
-        {
-            global::PlayerMultiplayer localTargetPlayer;
-            if (!IsCurrentTouchTargetLocalPlayer(out localTargetPlayer))
-                return false;
-
-            bool canCast = CanCastTouchSpellHandler();
-            DebugMpTouchSpell("ClientLocalTouch", $"targetNetId={targetNetId} canCast={canCast} selectedType={(SelectedSpell != null ? SelectedSpell.Settings.TargetType.ToString() : "null")}");
-
-            if (!canCast || SelectedSpell == null)
-                return false;
-
-            DaggerfallEntityBehaviour localPlayerBehaviour = GameManager.Instance != null ? GameManager.Instance.PlayerEntityBehaviour : null;
-            if (localPlayerBehaviour == null)
-            {
-                DebugMpTouchSpell("ClientLocalTouchFail", "local PlayerAdvanced behaviour is null");
-                return false;
-            }
-
-            EntityEffectManager localEffectManager = localPlayerBehaviour.GetComponent<EntityEffectManager>();
-            if (localEffectManager == null)
-            {
-                DebugMpTouchSpell("ClientLocalTouchFail", "local PlayerAdvanced has no EntityEffectManager");
-                return false;
-            }
-
-            if (mobile != null && mobile.EnemyState != MobileStates.Spell)
-                mobile.ChangeEnemyState(MobileStates.Spell);
-
-            int spellIndex = GetEnemySpellIndexForForwarding(SelectedSpell);
-            int effectCount = SelectedSpell.Settings.Effects != null ? SelectedSpell.Settings.Effects.Length : -1;
-            DebugMpTouchSpell("ClientLocalAssign", $"targetNetId={targetNetId} spellIndex={spellIndex} targetType={SelectedSpell.Settings.TargetType} effects={effectCount}");
-
-            // Apply the real touch payload to the real local player body. PlayerMultiplayer is
-            // only the network target shell and has no EntityEffectManager.
-            localEffectManager.AssignBundle(SelectedSpell, AssignBundleFlags.ShowNonPlayerFailures);
-
-            // Replay the visible effect on this player's PlayerMultiplayer shell for host and
-            // other observers. The target client already received the real local effect above.
-            try
-            {
-                uint enemyNetId = 0;
-                NetworkIdentity enemyIdentity = GetComponent<NetworkIdentity>();
-                if (enemyIdentity != null)
-                    enemyNetId = enemyIdentity.netId;
-
-                global::PlayerMultiplayer reporter = localTargetPlayer != null ? localTargetPlayer : global::PlayerMultiplayer.GetLocalPlayer();
-                if (reporter != null)
-                {
-                    DebugMpTouchSpell("ClientLocalCosmeticsReport", $"enemyNetId={enemyNetId} reporterNetId={reporter.netId}");
-                    reporter.CmdReportLocalPlayerSpellEffectCosmetics(enemyNetId);
-                }
-                else
-                {
-                    DebugMpTouchSpell("ClientLocalCosmeticsSkip", "no local PlayerMultiplayer reporter found");
-                }
-            }
-            catch (System.Exception ex)
-            {
-                DebugMpTouchSpell("ClientLocalCosmeticsError", ex.Message);
-            }
-
-            return true;
-        }
-
-
-        private bool SpellSettingsMatchForForwarding(EffectBundleSettings a, EffectBundleSettings b)
-        {
-            if (a.TargetType != b.TargetType || a.ElementType != b.ElementType || a.BundleType != b.BundleType)
-                return false;
-
-            int ac = a.Effects != null ? a.Effects.Length : 0;
-            int bc = b.Effects != null ? b.Effects.Length : 0;
-            if (ac != bc)
-                return false;
-
-            for (int i = 0; i < ac; i++)
-            {
-                if (a.Effects[i].Key != b.Effects[i].Key)
-                    return false;
-            }
-
-            return true;
-        }
-
-        /// <summary>
-        /// Handles touch-range spells.
-        /// </summary>
         bool DoTouchSpell()
         {
             if (!IsNetworkActive())
                 return DoTouchSpellSinglePlayer();
-
-            if (!senses.TargetInSight ||
-                !senses.DetectedTarget ||
-                attack.MeleeTimer != 0 ||
-                senses.DistanceToTarget >
-                    attack.MeleeDistance +
-                    senses.TargetRateOfApproach)
-            {
-                if (DEBUG_MP_TOUCH_SPELL_FORWARDING &&
-                    NetworkServer.active &&
-                    senses != null &&
-                    senses.Target != null &&
-                    senses.DistanceToTarget <=
-                        attack.MeleeDistance +
-                        senses.TargetRateOfApproach +
-                        1.5f)
-                {
-                    DebugMpTouchSpell(
-                        "GateFail",
-                        $"targetInSight={senses.TargetInSight} " +
-                        $"detected={senses.DetectedTarget} " +
-                        $"meleeTimer={attack.MeleeTimer:F2} " +
-                        $"dist={senses.DistanceToTarget:F2} " +
-                        $"allowed={(attack.MeleeDistance + senses.TargetRateOfApproach):F2}");
-                }
-
+            if (!ShouldSimulateCombat() || mobile == null || mobile.FreezeAnims ||
+                mobile.IsPlayingOneShot() || senses.Target == null || !senses.TargetInSight ||
+                !senses.DetectedTarget || attack.MeleeTimer != 0 ||
+                senses.DistanceToTarget > attack.MeleeDistance + senses.TargetRateOfApproach)
                 return false;
-            }
-
-            if (isServer)
-            {
-                bool canCast = CanCastTouchSpellHandler();
-                EntityEffectBundle spellToCast =
-                    canCast ? SelectedSpell : null;
-
-                if (DEBUG_MP_TOUCH_SPELL_FORWARDING)
-                {
-                    DebugMpTouchSpell(
-                        "TryServerTouch",
-                        $"canCast={canCast} " +
-                        $"selectedType={(spellToCast != null ? spellToCast.Settings.TargetType.ToString() : "null")}");
-                }
-
-                bool ready =
-                    spellToCast != null &&
-                    entityEffectManager.SetReadySpell(spellToCast);
-
-                if (ready)
-                {
-                    if (mobile.EnemyState != MobileStates.Spell)
-                        mobile.ChangeEnemyState(MobileStates.Spell);
-
-                    RpcPlaySpellCastAnimation();
-
-                    TryForwardTouchSpellPayloadToRemotePlayer(
-                        spellToCast,
-                        "server-touch");
-
-                    InvalidateTouchSpellEligibility();
-                    attack.ResetMeleeTimer();
-                    return true;
-                }
-
-                if (canCast)
-                    InvalidateTouchSpellEligibility();
-
-                if (DEBUG_MP_TOUCH_SPELL_FORWARDING)
-                {
-                    DebugMpTouchSpell(
-                        "ServerTouchFailed",
-                        $"canCast={canCast} selectedNull={spellToCast == null}");
-                }
-            }
-            else if (hasAuthority &&
-                     Time.time >=
-                         nextClientRangedAttackRequestTime)
-            {
-                uint targetNetId = GetCurrentTargetNetId();
-
-                if (TryApplyClientOwnedTouchSpellLocally(targetNetId))
-                {
-                    nextClientRangedAttackRequestTime =
-                        Time.time +
-                        CLIENT_RANGED_REQUEST_COOLDOWN;
-                    InvalidateTouchSpellEligibility();
-                    attack.ResetMeleeTimer();
-                    return true;
-                }
-
-                if (DEBUG_MP_TOUCH_SPELL_FORWARDING)
-                {
-                    DebugMpTouchSpell(
-                        "ClientRequestTouch",
-                        $"targetNetId={targetNetId}");
-                }
-
-                nextClientRangedAttackRequestTime =
-                    Time.time +
-                    CLIENT_RANGED_REQUEST_COOLDOWN;
-                CmdRequestTouchSpellCast(targetNetId);
-                InvalidateTouchSpellEligibility();
-                attack.ResetMeleeTimer();
-                return true;
-            }
-
-            return false;
+            if (!CanCastTouchSpellHandler() || SelectedSpell == null ||
+                !entityEffectManager.SetReadySpell(SelectedSpell))
+                return false;
+            // The same owner now prepares AND releases the spell. No speculative
+            // server request can consume the shared melee cooldown.
+            BeginOwnerAttackAnimation(MobileStates.Spell);
+            InvalidateTouchSpellEligibility();
+            attack.ResetMeleeTimer();
+            return true;
         }
 
         // Preserve original DFU touch-spell behavior and avoid constructing MP debug/network

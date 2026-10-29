@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using Mirror;
@@ -2622,8 +2622,8 @@ private bool SrvTryGetDungeonAnchorForQuestFoePosition(UnityEngine.Vector3 world
         if (candidate == null)
             continue;
 
-        float candidateY = Mathf.Abs(candidate.PositionY) > 0.01f ? candidate.PositionY : candidate.transform.position.y;
-        float yDistance = Mathf.Abs(worldPosition.y - candidateY);
+        if (!NetworkDungeonGrid.Contains(candidate, worldPosition)) continue;
+        float yDistance = (worldPosition - candidate.GridPosition).sqrMagnitude;
 
         if (yDistance < bestYDistance)
         {
@@ -2652,11 +2652,8 @@ private bool SrvLooksLikeNetworkDungeonPosition(UnityEngine.Vector3 worldPositio
         if (candidate == null)
             continue;
 
-        float candidateY = Mathf.Abs(candidate.PositionY) > 0.01f ? candidate.PositionY : candidate.transform.position.y;
-
-        // Network dungeon enemies are usually within the same vertical slot as the dungeon root,
-        // but can be tens of Unity units above it depending on block/floor. Keep the band wide.
-        if (Mathf.Abs(worldPosition.y - candidateY) <= 120f)
+        // Match all three axes: several columns share each underground height.
+        if (NetworkDungeonGrid.Contains(candidate, worldPosition))
             return true;
     }
 
@@ -4500,9 +4497,6 @@ private int SrvRebindDungeonEnemiesToTeleportPcAnchor(DaggerfallDungeon dungeon,
     if (dungeon == null)
         return 0;
 
-    float dungeonY = Mathf.Abs(dungeon.PositionY) > 0.01f ? dungeon.PositionY : dungeon.transform.position.y;
-    const float sameDungeonYBand = 145f;
-
     int count = 0;
     EnemyWorldPosition[] worldPositions = FindObjectsOfType<EnemyWorldPosition>();
     for (int i = 0; i < worldPositions.Length; i++)
@@ -4517,15 +4511,15 @@ private int SrvRebindDungeonEnemiesToTeleportPcAnchor(DaggerfallDungeon dungeon,
 
         Transform enemyTransform = ewp.transform;
         bool childOfDungeon = enemyTransform.IsChildOf(dungeon.transform);
-        bool sameDungeonYSlot = enemyTransform.position.y <= -250f && Mathf.Abs(enemyTransform.position.y - dungeonY) <= sameDungeonYBand;
+        bool sameDungeonSlot = NetworkDungeonGrid.FindAt(enemyTransform.position) == dungeon;
 
         SetupDemoEnemy setup = ewp.GetComponent<SetupDemoEnemy>();
         bool markedDungeonEnemy = ewp.isDungeonSpawn || (setup != null && setup.isDungeonEnemy);
         bool hasEnemyComponent = ewp.GetComponent<DaggerfallEnemy>() != null;
 
         // Imported RDB enemies are normally children of the generated dungeon blocks.
-        // Some MP paths move enemies to scene root, so also accept enemies in the same network dungeon Y slot.
-        if (!childOfDungeon && !(sameDungeonYSlot && (markedDungeonEnemy || hasEnemyComponent)))
+        // Some MP paths move enemies to scene root, so also accept enemies in the same network dungeon grid slot.
+        if (!childOfDungeon && !(sameDungeonSlot && (markedDungeonEnemy || hasEnemyComponent)))
             continue;
 
         int oldX = ewp.worldX;
@@ -4537,7 +4531,7 @@ private int SrvRebindDungeonEnemiesToTeleportPcAnchor(DaggerfallDungeon dungeon,
 
         if (oldX != anchorWorldX || oldZ != anchorWorldZ)
         {
-            Debug.Log($"[TeleportPcMP][AnchorRebind] Enemy '{ewp.name}' DF anchor {oldX}/{oldZ} -> {anchorWorldX}/{anchorWorldZ}. requester={requesterNetId} reason={reason} childOfDungeon={childOfDungeon} sameYSlot={sameDungeonYSlot} y={enemyTransform.position.y:F1} dungeonY={dungeonY:F1}");
+            Debug.Log($"[TeleportPcMP][AnchorRebind] Enemy '{ewp.name}' DF anchor {oldX}/{oldZ} -> {anchorWorldX}/{anchorWorldZ}. requester={requesterNetId} reason={reason} childOfDungeon={childOfDungeon} sameDungeonSlot={sameDungeonSlot} y={enemyTransform.position.y:F1} dungeonY={dungeon.PositionY:F1}");
         }
     }
 
@@ -5776,7 +5770,8 @@ private void HandleDungeonRequestFromHost(
     }
 
     // Host-authoritative Y allocation. Do not use object count; destroyed dungeons make count-based slots unsafe.
-    float assignedY = DaggerfallDungeon.GetNextAvailableDungeonY();
+    Vector3 assignedPosition = NetworkDungeonGrid.Allocate(location);
+    float assignedY = assignedPosition.y;
 
     GameObject prefab = NetworkManager.singleton.spawnPrefabs
         .FirstOrDefault(p => p.GetComponent<DaggerfallDungeon>() != null);
@@ -5793,10 +5788,10 @@ private void HandleDungeonRequestFromHost(
 
     GameObject dungeonObject = Instantiate(prefab);
     dungeonObject.name = dungeonSceneName;
-    dungeonObject.transform.position = new Vector3(0, assignedY, 0);
+    dungeonObject.transform.position = assignedPosition;
 
     DaggerfallDungeon dungeonComponentNew = dungeonObject.GetComponent<DaggerfallDungeon>();
-    dungeonComponentNew.PositionY = assignedY;
+    dungeonComponentNew.SetGridPosition(assignedPosition);
 
     if (hasExplicitDungeonAnchor)
     {
@@ -6005,7 +6000,18 @@ private IEnumerator DelayedDungeonSpawn(
 
     Debug.Log($"[DelayedDungeonSpawn] Found prefab. Applying host data for {dungeonData.LocationName}. hostY={dungeonData.PositionY}");
 
+    bool shouldAutoEnter = enterAfterReady && isLocalPlayer && netId == dungeonData.RequesterNetId;
+    if (dungeon.isSet && !shouldAutoEnter)
+    {
+        // Repeated syncs must not replace water levels, live action state, or layout
+        // data on a dungeon already built on this client.
+        Debug.Log($"[LazyDungeon] Dungeon already loaded. Ignoring redundant sync for '{dungeonData.LocationName}'.");
+        yield break;
+    }
+
     DFLocation location;
+    if (!dungeon.isSet)
+    {
     string locationResolution;
     if (!DaggerfallDungeon.TryResolveNetworkDungeonLocation(dungeonData, out location, out locationResolution))
     {
@@ -6045,7 +6051,7 @@ private IEnumerator DelayedDungeonSpawn(
     // Use the host-authored Y from the RPC immediately.
     // Do not wait for the PositionY SyncVar here; on a late/pending spawn it can still be the prefab/default value for a frame.
     dungeon.PositionY = dungeonData.PositionY;
-    dungeon.transform.position = new Vector3(0, dungeonData.PositionY, 0);
+    dungeon.SetGridPosition(new Vector3(dungeonData.PositionX, dungeonData.PositionY, dungeonData.PositionZ));
     dungeon.ApplyNetworkDungeonIdentityFromData(dungeonData);
 
     dungeon.ApplyAuthoritativeGenerationSpec(dungeonData);
@@ -6058,12 +6064,25 @@ private IEnumerator DelayedDungeonSpawn(
         Debug.LogWarning("[DelayedDungeonSpawn] WARNING: Dungeon sync did not contain a generation spec. Client will use local fallback generation.");
     }
 
-    dungeon.ScheduleDeferredGeneration(dungeonData.PositionY);
+    }
+    else
+    {
+        // A normal entrance or party rendezvous could have loaded the same
+        // dungeon before a delayed TargetRpc arrived. Keep its generated state.
+        if (dungeon.DungeonInstanceId != dungeonData.DungeonInstanceId)
+        {
+            Debug.LogWarning($"[LazyDungeon] Rejecting mismatched instance sync for loaded dungeon '{dungeonData.LocationName}'.");
+            yield break;
+        }
+        location = dungeon.Summary.LocationData;
+    }
 
-    Debug.Log($"[DelayedDungeonSpawn] Blocks count = {summary.LocationData.Dungeon.Blocks?.Length}");
+    if (shouldAutoEnter)
+        dungeon.ScheduleDeferredGeneration(dungeonData.PositionY);
+    else
+        Debug.Log($"[LazyDungeon] Metadata only for '{dungeonData.LocationName}' netId={dungeonData.DungeonNetId}; skipping RDB/lights.");
+
     Debug.Log($"[DelayedDungeonSpawn] Dungeon sync applied: {dungeonData.LocationName} at hostY={dungeonData.PositionY}");
-
-    bool shouldAutoEnter = enterAfterReady && isLocalPlayer && netId == dungeonData.RequesterNetId;
 
     if (shouldAutoEnter)
     {
@@ -6207,10 +6226,18 @@ private IEnumerator WaitForTeleportPcDungeonReady(DaggerfallDungeon dungeon, DFL
 
 private IEnumerator WaitForDungeonReady(DaggerfallDungeon dungeon, DFLocation location)
 {
-    while (!dungeon.isSet || dungeon.StartMarker == null || !dungeon.InitialSavedActionStateReady) // Wait for full generation and first-creator state
+    float timeoutAt = Time.realtimeSinceStartup + 25f;
+    while (dungeon != null && (!dungeon.isSet || dungeon.StartMarker == null || !dungeon.InitialSavedActionStateReady))
     {
+        if (Time.realtimeSinceStartup > timeoutAt)
+        {
+            Debug.LogError($"[LazyDungeon] Timed out generating '{location.Name}' for normal dungeon entry.");
+            yield break;
+        }
         yield return null;
     }
+    if (dungeon == null)
+        yield break;
 
     Debug.Log($"[WaitForDungeonReady] Dungeon is fully generated. Moving player inside.");
 

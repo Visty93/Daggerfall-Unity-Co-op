@@ -188,12 +188,12 @@ namespace DaggerfallWorkshop.Utility
                 if (combiner.VertexCount > 0)
                 {
                     combiner.Apply();
-                    GameObject cgo = GameObjectHelper.CreateCombinedMeshGameObject(
+                    GameObject cgo = ServerDungeonPresentation.CreateCombinedModel(
                         combiner,
                         "CombinedModels",
                         modelsNode.transform,
                         dfUnity.Option_SetStaticFlags);
-                    cgo.GetComponent<DaggerfallMesh>().SetDungeonTextures(textureTable);
+                    ServerDungeonPresentation.SetDungeonTextures(cgo.GetComponent<DaggerfallMesh>(), textureTable);
                 }
             }
 
@@ -250,7 +250,7 @@ namespace DaggerfallWorkshop.Utility
 
                             var dfMesh = cgo.GetComponent<DaggerfallMesh>();
                             if (dfMesh)
-                                dfMesh.SetDungeonTextures(textureTable);
+                                ServerDungeonPresentation.SetDungeonTextures(dfMesh, textureTable);
 
                             // Add action component to door if it also has an action
                             if (HasAction(obj))
@@ -268,6 +268,7 @@ namespace DaggerfallWorkshop.Utility
         /// </summary>
         public static void AddLights(GameObject go, ref DFBlock blockData)
         {
+            if (ServerDungeonPresentation.Current != null) return;
             DaggerfallUnity dfUnity = DaggerfallUnity.Instance;
             if (!dfUnity.IsReady)
                 return;
@@ -666,7 +667,7 @@ namespace DaggerfallWorkshop.Utility
                             if (combiner == null || hasAction || PlayerActivate.HasCustomActivation(modelId))
                             {
                                 standaloneObject = AddStandaloneModel(dfUnity, ref modelData, modelMatrix, parent, isAutomapRun, hasAction);
-                                standaloneObject.GetComponent<DaggerfallMesh>().SetDungeonTextures(textureTable);
+                                ServerDungeonPresentation.SetDungeonTextures(standaloneObject.GetComponent<DaggerfallMesh>(), textureTable);
                             }
                             else
                             {
@@ -734,7 +735,7 @@ namespace DaggerfallWorkshop.Utility
 
             // Add GameObject
             uint modelID = (uint)modelData.DFMesh.ObjectId;
-            GameObject modelGO = GameObjectHelper.CreateDaggerfallMeshGameObject(modelID, parent, makeStatic, null, ignoreCollider, convexCollider);
+            GameObject modelGO = ServerDungeonPresentation.CreateModel(modelID, parent, makeStatic, null, ignoreCollider, convexCollider);
             modelGO.transform.position = matrix.GetColumn(3);
             modelGO.transform.rotation = matrix.rotation;
             modelGO.transform.localScale = matrix.lossyScale;
@@ -1144,7 +1145,7 @@ namespace DaggerfallWorkshop.Utility
             if (!go)
             {
                 go = GameObjectHelper.InstantiatePrefab(dfUnity.Option_DungeonDoorPrefab.gameObject, string.Empty, parent, Vector3.zero);
-                GameObjectHelper.CreateDaggerfallMeshGameObject(modelId, parent, false, go, true);
+                ServerDungeonPresentation.CreateModel(modelId, parent, false, go, true);
 
                 // Resize box collider to new mesh bounds
                 BoxCollider boxCollider = go.GetComponent<BoxCollider>();
@@ -1217,7 +1218,7 @@ namespace DaggerfallWorkshop.Utility
             if (!go)
             {
                 // Setup standard billboard and assign RDB data
-                go = GameObjectHelper.CreateDaggerfallBillboardGameObject(archive, record, parent);
+                go = ServerDungeonPresentation.CreateBillboard(archive, record, parent);
                 go.transform.position = targetPosition;
             }
             Billboard dfBillboard = go.GetComponent<Billboard>();
@@ -1498,6 +1499,9 @@ namespace DaggerfallWorkshop.Utility
             AddEnemy(obj, type, parent, loadID, classicSpawnDistanceType, true, waterLevel);
         }
 
+        // Scoped only around stress-test layout selection. Normal imports remain synchronous.
+        internal static List<Func<GameObject>> GridTestEnemyCapture;
+
         private static void AddEnemy(
             DFBlock.RdbObject obj,
             MobileTypes type,
@@ -1507,13 +1511,29 @@ namespace DaggerfallWorkshop.Utility
             bool useGenderFlag = true,
             int waterLevel = 10000)
         {
+            if (GridTestEnemyCapture != null)
+                GridTestEnemyCapture.Add(() => CreateRDBEnemy(obj, type, parent, loadID, classicSpawnDistanceType, useGenderFlag, waterLevel, true));
+            else
+                CreateRDBEnemy(obj, type, parent, loadID, classicSpawnDistanceType, useGenderFlag, waterLevel);
+        }
+
+        private static GameObject CreateRDBEnemy(
+            DFBlock.RdbObject obj,
+            MobileTypes type,
+            Transform parent = null,
+            ulong loadID = 0,
+            byte classicSpawnDistanceType = 0,
+            bool useGenderFlag = true,
+            int waterLevel = 10000,
+            bool usePlacedParent = false)
+        {
             // Water level check. This is done by classic and is needed in at least one case, where otherwise
             // a slaughterfish will be placed outside of water.
             // These are classic values, so a greater y value means elevation is lower
             if ((type == MobileTypes.Slaughterfish || type == MobileTypes.Dreugh || type == MobileTypes.Lamia)
                 && (waterLevel == 10000 || waterLevel - 20 > obj.YPos))
             {
-                return;
+                return null;
             }
 
             // Get default reaction
@@ -1535,6 +1555,11 @@ namespace DaggerfallWorkshop.Utility
             // Just setup demo enemies at this time
             string name = string.Format("DaggerfallEnemy [{0}]", type.ToString());
             Vector3 position = new Vector3(obj.XPos, -obj.YPos, obj.ZPos) * MeshReader.GlobalScale;
+            // Paced grid-test imports run after block placement. The prefab helper
+            // takes a world position, while the RDB marker is block-local.
+            // Resolve before setup, ground alignment, spawn events and network spawn.
+            if (usePlacedParent && parent != null)
+                position = parent.TransformPoint(position);
             GameObject go = GameObjectHelper.InstantiatePrefab(DaggerfallUnity.Instance.Option_EnemyPrefab.gameObject, name, parent, position);
             SetupDemoEnemy setupEnemy = go.GetComponent<SetupDemoEnemy>();
             if (setupEnemy != null)
@@ -1559,6 +1584,7 @@ namespace DaggerfallWorkshop.Utility
             }
 
             GameManager.Instance?.RaiseOnEnemySpawnEvent(go);
+            return go;
 
         }
 

@@ -1,4 +1,4 @@
-// Project:         Daggerfall Unity
+﻿// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -207,8 +207,62 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
             }
         }
 
+        // Busy effect managers never sleep. Event subscriptions and projectile records
+        // remain intact, and gameplay entry points wake the peer entity before effects run.
+        public bool CanSuspendNetworkObserverUpdates
+        {
+            get
+            {
+                return !IsPlayerEntity && instancedBundles.Count == 0 && bundlesToRemove.Count == 0 &&
+                    !wipeAllBundles && readySpell == null && !castInProgress &&
+                    Time.unscaledTime >= observerEffectWakeUntil;
+            }
+        }
+
+        private float observerEffectWakeUntil;
+        private void WakeObserverForEffect()
+        {
+            // Direct stat/skill modifiers can be supplied without a live bundle.
+            // Keep full updates until at least the next normal magic round.
+            observerEffectWakeUntil = float.PositiveInfinity;
+            var authority = GetComponent<global::DynamicEnemyAuthority>();
+            if (authority != null) authority.WakeObserverRuntime();
+        }
+
+        public bool PrepareNetworkObserverDormancy()
+        {
+            if (!enabled || !CanSuspendNetworkObserverUpdates || entityBehaviour == null ||
+                entityBehaviour.Entity == null || !GameManager.Instance.IsPlayingGame() ||
+                SaveLoadManager.Instance.LoadInProgress) return false;
+            // Finish cleanup once while the entity is still enabled. No active effects
+            // are frozen; all effect insertion/direct-mod APIs wake this runtime.
+            DoConstantEffects();
+            UpdateEntityMods();
+            refreshModsTimer = 0f;
+            if (IsNetworkCombatEnemy()) RefreshOwnerProjectileEpoch();
+            return CanSuspendNetworkObserverUpdates && entityBehaviour.Entity.CurrentHealth > 0;
+        }
+
+        public void TickDormantNetworkObserver()
+        {
+            if (enabled || !gameObject.activeInHierarchy) return;
+            if (!CanSuspendNetworkObserverUpdates)
+            {
+                var authority = GetComponent<global::DynamicEnemyAuthority>();
+                if (authority != null) authority.WakeObserverRuntime();
+                return;
+            }
+            // Idle observer maintenance only: no bundle iteration, stat-array rebuild,
+            // constant-effect reset, spell casting, or Update() replay.
+            if (IsNetworkCombatEnemy()) RefreshOwnerProjectileEpoch();
+            if (entityBehaviour != null && entityBehaviour.Entity != null &&
+                entityBehaviour.Entity.CurrentMagicka > entityBehaviour.Entity.MaxMagicka)
+                entityBehaviour.Entity.CurrentMagicka = entityBehaviour.Entity.MaxMagicka;
+        }
+
         private void Update()
         {
+            if (IsNetworkCombatEnemy()) RefreshOwnerProjectileEpoch();
             // Do nothing if no peer entity, game not in play, or load in progress
             if (!entityBehaviour || !GameManager.Instance.IsPlayingGame() || SaveLoadManager.Instance.LoadInProgress)
                 return;
@@ -321,6 +375,12 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
         /// </summary>
         public bool SetReadySpell(EntityEffectBundle spell, bool noSpellPointCost = false)
         {
+            if (IsNetworkCombatEnemy())
+            {
+                RefreshOwnerProjectileEpoch();
+                if (!IsEnemySimulator()) return false;
+            }
+            WakeObserverForEffect();
             // Do nothing if silenced or cast already in progress
             if ((SilenceCheck() && !noSpellPointCost) || castInProgress)
                 return false;
@@ -396,6 +456,11 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
 
         public void CastNoAnimSpell()
         {
+            if (IsNetworkCombatEnemy())
+            {
+                CastReadySpell();
+                return;
+            }
             // Must have a spell loaded
             if (readySpell == null)
                 return;
@@ -442,6 +507,11 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
 
         public void CastReadySpell()
         {
+            if (IsNetworkCombatEnemy() && !IsEnemySimulator())
+            {
+                if (readySpell != null) AbortReadySpell();
+                return;
+            }
             // Do nothing if silenced
             if (SilenceCheck())
                 return;
@@ -506,6 +576,7 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
 
         public void AssignBundle(EntityEffectBundle sourceBundle, AssignBundleFlags flags = AssignBundleFlags.None)
         {
+            WakeObserverForEffect();
             // Check flags
             bool showNonPlayerFailures = (flags & AssignBundleFlags.ShowNonPlayerFailures) == AssignBundleFlags.ShowNonPlayerFailures;
             bool bypassSavingThrows = (flags & AssignBundleFlags.BypassSavingThrows) == AssignBundleFlags.BypassSavingThrows;
@@ -849,6 +920,7 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
         /// <param name="statMods">Stat mods array, must be DaggerfallStats.Count length.</param>
         public void MergeDirectStatMods(int[] statMods)
         {
+            WakeObserverForEffect();
             if (statMods == null || statMods.Length != DaggerfallStats.Count)
                 return;
 
@@ -865,6 +937,7 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
         /// <param name="skillMods">Skill mods array, must be DaggerfallSkills.Count length.</param>
         public void MergeDirectSkillMods(int[] skillMods)
         {
+            WakeObserverForEffect();
             if (skillMods == null || skillMods.Length != DaggerfallSkills.Count)
                 return;
 
@@ -2191,6 +2264,235 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
 
         #region EnemyCasting
 
+        private EnemyMotor ownerCombatMotor;
+        private uint nextOwnerCastId = 1;
+        [SyncVar] private int ownerManaSnapshot = -1;
+        private int ownerProjectileEpoch;
+        private bool wasEnemySimulator;
+
+        private sealed class OwnerSpellRecord
+        {
+            public NetworkConnectionToClient Owner;
+            public EntityEffectBundle Spell;
+            public float Expires;
+            public readonly HashSet<uint> Victims = new HashSet<uint>();
+        }
+        private readonly Dictionary<uint, OwnerSpellRecord> ownerSpellRecords = new Dictionary<uint, OwnerSpellRecord>();
+
+        private bool IsNetworkCombatEnemy()
+        {
+            if ((!NetworkClient.active && !NetworkServer.active) || IsPlayerEntity)
+                return false;
+            // Local/mod-created entities can have effects without a NetworkIdentity.
+            // NetworkBehaviour.netId dereferences that identity in this Mirror version.
+            NetworkIdentity identity = GetComponent<NetworkIdentity>();
+            if (identity == null || identity.netId == 0)
+                return false;
+            if (ownerCombatMotor == null) ownerCombatMotor = GetComponent<EnemyMotor>();
+            return ownerCombatMotor != null;
+        }
+
+        private bool IsEnemySimulator()
+        {
+            return !IsNetworkCombatEnemy() || ownerCombatMotor.ShouldSimulateCombat();
+        }
+
+        private void RefreshOwnerProjectileEpoch()
+        {
+            bool simulator = IsEnemySimulator();
+            if (entityBehaviour != null && entityBehaviour.Entity != null)
+            {
+                if (isServer)
+                    ownerManaSnapshot = entityBehaviour.Entity.CurrentMagicka;
+                else if (ownerManaSnapshot >= 0 && (!simulator || !wasEnemySimulator))
+                    entityBehaviour.Entity.CurrentMagicka = Mathf.Clamp(ownerManaSnapshot, 0, entityBehaviour.Entity.MaxMagicka);
+            }
+            if (simulator != wasEnemySimulator)
+            {
+                wasEnemySimulator = simulator;
+                ownerProjectileEpoch++;
+                if (!simulator && readySpell != null) AbortReadySpell();
+            }
+        }
+
+        public override void OnStopAuthority()
+        {
+            base.OnStopAuthority();
+            ownerProjectileEpoch++;
+            if (IsNetworkCombatEnemy() && readySpell != null) AbortReadySpell();
+        }
+
+        private void CastOwnerNetworkSpell(EntityEffectBundle spell)
+        {
+            RefreshOwnerProjectileEpoch();
+            uint castId = nextOwnerCastId++;
+            if (nextOwnerCastId == 0) nextOwnerCastId = 1;
+            int epoch = ownerProjectileEpoch;
+            Vector3 origin, aim;
+            GetEnemySpellAim(out origin, out aim);
+            string data = SerializeSpellData(spell);
+            int magicka = entityBehaviour.Entity.CurrentMagicka;
+            if (isServer)
+                ServerBeginOwnerSpell(castId, data, origin - transform.position, aim, magicka, null);
+            else
+                CmdBeginOwnerSpell(castId, data, origin - transform.position, aim, magicka);
+
+            if (spell.Settings.TargetType == TargetTypes.CasterOnly)
+            {
+                // Persistent effects on enemy entities retain server authority.
+                ReportOwnerSpellImpact(castId, entityBehaviour);
+                return;
+            }
+            DaggerfallMissile missile = InstantiateSpellMissile(spell.Settings.ElementType);
+            if (missile == null) return;
+            missile.Payload = spell;
+            missile.CustomAimPosition = origin;
+            missile.CustomAimDirection = aim;
+            missile.OwnerDrivenEnemyProjectile = true;
+            missile.OwnerSimulationValid = () => this != null && epoch == ownerProjectileEpoch &&
+                IsNetworkCombatEnemy() && IsEnemySimulator() && entityBehaviour != null && entityBehaviour.Entity != null && entityBehaviour.Entity.CurrentHealth > 0;
+            missile.OwnerImpact = victim => ReportOwnerSpellImpact(castId, victim);
+        }
+
+        [Command]
+        private void CmdBeginOwnerSpell(uint castId, string data, Vector3 originOffset, Vector3 aim,
+            int magicka, NetworkConnectionToClient sender = null)
+        {
+            ServerBeginOwnerSpell(castId, data, originOffset, aim, magicka, sender);
+        }
+
+        private bool IsCurrentSpellSender(NetworkConnectionToClient sender)
+        {
+            if (!isServer || !IsNetworkCombatEnemy()) return false;
+            return sender == null ? IsEnemySimulator() : netIdentity.connectionToClient == sender;
+        }
+
+        private static bool FiniteAim(Vector3 vector)
+        {
+            return !float.IsNaN(vector.x) && !float.IsInfinity(vector.x) &&
+                !float.IsNaN(vector.y) && !float.IsInfinity(vector.y) &&
+                !float.IsNaN(vector.z) && !float.IsInfinity(vector.z);
+        }
+
+        [Server]
+        private void ServerBeginOwnerSpell(uint castId, string data, Vector3 originOffset, Vector3 aim,
+            int magicka, NetworkConnectionToClient sender)
+        {
+            if (!IsCurrentSpellSender(sender) || castId == 0 || string.IsNullOrEmpty(data) ||
+                data.Length > 65536 || !FiniteAim(originOffset) || originOffset.sqrMagnitude > 100f ||
+                !FiniteAim(aim) || aim.sqrMagnitude < 0.001f) return;
+            EntityEffectBundle spell;
+            try { spell = DeserializeSpellData(data); }
+            catch (Exception) { return; }
+            if (spell == null || spell.Settings.Effects == null || spell.Settings.Effects.Length == 0) return;
+            TargetTypes kind = spell.Settings.TargetType;
+            if (kind != TargetTypes.CasterOnly && kind != TargetTypes.ByTouch &&
+                kind != TargetTypes.SingleTargetAtRange && kind != TargetTypes.AreaAtRange &&
+                kind != TargetTypes.AreaAroundCaster) return;
+
+            // Event-time housekeeping only; no server casting decisions or collision work.
+            List<uint> expired = new List<uint>();
+            foreach (var pair in ownerSpellRecords)
+                if (pair.Value.Expires < Time.unscaledTime || pair.Value.Owner != sender)
+                    expired.Add(pair.Key);
+            foreach (uint id in expired) ownerSpellRecords.Remove(id);
+            if (ownerSpellRecords.ContainsKey(castId) || ownerSpellRecords.Count >= 64) return;
+            ownerSpellRecords.Add(castId, new OwnerSpellRecord {
+                Owner = sender, Spell = spell, Expires = Time.unscaledTime + 12f });
+            entityBehaviour.Entity.CurrentMagicka = Mathf.Clamp(magicka, 0, entityBehaviour.Entity.MaxMagicka);
+            ownerManaSnapshot = entityBehaviour.Entity.CurrentMagicka;
+            RpcOwnerSpellVisual(data, originOffset, aim.normalized, entityBehaviour.Entity.CurrentMagicka);
+        }
+
+        private void ReportOwnerSpellImpact(uint castId, DaggerfallEntityBehaviour victim)
+        {
+            if (!IsEnemySimulator()) return;
+            victim = DaggerfallMissile.ResolveEnemyCombatVictim(victim);
+            NetworkIdentity targetIdentity = victim != null ? victim.GetComponent<NetworkIdentity>() : null;
+            if (targetIdentity == null || (targetIdentity.netId == 0 && victim.GetComponent<PlayerMultiplayer>() == null)) return;
+            if (isServer) ServerOwnerSpellImpact(castId, targetIdentity.netId, null);
+            else if (hasAuthority) CmdOwnerSpellImpact(castId, targetIdentity.netId);
+        }
+
+        [Command]
+        private void CmdOwnerSpellImpact(uint castId, uint targetId, NetworkConnectionToClient sender = null)
+        {
+            ServerOwnerSpellImpact(castId, targetId, sender);
+        }
+
+        [Server]
+        private void ServerOwnerSpellImpact(uint castId, uint targetId, NetworkConnectionToClient sender)
+        {
+            OwnerSpellRecord cast;
+            if (!IsCurrentSpellSender(sender) || !ownerSpellRecords.TryGetValue(castId, out cast) ||
+                cast.Owner != sender || cast.Expires < Time.unscaledTime || cast.Victims.Contains(targetId)) return;
+            bool area = cast.Spell.Settings.TargetType == TargetTypes.AreaAtRange ||
+                cast.Spell.Settings.TargetType == TargetTypes.AreaAroundCaster;
+            if (!area && cast.Victims.Count != 0) return;
+            NetworkIdentity victimIdentity;
+            if (!NetworkServer.spawned.TryGetValue(targetId, out victimIdentity) || victimIdentity == null)
+            {
+                victimIdentity = targetId == 0 && NetworkServer.localConnection != null ?
+                    NetworkServer.localConnection.identity : null;
+                if (victimIdentity == null) return;
+            }
+            DaggerfallEntityBehaviour victim = victimIdentity.GetComponent<DaggerfallEntityBehaviour>();
+            if (victim == null || victim.Entity == null) return;
+            TargetTypes kind = cast.Spell.Settings.TargetType;
+            if (kind == TargetTypes.CasterOnly && victimIdentity != netIdentity) return;
+            if (kind != TargetTypes.CasterOnly && victimIdentity == netIdentity) return;
+            float maxDistance = (kind == TargetTypes.ByTouch || kind == TargetTypes.AreaAroundCaster) ? 12f : 280f;
+            if ((victim.transform.position - transform.position).sqrMagnitude > maxDistance * maxDistance) return;
+            PlayerMultiplayer player = victimIdentity.GetComponent<PlayerMultiplayer>();
+            if (player != null)
+            {
+                if (player.IsDownedForRevive || player.LifeState != PlayerMultiplayer.MultiplayerLifeState.Alive) return;
+                cast.Victims.Add(targetId);
+                if (player.isLocalPlayer)
+                {
+                    var localEffects = GameManager.Instance.PlayerEntityBehaviour.GetComponent<EntityEffectManager>();
+                    if (localEffects != null) localEffects.AssignBundle(cast.Spell, AssignBundleFlags.ShowNonPlayerFailures);
+                }
+                else if (player.connectionToClient != null && player.connectionToClient.isReady)
+                    player.TargetApplyEnemyTouchSpellPayload(player.connectionToClient, netId, -1, SerializeSpellData(cast.Spell));
+            }
+            else
+            {
+                EnemySenses senses = GetComponent<EnemySenses>();
+                if (victim != entityBehaviour && senses != null && senses.IsQuestInfightingTargetBlocked(victim)) return;
+                EntityEffectManager effects = victim.GetComponent<EntityEffectManager>();
+                if (effects == null) return;
+                cast.Victims.Add(targetId);
+                effects.AssignBundle(cast.Spell, AssignBundleFlags.ShowNonPlayerFailures);
+            }
+        }
+
+        [ClientRpc]
+        private void RpcOwnerSpellVisual(string data, Vector3 originOffset, Vector3 aim, int magicka)
+        {
+            if (IsEnemySimulator()) return; // Owner already paid and created the real cast.
+            if (entityBehaviour != null && entityBehaviour.Entity != null)
+                entityBehaviour.Entity.CurrentMagicka = Mathf.Max(0, magicka);
+            var presentation = GetComponent<DynamicEnemyAuthority>();
+            if (presentation != null && presentation.IsLocalPresentationSuspended) return;
+            EntityEffectBundle spell;
+            try { spell = DeserializeSpellData(data); }
+            catch (Exception) { return; }
+            if (spell == null) return;
+            PlayCastSound(entityBehaviour, GetCastSoundID(spell.Settings.ElementType));
+            DaggerfallMissile visual = InstantiateSpellMissile(spell.Settings.ElementType);
+            if (visual == null) return;
+            visual.VisualOnly = true;
+            visual.OwnerDrivenEnemyVisual = true;
+            visual.Caster = entityBehaviour;
+            visual.ElementType = spell.Settings.ElementType;
+            visual.TargetType = spell.Settings.TargetType == TargetTypes.CasterOnly ? TargetTypes.ByTouch : spell.Settings.TargetType;
+            visual.CustomAimPosition = transform.position + originOffset;
+            visual.CustomAimDirection = aim;
+            // No payload and no local-player-only damage projectile on observers.
+        }
+
+
         // For enemies this is equivalent to PlayerSpellCasting_OnReleaseFrame()
         // Might need to time cast to enemy release - whatever looks best
         void EnemyCastReadySpell()
@@ -2219,42 +2521,24 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
                 }
             }
 
-            bool networkActive = NetworkServer.active || NetworkClient.active;
-            bool canExecuteRealCast = !networkActive || isServer;
-
-            if (canExecuteRealCast)
+            if (IsNetworkCombatEnemy())
             {
-                if (spellToCast.Settings.TargetType == TargetTypes.CasterOnly)
+                CastOwnerNetworkSpell(spellToCast);
+            }
+            else if (spellToCast.Settings.TargetType == TargetTypes.CasterOnly)
+            {
+                AssignBundle(spellToCast);
+            }
+            else
+            {
+                Vector3 origin, aim;
+                GetEnemySpellAim(out origin, out aim);
+                DaggerfallMissile missile = InstantiateSpellMissile(spellToCast.Settings.ElementType);
+                if (missile != null)
                 {
-                    AssignBundle(spellToCast);
-                }
-                else
-                {
-                    Vector3 aimPosition;
-                    Vector3 aimDirection;
-                    GetEnemySpellAim(out aimPosition, out aimDirection);
-
-                    DaggerfallMissile missile = InstantiateSpellMissile(spellToCast.Settings.ElementType);
-                    if (missile)
-                    {
-                        missile.CustomAimPosition = aimPosition;
-                        missile.CustomAimDirection = aimDirection;
-                        missile.Payload = spellToCast;
-                    }
-
-                    // Remote clients get a visual-only missile. The authoritative cast above
-                    // is the only one allowed to assign payload damage/effects. This prevents
-                    // observer missiles from colliding with or damaging the caster/enemy copy.
-                    if (isServer)
-                    {
-                        RpcTriggerSpellVisual(
-                            spellToCast.Settings.ElementType,
-                            spellToCast.Settings.TargetType,
-                            aimPosition,
-                            aimDirection,
-                            GetEnemySpellTargetNetId(),
-                            SerializeSpellData(spellToCast));
-                    }
+                    missile.CustomAimPosition = origin;
+                    missile.CustomAimDirection = aim;
+                    missile.Payload = spellToCast;
                 }
             }
 
@@ -2267,36 +2551,12 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
             castInProgress = false;
             readySpellDoesNotCostSpellPoints = false;
 
-            // Server consumes enemy magicka for the real cast. Client-owned enemies run
-            // their AI locally, so mirror the new magicka value back or the owner will
-            // keep thinking this enemy can cast and will keep requesting failed spells.
-            if (isServer && entityBehaviour != null && entityBehaviour.Entity != null)
-                RpcSyncEnemyMagickaAfterSpell(entityBehaviour.Entity.CurrentMagicka);
+
         }
 
-        private uint GetEnemySpellTargetNetId()
-        {
-            if (entityBehaviour == null)
-                return 0;
+        
 
-            EnemySenses enemySenses = entityBehaviour.GetComponent<EnemySenses>();
-            if (enemySenses == null || enemySenses.Target == null)
-                return 0;
-
-            NetworkIdentity targetIdentity = enemySenses.Target.GetComponent<NetworkIdentity>();
-            return targetIdentity != null ? targetIdentity.netId : 0;
-        }
-
-        [ClientRpc]
-        private void RpcSyncEnemyMagickaAfterSpell(int currentMagicka)
-        {
-            // Host/server already has the authoritative value.
-            if (isServer)
-                return;
-
-            if (entityBehaviour != null && entityBehaviour.Entity != null)
-                entityBehaviour.Entity.CurrentMagicka = Mathf.Max(0, currentMagicka);
-        }
+        
 
         private void GetEnemySpellAim(out Vector3 aimPosition, out Vector3 aimDirection)
         {
@@ -2334,39 +2594,7 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
             }
         }
 
-        [ClientRpc]
-        void RpcTriggerSpellVisual(ElementTypes elementType, TargetTypes targetType, Vector3 aimPosition, Vector3 aimDirection, uint targetNetId, string spellData)
-        {
-            if (isServer)
-                return; // host already spawned the authoritative missile locally
-
-            EntityEffectBundle visualSpell = DeserializeSpellData(spellData);
-            if (visualSpell == null)
-                return;
-
-            bool localPlayerIsTarget = false;
-            try
-            {
-                PlayerMultiplayer localMultiplayer = PlayerMultiplayer.localPlayer;
-                localPlayerIsTarget = localMultiplayer != null && targetNetId != 0 && localMultiplayer.netId == targetNetId;
-            }
-            catch { localPlayerIsTarget = false; }
-
-            DaggerfallMissile missile = InstantiateSpellMissile(elementType);
-            if (missile)
-            {
-                // Observers get a harmless visual-only missile. The owning client gets
-                // a local-player-only payload missile so the spell can affect PlayerAdvanced
-                // without giving the missile solid physics or letting it damage/push enemies.
-                missile.VisualOnly = !localPlayerIsTarget;
-                missile.LocalPlayerOnlyPayload = localPlayerIsTarget;
-                missile.CustomAimPosition = aimPosition;
-                missile.CustomAimDirection = aimDirection;
-                missile.TargetType = targetType;
-                missile.ElementType = elementType;
-                missile.Payload = visualSpell;
-            }
-        }
+        
         // Convert Spell Data into a String
         string SerializeSpellData(EntityEffectBundle spell)
         {
@@ -2466,6 +2694,8 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects
 
         private void EntityEffectBroker_OnNewMagicRound()
         {
+            if (observerEffectWakeUntil > Time.unscaledTime)
+                observerEffectWakeUntil = Time.unscaledTime + 1f;
             DoMagicRound();
         }
 

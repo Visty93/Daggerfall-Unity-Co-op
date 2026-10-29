@@ -1,4 +1,4 @@
-﻿// Project:         Daggerfall Unity
+// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -704,7 +704,10 @@ public static GameObject CreateRDBBlockGameObject(
 if (importEnemies && (!NetworkClient.active || NetworkServer.active))
 {
     DaggerfallDungeon dungeonParent = go.GetComponentInParent<DaggerfallDungeon>();
-    GameManager.Instance.StartCoroutine(DelayedEnemySpawn(go, editorObjects, blockData, startMarkers, dungeonType, monsterPower, monsterVariance, seed, dungeonParent, spawnScalingLevel));
+    var testDungeon = NetworkDungeonGrid.CreatingTestDungeon;
+    var import = DelayedEnemySpawn(go, editorObjects, blockData, startMarkers, dungeonType, monsterPower, monsterVariance, seed,
+        testDungeon != null ? testDungeon : dungeonParent, spawnScalingLevel, testDungeon, NetworkDungeonGrid.CreatingPassiveTest);
+    GameManager.Instance.StartCoroutine(testDungeon != null ? NetworkDungeonGrid.TrackTestEnemyBlock(import) : import);
 }
 
     RDBLayout.LinkActionNodes(actionLinkDict);
@@ -718,9 +721,10 @@ if (importEnemies && (!NetworkClient.active || NetworkServer.active))
 
 private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] editorObjects, DFBlock blockData,
     GameObject[] startMarkers, DFRegion.DungeonTypes dungeonType, float monsterPower, int monsterVariance, int seed,
-    DaggerfallDungeon dungeonParent, int spawnScalingLevel)
+    DaggerfallDungeon dungeonParent, int spawnScalingLevel, DaggerfallDungeon testDungeon, bool passiveTest)
 {
     // Wait until the dungeon signals it has finished positioning
+    bool pacedGridTest = testDungeon != null;
     float timeout = 5f;
     float elapsed = 0f;
 
@@ -735,7 +739,69 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
         Debug.LogWarning("[DelayedEnemySpawn] Timeout waiting for dungeon to be initialized. Proceeding anyway.");
     }
 
+    if (pacedGridTest && (testDungeon == null || go == null || !NetworkServer.active)) yield break;
+
     Debug.Log($"[DelayedEnemySpawn] Spawning enemies after dungeon is ready with spawnScalingLevel={spawnScalingLevel}...");
+
+    if (testDungeon != null)
+    {
+        var deferred = new List<Func<GameObject>>();
+        if (RDBLayout.GridTestEnemyCapture != null) throw new InvalidOperationException("Nested test enemy capture.");
+        RDBLayout.GridTestEnemyCapture = deferred;
+        try
+        {
+    uint capturePreviousEquipmentRequester = SetupDemoEnemy.PushDungeonEquipmentRequester(
+        dungeonParent != null ? dungeonParent.RequesterNetId : 0U);
+    int capturePreviousDungeonSpawnScalingLevel = SetupDemoEnemy.PushDungeonSpawnScalingLevel(spawnScalingLevel);
+    PlayerEntityLevelOverrideState capturePlayerLevelOverrideState = PushPlayerEntityLevelOverrideForDungeonEnemyImport(spawnScalingLevel);
+    try
+    {
+        RDBLayout.AddFixedEnemies(go, editorObjects, ref blockData, startMarkers);
+        RDBLayout.AddRandomEnemies(go, editorObjects, dungeonType, monsterPower, ref blockData, startMarkers, monsterVariance, seed);
+    }
+    finally
+    {
+        PopPlayerEntityLevelOverrideForDungeonEnemyImport(capturePlayerLevelOverrideState);
+        SetupDemoEnemy.RestoreDungeonSpawnScalingLevel(capturePreviousDungeonSpawnScalingLevel);
+        SetupDemoEnemy.RestoreDungeonEquipmentRequester(capturePreviousEquipmentRequester);
+    }
+
+        }
+        finally { RDBLayout.GridTestEnemyCapture = null; }
+        // Deferred objects are created after block placement; their parent nodes must
+        // now use block-local coordinates rather than retaining their initial world origin.
+        foreach (Transform child in go.transform)
+            if (child.name == "Fixed Enemies" || child.name == "Random Enemies") child.localPosition = Vector3.zero;
+        foreach (var create in deferred)
+        {
+            while (!NetworkDungeonGrid.TakeEnemyCreationSlot())
+            {
+                if (go == null || testDungeon == null || !NetworkServer.active) yield break;
+                yield return null;
+            }
+            if (go == null || testDungeon == null || !NetworkServer.active) yield break;
+            uint requesterBefore = SetupDemoEnemy.PushDungeonEquipmentRequester(testDungeon.RequesterNetId);
+            int levelBefore = SetupDemoEnemy.PushDungeonSpawnScalingLevel(spawnScalingLevel);
+            PlayerEntityLevelOverrideState levelState = PushPlayerEntityLevelOverrideForDungeonEnemyImport(spawnScalingLevel);
+            try
+            {
+                GameObject created = create();
+                if (created != null)
+                {
+                    var authority = created.GetComponent<global::DynamicEnemyAuthority>();
+                    if (authority != null) authority.ConfigureDungeonGridTest(passiveTest);
+                    SpawnImportedNetworkEnemy(created.GetComponent<DaggerfallEnemy>(), go, testDungeon, spawnScalingLevel, true);
+                }
+            }
+            finally
+            {
+                PopPlayerEntityLevelOverrideForDungeonEnemyImport(levelState);
+                SetupDemoEnemy.RestoreDungeonSpawnScalingLevel(levelBefore);
+                SetupDemoEnemy.RestoreDungeonEquipmentRequester(requesterBefore);
+            }
+        }
+        yield break;
+    }
 
     uint previousEquipmentRequester = SetupDemoEnemy.PushDungeonEquipmentRequester(
         dungeonParent != null ? dungeonParent.RequesterNetId : 0U);
@@ -779,13 +845,20 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
     }
 
     foreach (var enemy in go.GetComponentsInChildren<DaggerfallEnemy>())
-    {
-        if (enemy == null) continue;
+        SpawnImportedNetworkEnemy(enemy, go, dungeonParent, spawnScalingLevel, dedicatedSpawn);
+
+}
+
+private static void SpawnImportedNetworkEnemy(DaggerfallEnemy enemy, GameObject go,
+    DaggerfallDungeon dungeonParent, int spawnScalingLevel, bool dedicatedSpawn)
+{
+
+        if (enemy == null) return;
 
         // Singleplayer/local dungeon enemies must remain normal children of the dungeon/RDB block.
         // Only multiplayer server-spawned dungeon enemies are moved to scene root and given NetworkIdentity.
         if (!NetworkServer.active)
-            continue;
+            return;
 
         Transform previousParent = enemy.transform.parent;
         if (dedicatedSpawn)
@@ -816,6 +889,8 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
             // Stamp these SyncVars and capture authoritative HP BEFORE NetworkServer.Spawn(), so
             // build clients do not briefly spawn them with local/default 0 HP before settings arrive.
             global::EnemyWorldPosition enemyWorldPosition = enemy.GetComponent<global::EnemyWorldPosition>();
+            if (enemyWorldPosition != null && dungeonParent != null)
+                enemyWorldPosition.SetPresentationDungeon(dungeonParent);
             SetupDemoEnemy setupDemoEnemy = enemy.GetComponent<SetupDemoEnemy>();
             if (setupDemoEnemy != null)
             {
@@ -880,8 +955,9 @@ private static IEnumerator DelayedEnemySpawn(GameObject go, DFBlock.RdbObject[] 
             if (enemyWorldPosition != null)
                 GameManager.Instance.StartCoroutine(ApplyDungeonRequesterContextAfterParent(enemy, go));
         }
-    }
+    
 }
+
 
 
 
@@ -932,6 +1008,7 @@ private static IEnumerator ApplyDungeonRequesterContextAfterParent(DaggerfallEne
         dungeonParent.DungeonAnchorWorldX,
         dungeonParent.DungeonAnchorWorldZ,
         dungeonParent.HasDungeonWorldAnchor);
+    enemyWorldPosition.SetPresentationDungeon(dungeonParent);
 
     Debug.Log($"[DelayedEnemySpawn][DungeonWorldAnchor:PostSpawn] enemy='{enemy.name}' requester={dungeonParent.RequesterNetId} hasAnchor={dungeonParent.HasDungeonWorldAnchor} anchorDF={dungeonParent.DungeonAnchorWorldX}/{dungeonParent.DungeonAnchorWorldZ}");
 }
@@ -2515,6 +2592,8 @@ static void AddQuestFoe(SiteTypes siteType, Quest quest, QuestMarker marker, Foe
             int anchorX, anchorZ;
             bool hasAnchor = TryGetDungeonAnchorForQuestFoe(parent, worldPosition, out anchorX, out anchorZ);
             ewpHost.SetDungeonSpawnContext(hostNetId, anchorX, anchorZ, hasAnchor);
+            if (parent != null)
+                ewpHost.SetPresentationDungeon(parent.GetComponentInParent<DaggerfallDungeon>());
             Debug.Log($"[AddQuestFoe][DungeonWorldAnchor] Host stamped dungeon quest foe '{foe.Symbol.Original}' requester={hostNetId} hasAnchor={hasAnchor} anchorDF={anchorX}/{anchorZ}");
         }
         else
@@ -3087,33 +3166,10 @@ public static GameObject[] CreateFoeGameObjects(
         {
             if (Mirror.NetworkServer.active)
             {
-                // Host path unchanged except for dungeon metadata stamping.
+                // Supply the local requester before NetworkServer.Spawn. Building enemies
+                // otherwise retain isInteriorSpawn=false and are culled as exterior actors.
                 Debug.Log("[CreateFoeGameObjects] Host: spawning and calling RpcCreateFoes.");
-                GameObject[] spawnedEnemies = CreateFoeGameObjectsInternal(position, foeType, totalSpawns, reaction, foeResource, alliedToPlayer, spawnScalingLevel);
-
-                // FoeSpawner/CreateFoe enemies requested while the host is inside a dungeon
-                // must use the same dungeon metadata as normal generated dungeon enemies.
-                // This does not change reaction, hostility, transform placement, or spawn timing.
-                bool isDungeonFromHost =
-                    GameManager.Instance?.PlayerEnterExit?.IsPlayerInsideDungeon == true;
-
-                if (isDungeonFromHost && spawnedEnemies != null)
-                {
-                    for (int i = 0; i < spawnedEnemies.Length; i++)
-                    {
-                        GameObject enemy = spawnedEnemies[i];
-                        if (enemy == null)
-                            continue;
-
-                        SetupDemoEnemy setupEnemy = enemy.GetComponent<SetupDemoEnemy>();
-                        if (setupEnemy != null)
-                            setupEnemy.isDungeonEnemy = true;
-
-                        EnemyWorldPosition enemyWorldPosition = enemy.GetComponent<EnemyWorldPosition>();
-                        if (enemyWorldPosition != null)
-                            enemyWorldPosition.SetDungeonSpawnContext(multiplayer.netId, 0, 0, false);
-                    }
-                }
+                GameObject[] spawnedEnemies = CreateFoeGameObjectsInternal(position, foeType, totalSpawns, reaction, foeResource, alliedToPlayer, spawnScalingLevel, multiplayer);
 
                 multiplayer.RpcCreateFoes(position, foeType, totalSpawns, reaction, alliedToPlayer);
                 return spawnedEnemies;
@@ -3279,6 +3335,12 @@ private static List<Vector3> ComputeClientWavePositions(int count, bool isInteri
 
 public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, MobileTypes foeType, int spawnCount, MobileReactions reaction, Foe foeResource, bool alliedToPlayer, int spawnScalingLevel = 0)
 {
+    // Retain the existing public signature for mods and remote-request callers.
+    return CreateFoeGameObjectsInternal(position, foeType, spawnCount, reaction, foeResource, alliedToPlayer, spawnScalingLevel, null);
+}
+
+private static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, MobileTypes foeType, int spawnCount, MobileReactions reaction, Foe foeResource, bool alliedToPlayer, int spawnScalingLevel, PlayerMultiplayer localSpawnRequester)
+{
     List<GameObject> gameObjects = new List<GameObject>();
 
     for (int i = 0; i < spawnCount; i++)
@@ -3345,6 +3407,27 @@ public static GameObject[] CreateFoeGameObjectsInternal(Vector3 position, Mobile
             else
             {
                 go.transform.SetParent(null);
+            }
+        }
+
+        // This overload is used only by the local host's CreateFoe path (including cm).
+        // Remote Commands use the public overload and retain their own request context;
+        // never infer a remote player's building from the listen host's current location.
+        if (mpHostActive && localSpawnRequester != null)
+        {
+            var enterExit = GameManager.Instance?.PlayerEnterExit;
+            bool inDungeon = enterExit != null && enterExit.IsPlayerInsideDungeon;
+            bool inBuilding = enterExit != null && enterExit.IsPlayerInsideBuilding;
+            if (inDungeon && setupEnemy != null)
+                setupEnemy.isDungeonEnemy = true;
+
+            EnemyWorldPosition world = go.GetComponent<EnemyWorldPosition>();
+            if (world != null)
+            {
+                if (inDungeon)
+                    world.SetDungeonSpawnContext(localSpawnRequester.netId, 0, 0, false);
+                else
+                    world.SetSpawnContext(inBuilding, localSpawnRequester.netId);
             }
         }
 

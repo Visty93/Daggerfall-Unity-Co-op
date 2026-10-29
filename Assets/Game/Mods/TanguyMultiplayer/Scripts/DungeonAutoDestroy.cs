@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using UnityEngine;
 using Mirror;
 
@@ -44,6 +44,8 @@ public class DungeonAutoDestroy : NetworkBehaviour
 
     bool IsAnyPlayerInRange()
     {
+        var dungeon = GetComponent<DaggerfallWorkshop.DaggerfallDungeon>();
+        if (dungeon != null && dungeon.KeepForGridTest) return true;
         foreach (var player in FindObjectsOfType<PlayerMultiplayer>())
         {
             float distance = Vector3.Distance(player.transform.position, transform.position);
@@ -57,6 +59,11 @@ public class DungeonAutoDestroy : NetworkBehaviour
     {
         Debug.Log($"[DungeonAutoDestroy] No players nearby. Destroying dungeon '{name}' in {destroyDelay} seconds.");
         yield return new WaitForSeconds(destroyDelay);
+        if (IsAnyPlayerInRange())
+        {
+            destroyRoutine = null;
+            yield break;
+        }
         Debug.Log($"[DungeonAutoDestroy] Destroying dungeon '{name}' (NetID: {netId})");
         NetworkServer.Destroy(gameObject);
     }

@@ -33,7 +33,20 @@ namespace DaggerfallWorkshop
     {
 		
 		    [SyncVar] 
-   public float PositionY; // ✅ This ensures all clients get the exact Y from the host
+   public float PositionY;
+        [SyncVar] public float PositionX;
+        [SyncVar] public float PositionZ;
+        [SyncVar] public bool HasGridPosition;
+        public bool KeepForGridTest;
+        public Vector3 GridPosition { get { return new Vector3(PositionX, PositionY, PositionZ); } }
+
+        public void SetGridPosition(Vector3 position)
+        {
+            PositionX = position.x; PositionY = position.y; PositionZ = position.z;
+            HasGridPosition = true;
+            transform.position = position;
+            NetworkDungeonGrid.InvalidateLookup();
+        }
 
         // Server-authored context for enemies imported by this dungeon.
         // Dungeon enemies use these DF X/Z coordinates as their world anchor instead of
@@ -85,7 +98,7 @@ namespace DaggerfallWorkshop
 
         public bool InitialSavedActionStateReady
         {
-            get { return string.IsNullOrEmpty(initialSavedActionState) || initialSavedActionStateApplied; }
+            get { return (string.IsNullOrEmpty(initialSavedActionState) || initialSavedActionStateApplied) && LiveActionStateReady; }
         }
 
         GameObject startMarker = null;
@@ -172,6 +185,7 @@ namespace DaggerfallWorkshop
 
         public void ApplyNetworkDungeonIdentityFromData(DungeonNetworkData data)
         {
+            SetGridPosition(new Vector3(data.PositionX, data.PositionY, data.PositionZ));
             IsNetworkDungeonInstance = data.IsNetworkDungeonInstance;
             DungeonInstanceId = data.DungeonInstanceId ?? string.Empty;
             ApplyDungeonWorldAnchorFromData(data);
@@ -180,11 +194,16 @@ namespace DaggerfallWorkshop
 
         public void ConfigureRecoveredNetworkDungeonSave(float savedY, string savedInstanceId)
         {
+            ConfigureRecoveredNetworkDungeonSave(new Vector3(0, savedY, 0), savedInstanceId);
+        }
+
+        public void ConfigureRecoveredNetworkDungeonSave(Vector3 savedOrigin, string savedInstanceId)
+        {
             IsRecoveredNetworkDungeonSave = true;
             IsNetworkDungeonInstance = false;
             DungeonInstanceId = savedInstanceId ?? string.Empty;
-            PositionY = savedY;
-            transform.position = new Vector3(0, PositionY, 0);
+            SetGridPosition(savedOrigin);
+            transform.position = GridPosition;
             Debug.Log($"[NetworkDungeonSave] Configured recovered SP dungeon id='{DungeonInstanceId}' savedY={PositionY}");
         }
 
@@ -206,6 +225,9 @@ namespace DaggerfallWorkshop
 
         public void WriteWorldAnchorToNetworkData(ref DungeonNetworkData data)
         {
+            data.PositionX = PositionX;
+            data.PositionY = PositionY;
+            data.PositionZ = PositionZ;
             data.HasDungeonWorldAnchor = HasDungeonWorldAnchor;
             data.DungeonAnchorWorldX = DungeonAnchorWorldX;
             data.DungeonAnchorWorldZ = DungeonAnchorWorldZ;
@@ -475,6 +497,8 @@ public struct DungeonNetworkData
     public DFRegion.LocationTypes LocationType;
     public DFRegion.DungeonTypes DungeonType;
     public float PositionY;
+    public float PositionX;
+    public float PositionZ;
     public uint RequesterNetId;
     public uint DungeonNetId; // <-- Add this
 
@@ -1111,7 +1135,7 @@ public void ConfigureInitialSavedActionState(string encodedState, string reason)
 
 public void ScheduleInitialSavedActionStateApply(string reason)
 {
-    if (InitialSavedActionStateReady || initialSavedActionStateApplyScheduled)
+    if (string.IsNullOrEmpty(initialSavedActionState) || initialSavedActionStateApplied || initialSavedActionStateApplyScheduled)
         return;
 
     initialSavedActionStateApplyScheduled = true;
@@ -1354,8 +1378,45 @@ static bool IsFiniteQuaternion(Quaternion value)
 
 
 
+// A newly built client dungeon cannot be entered until its mechanisms have
+// caught up with the server. This is independent of the original save snapshot.
+public bool LiveActionStateReady { get; set; } = true;
+
+private IEnumerator RequestLiveActionStateAfterStart()
+{
+    // Action components initialise their starting transforms in Start().
+    yield return null;
+    while (!string.IsNullOrEmpty(initialSavedActionState) && !initialSavedActionStateApplied)
+        yield return null;
+    float nextRequest = 0f;
+    while (NetworkClient.active && !NetworkServer.active && !LiveActionStateReady)
+    {
+        if (Time.realtimeSinceStartup >= nextRequest)
+        {
+            global::DoorsCatcher.RequestDungeonState(this);
+            nextRequest = Time.realtimeSinceStartup + 5f;
+        }
+        yield return null;
+    }
+}
+
+// Client-only lazy generation. NetworkIdentity and DungeonNetworkData are allowed
+// to exist without any RDB geometry, lights, or physical colliders.
+private bool deferredClientGenerationScheduled = false;
+
 public void ScheduleDeferredGeneration(float authoritativePositionY = float.NaN)
 {
+    if (NetworkServer.active || isSet || deferredClientGenerationScheduled)
+        return;
+
+    if (!summary.LocationData.Loaded)
+    {
+        Debug.LogWarning($"[LazyDungeon] Cannot generate dungeon '{name}' before its authoritative location data arrives.");
+        return;
+    }
+
+    LiveActionStateReady = false;
+    deferredClientGenerationScheduled = true;
     dfUnity = DaggerfallUnity.Instance; // ✅ Ensure dfUnity is initialized
 
     // If the caller has host-authored Y in RPC data, apply it immediately before the deferred generation coroutine.
@@ -1363,7 +1424,7 @@ public void ScheduleDeferredGeneration(float authoritativePositionY = float.NaN)
     if (!float.IsNaN(authoritativePositionY))
     {
         PositionY = authoritativePositionY;
-        transform.position = new Vector3(0, PositionY, 0);
+        transform.position = GridPosition;
     }
 
     StartCoroutine(DeferredClientGeneration());
@@ -1371,10 +1432,12 @@ public void ScheduleDeferredGeneration(float authoritativePositionY = float.NaN)
 
 private IEnumerator DeferredClientGeneration()
 {
+    try
+    {
     yield return new WaitForSeconds(0.5f);
 
     // Apply the current authoritative PositionY value. This is either already set from RPC data or from the SyncVar.
-    transform.position = new Vector3(0, PositionY, 0);
+    transform.position = GridPosition;
     Debug.Log($"[DeferredClientGeneration] Applied PositionY: {PositionY}");
 
     if (!isSet && summary.LocationData.Loaded)
@@ -1397,12 +1460,18 @@ private IEnumerator DeferredClientGeneration()
 
         LayoutDungeon(summary.LocationData, false);
         isSet = true;
-        ScheduleInitialSavedActionStateApply("deferred-client-generation");
+    NetworkDungeonGrid.InvalidateLookup();        ScheduleInitialSavedActionStateApply("deferred-client-generation");
         RaiseOnSetDungeonEvent();
+        StartCoroutine(RequestLiveActionStateAfterStart());
     }
     else
     {
         Debug.LogWarning("[DeferredClientGeneration] Skipped generation: either already set or location not loaded.");
+    }
+    }
+    finally
+    {
+        deferredClientGenerationScheduled = false;
     }
 }
 
@@ -1685,6 +1754,11 @@ private void PopPlayerGPSLocationForDungeonEnemyImport(PlayerGPSLocationOverride
             if (!IsNetworkDungeonInstance && Mathf.Abs(PositionY) < 1f)
                 return;
 
+            // Presentation identity is independent of entrance-coordinate availability.
+            foreach (global::EnemyWorldPosition actor in GetComponentsInChildren<global::EnemyWorldPosition>(true))
+                if (actor != null && actor.GetComponentInParent<global::PlayerMultiplayer>() == null)
+                    actor.SetPresentationDungeon(this);
+
             if (!HasDungeonWorldAnchor)
             {
                 Debug.LogWarning($"[DungeonEnemyAnchor] Cannot stamp imported enemies for dungeon='{name}' because no dungeon world anchor is set. requester={RequesterNetId} reason={reason}");
@@ -1777,7 +1851,10 @@ public void GenerateDungeon(DFLocation location, bool importEnemies, float assig
         // When recovering a save made inside a network dungeon, keep the saved MP Y slot
         // so the saved player/enemy positions still match the reconstructed local dungeon.
         if (!IsRecoveredNetworkDungeonSave)
+        {
+            PositionX = PositionZ = 0f;
             assignedY = 0f;
+        }
         else if (Mathf.Approximately(assignedY, -1f))
             assignedY = PositionY;
     }
@@ -1789,8 +1866,9 @@ if (NetworkServer.active)
 
     // If caller did not provide a real negative Y, allocate a host-authoritative free slot.
     // Do not recalculate from dungeon count here; this object may already exist and destroyed dungeons make count-based slots unsafe.
-    if (assignedY >= 0f || Mathf.Approximately(assignedY, -1f))
-        assignedY = GetNextAvailableDungeonY(this);
+    if (!HasGridPosition)
+        SetGridPosition(NetworkDungeonGrid.Allocate(location, this));
+    assignedY = PositionY;
 
     Debug.Log($"[GenerateDungeon] Using host-authoritative assigned Y = {assignedY}");
 }
@@ -1804,7 +1882,7 @@ else if (multiplayerActive && (assignedY >= 0f || Mathf.Approximately(assignedY,
 
     // 🔹 Apply the calculated Y position
     PositionY = assignedY;
-    transform.position = new Vector3(0, PositionY, 0);
+    transform.position = GridPosition;
     Debug.Log($"[GenerateDungeon] Dungeon {summary.LocationName} assigned PositionY = {PositionY}");
 
     if (HasAuthoritativeGenerationSpec)
@@ -1850,7 +1928,7 @@ else if (multiplayerActive && (assignedY >= 0f || Mathf.Approximately(assignedY,
     }
 
     isSet = true;
-    ScheduleInitialSavedActionStateApply("host-or-local-generation");
+    NetworkDungeonGrid.InvalidateLookup();    ScheduleInitialSavedActionStateApply("host-or-local-generation");
     RaiseOnSetDungeonEvent();
 	
 if (NetworkServer.active)
@@ -2165,6 +2243,13 @@ public void LayoutDungeon(in DFLocation location, bool importEnemies = true)
     System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
     long startTime = stopwatch.ElapsedMilliseconds;
 #endif
+    ServerDungeonPresentation serverPresentation = null;
+    if (NetworkServer.active)
+    {
+        serverPresentation = GetComponent<ServerDungeonPresentation>();
+        if (serverPresentation == null) serverPresentation = gameObject.AddComponent<ServerDungeonPresentation>();
+    }
+    using (ServerDungeonPresentation.BeginBuild(serverPresentation))
     using (s_LayoutDungeonMarker.Auto())
     {
         // Get player level. Networked dungeons use the requester-authoritative level supplied by the player who clicked the entrance.
@@ -2201,11 +2286,8 @@ public void LayoutDungeon(in DFLocation location, bool importEnemies = true)
             go.transform.parent = this.transform;
 
             // 🔹 Fix: Offset each block by the dungeon's PositionY to prevent overlapping
-go.transform.position = new Vector3(
-    block.X * RDBLayout.RDBSide,      // X remains X
-    PositionY,                        // ✅ Use Y here to move dungeon vertically
-    block.Z * RDBLayout.RDBSide       // Z remains Z
-);
+go.transform.position = GridPosition + new Vector3(
+    block.X * RDBLayout.RDBSide, 0f, block.Z * RDBLayout.RDBSide);
 
             DaggerfallRDBBlock daggerfallBlock = go.GetComponent<DaggerfallRDBBlock>();
             if (block.IsStartingBlock)
@@ -2217,11 +2299,15 @@ go.transform.position = new Vector3(
             summary.LocationData.Dungeon.Blocks[i].CastleBlock = block.CastleBlock;
 
             // Add water blocks
-            RDBLayout.AddWater(go, go.transform.position, block.WaterLevel);
+            if (serverPresentation != null)
+                serverPresentation.RegisterBlock(go, block.BlockName, block.WaterLevel);
+            else
+                RDBLayout.AddWater(go, go.transform.position, block.WaterLevel);
         }
 
         RemoveOverlappingDoors();
     }
+    if (serverPresentation != null) serverPresentation.FinishBuild();
 
 #if SHOW_LAYOUT_TIMES
     // Show timer

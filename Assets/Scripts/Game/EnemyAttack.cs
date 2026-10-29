@@ -40,6 +40,207 @@ namespace DaggerfallWorkshop.Game
         DaggerfallEntityBehaviour entityBehaviour;
         int damage = 0;
 
+        // Server resolves each hit ONCE from the current simulator, then forwards
+        // player damage to the victim's own real PlayerEntity. Observer animation
+        // frames never run their own stale EnemySenses hit detection.
+        private NetworkIdentity cachedAttackIdentity;
+        private DynamicEnemyAuthority cachedAttackAuthority;
+        private float lastServerOwnerHitAt = -999f;
+        private float lastServerMeleeAnimationAt = -999f;
+        private uint nextOwnerSwingId = 1;
+        private uint activeOwnerSwingId;
+        private uint lastReportedOwnerSwingId;
+        private uint activeOwnerTargetNetId;
+        private DaggerfallEntityBehaviour activeOwnerSwingTarget;
+        private bool ownerHasActiveTarget;
+        private float ownerSwingStartedAt;
+        private uint lastServerSwingId;
+        private NetworkConnection lastServerSwingConnection;
+        private uint serverApprovedSwingId;
+        private uint serverApprovedSwingTargetId;
+        private float serverApprovedSwingAt = -999f;
+        private const float MinServerMeleeHitInterval = 0.25f;
+
+        private bool IsSpawnedNetworkEnemy()
+        {
+            if (!NetworkClient.active && !NetworkServer.active)
+                return false;
+            if (cachedAttackIdentity == null)
+                cachedAttackIdentity = GetComponent<NetworkIdentity>();
+            return cachedAttackIdentity != null && cachedAttackIdentity.netId != 0;
+        }
+
+        private bool IsOwnerSimulator()
+        {
+            if (!IsSpawnedNetworkEnemy())
+                return true;
+            if (motor == null)
+                motor = GetComponent<EnemyMotor>();
+            if (motor != null && !motor.ShouldSimulateMotor())
+                return false;
+            if (cachedAttackAuthority == null)
+                cachedAttackAuthority = GetComponent<DynamicEnemyAuthority>();
+            return cachedAttackAuthority == null || !cachedAttackAuthority.IsAuthorityDeactivatedForRetention;
+        }
+
+        private uint nextOwnerArrowId = 1;
+        private bool ownerBowAnimationPending;
+
+        public void PrepareOwnerBowAttack()
+        {
+            TrackCombatOwnership();
+            ownerBowAnimationPending = IsOwnerSimulator();
+        }
+        private int ownerArrowEpoch;
+        private bool combatOwnerKnown;
+        private bool previousCombatOwner;
+        private sealed class OwnerArrowRecord
+        {
+            public NetworkConnectionToClient Owner;
+            public float Expires;
+        }
+        private readonly System.Collections.Generic.Dictionary<uint, OwnerArrowRecord> ownerArrows =
+            new System.Collections.Generic.Dictionary<uint, OwnerArrowRecord>();
+
+        // DynamicEnemyAuthority calls this at tick suspension/restoration boundaries.
+        // Record ownership loss even when Update will no longer run on this observer.
+        public void RefreshObserverCombatOwnership()
+        {
+            if (IsSpawnedNetworkEnemy()) TrackCombatOwnership();
+            if (mobile != null)
+            {
+                mobile.DoMeleeDamage = false;
+                mobile.ShootArrow = false;
+            }
+        }
+
+        private void TrackCombatOwnership()
+        {
+            bool owner = IsOwnerSimulator();
+            if (!combatOwnerKnown || owner != previousCombatOwner)
+            {
+                combatOwnerKnown = true;
+                previousCombatOwner = owner;
+                ownerArrowEpoch++;
+                ownerHasActiveTarget = false;
+                ownerBowAnimationPending = false;
+                activeOwnerSwingId = 0;
+                if (mobile != null)
+                {
+                    mobile.DoMeleeDamage = false;
+                    mobile.ShootArrow = false;
+                }
+            }
+        }
+
+        public override void OnStopAuthority()
+        {
+            base.OnStopAuthority();
+            ownerArrowEpoch++;
+            ownerBowAnimationPending = false;
+            ownerHasActiveTarget = false;
+            activeOwnerSwingId = 0;
+        }
+
+        private void ShootOwnerArrow()
+        {
+            if (!IsOwnerSimulator() || !ownerBowAnimationPending || entityBehaviour == null || ArrowMissilePrefab == null) return;
+            ownerBowAnimationPending = false;
+            uint shot = nextOwnerArrowId++;
+            if (nextOwnerArrowId == 0) nextOwnerArrowId = 1;
+            int epoch = ownerArrowEpoch;
+            DaggerfallMissile arrow = Instantiate(ArrowMissilePrefab);
+            arrow.Caster = entityBehaviour;
+            arrow.TargetType = TargetTypes.SingleTargetAtRange;
+            arrow.ElementType = ElementTypes.None;
+            arrow.IsArrow = true;
+            Vector3 origin, aim;
+            arrow.GetOwnerLaunchAim(out origin, out aim);
+            arrow.CustomAimPosition = origin;
+            arrow.CustomAimDirection = aim;
+            arrow.OwnerDrivenEnemyProjectile = true;
+            arrow.OwnerSimulationValid = () => this != null && epoch == ownerArrowEpoch &&
+                IsSpawnedNetworkEnemy() && IsOwnerSimulator() && entityBehaviour != null && entityBehaviour.Entity != null && entityBehaviour.Entity.CurrentHealth > 0;
+            arrow.OwnerImpact = victim => ReportOwnerArrowImpact(shot, victim);
+            if (isServer) ServerOwnerArrowLaunch(shot, origin - transform.position, aim, null);
+            else CmdOwnerArrowLaunch(shot, origin - transform.position, aim);
+        }
+
+        [Command]
+        private void CmdOwnerArrowLaunch(uint shot, Vector3 offset, Vector3 aim,
+            NetworkConnectionToClient sender = null)
+        {
+            ServerOwnerArrowLaunch(shot, offset, aim, sender);
+        }
+
+        private bool IsCurrentArrowSender(NetworkConnectionToClient sender)
+        {
+            return isServer && (sender == null ? IsOwnerSimulator() : netIdentity.connectionToClient == sender);
+        }
+
+        [Server]
+        private void ServerOwnerArrowLaunch(uint shot, Vector3 offset, Vector3 aim, NetworkConnectionToClient sender)
+        {
+            if (!IsCurrentArrowSender(sender) || shot == 0 ||
+                float.IsNaN(offset.sqrMagnitude) || float.IsInfinity(offset.sqrMagnitude) ||
+                offset.sqrMagnitude > 100f || float.IsNaN(aim.sqrMagnitude) ||
+                float.IsInfinity(aim.sqrMagnitude) || aim.sqrMagnitude < 0.001f) return;
+            var expired = new System.Collections.Generic.List<uint>();
+            foreach (var pair in ownerArrows)
+                if (pair.Value.Expires < Time.unscaledTime || pair.Value.Owner != sender)
+                    expired.Add(pair.Key);
+            foreach (uint id in expired) ownerArrows.Remove(id);
+            if (ownerArrows.ContainsKey(shot) || ownerArrows.Count >= 64) return;
+            ownerArrows.Add(shot, new OwnerArrowRecord { Owner = sender, Expires = Time.unscaledTime + 12f });
+            RpcOwnerArrowVisual(offset, aim.normalized);
+        }
+
+        [ClientRpc]
+        private void RpcOwnerArrowVisual(Vector3 offset, Vector3 aim)
+        {
+            if (IsOwnerSimulator() || ArrowMissilePrefab == null) return;
+            var presentation = GetComponent<DynamicEnemyAuthority>();
+            if (presentation != null && presentation.IsLocalPresentationSuspended) return;
+            DaggerfallMissile arrow = Instantiate(ArrowMissilePrefab);
+            arrow.Caster = GetComponent<DaggerfallEntityBehaviour>();
+            arrow.TargetType = TargetTypes.SingleTargetAtRange;
+            arrow.ElementType = ElementTypes.None;
+            arrow.IsArrow = true;
+            arrow.VisualOnly = true;
+            arrow.OwnerDrivenEnemyVisual = true;
+            arrow.CustomAimPosition = transform.position + offset;
+            arrow.CustomAimDirection = aim;
+            DaggerfallAudioSource source = GetComponent<DaggerfallAudioSource>();
+            if (source) source.PlayOneShot((int)SoundClips.ArrowShoot, 1, 1.0f);
+        }
+
+        private void ReportOwnerArrowImpact(uint shot, DaggerfallEntityBehaviour victim)
+        {
+            if (!IsOwnerSimulator()) return;
+            victim = DaggerfallMissile.ResolveEnemyCombatVictim(victim);
+            NetworkIdentity identity = victim != null ? victim.GetComponent<NetworkIdentity>() : null;
+            if (identity == null || (identity.netId == 0 && victim.GetComponent<PlayerMultiplayer>() == null)) return;
+            if (isServer) ServerOwnerArrowImpact(shot, identity.netId, null);
+            else CmdOwnerArrowImpact(shot, identity.netId);
+        }
+
+        [Command]
+        private void CmdOwnerArrowImpact(uint shot, uint victimId, NetworkConnectionToClient sender = null)
+        {
+            ServerOwnerArrowImpact(shot, victimId, sender);
+        }
+
+        [Server]
+        private void ServerOwnerArrowImpact(uint shot, uint victimId, NetworkConnectionToClient sender)
+        {
+            OwnerArrowRecord record;
+            if (!IsCurrentArrowSender(sender) || !ownerArrows.TryGetValue(shot, out record) ||
+                record.Owner != sender || record.Expires < Time.unscaledTime) return;
+            ownerArrows.Remove(shot); // One collision result per launched arrow.
+            DaggerfallEntityBehaviour victim = ServerResolveCombatTarget(victimId);
+            ServerResolveOwnerHit(victim, true, shot, sender);
+        }
+
         void Start()
         {
             motor = GetComponent<EnemyMotor>();
@@ -51,6 +252,7 @@ namespace DaggerfallWorkshop.Game
 
         void FixedUpdate()
         {
+            if (IsSpawnedNetworkEnemy()) TrackCombatOwnership();
             const int speedFloor = 8;
 
             // Unable to attack if AI disabled or paralyzed
@@ -77,11 +279,10 @@ namespace DaggerfallWorkshop.Game
             // If enemy is still at maximum speed then divisor is 1 and will experience no change to frame rate
             mobile.FrameSpeedDivisor = entity.Stats.PermanentSpeed / speed;
 
-            // Pure clients never initiate an enemy attack. They only play server-authorized
-            // attack states received through RpcPlayAttackAnimation(). Previously every client
-            // still rolled this attack check and called MeleeAnimation(), which immediately
-            // refused the call and could generate hundreds of thousands of warning lines.
-            if (NetworkClient.active && !isServer)
+            // The enemy owner (including a pure client) initiates melee.
+            // Never run attack decisions on a remote observer or on the server
+            // copy of an enemy owned by a client.
+            if (!IsOwnerSimulator())
                 return;
 
             // Note: Speed comparison here is reversed from classic. Classic's way makes fewer attack
@@ -97,6 +298,7 @@ namespace DaggerfallWorkshop.Game
 
         void Update()
         {
+            if (IsSpawnedNetworkEnemy()) TrackCombatOwnership();
             // Unable to attack if paralyzed
             if (entityBehaviour.Entity.IsParalyzed)
                 return;
@@ -104,14 +306,19 @@ namespace DaggerfallWorkshop.Game
             // If a melee attack has reached the damage frame we can run a melee attempt
             if (mobile.DoMeleeDamage)
             {
-                MeleeDamage();
+                // Animation callbacks fire on all observers. Only the owning
+                // simulator may turn one into an authoritative hit request.
+                if (IsOwnerSimulator())
+                    MeleeDamage();
                 mobile.DoMeleeDamage = false;
             }
             // If a bow attack has reached the shoot frame we can shoot an arrow
             else if (mobile.ShootArrow)
             {
-                ShootBow();
+                bool mayShoot = !IsSpawnedNetworkEnemy() || (IsOwnerSimulator() && ownerBowAnimationPending);
+                if (mayShoot) ShootBow();
                 mobile.ShootArrow = false;
+                if (!mayShoot) return;
 
                 DaggerfallAudioSource dfAudioSource = GetComponent<DaggerfallAudioSource>();
                 if (dfAudioSource)
@@ -141,8 +348,26 @@ namespace DaggerfallWorkshop.Game
 
        public void BowDamage(Vector3 direction)
 {
-    if (senses.Target == null)
+    if (senses == null || senses.Target == null)
         return;
+
+    if (IsSpawnedNetworkEnemy())
+    {
+        if (!IsOwnerSimulator()) return;
+        PlayerMultiplayer victimPlayer = senses.Target.GetComponent<PlayerMultiplayer>();
+        if (victimPlayer != null)
+        {
+            NetworkIdentity targetIdentity = victimPlayer.GetComponent<NetworkIdentity>();
+            if (targetIdentity == null) return;
+            if (isServer)
+                ServerResolveOwnerHit(senses.Target, true, 0, null);
+            else if (hasAuthority)
+                CmdReportOwnerBowPlayerHit(targetIdentity.netId);
+            return;
+        }
+        // The existing server-authoritative enemy-vs-enemy bow Command
+        // remains intact below; observers must not run any hit path.
+    }
 
     EnemyEntity entity = entityBehaviour.Entity as EnemyEntity;
     PlayerMultiplayer targetMultiplayer = senses.Target.GetComponent<PlayerMultiplayer>();
@@ -208,69 +433,106 @@ namespace DaggerfallWorkshop.Game
         #region Private Methods
 
      private bool MeleeAnimation()
-{
-    // 🔹 **Ensure only the host runs this in multiplayer**
-    if (NetworkClient.active && !isServer) 
-    {
-        global::EnemySwingDiagnostics.RecordUnexpectedClientMelee(this);
-        Debug.LogWarning($"[MeleeAnimation] ERROR: Client is running MeleeAnimation() when it should not! ({gameObject.name})");
-        return false; // Safety guard: pure clients should never initiate melee.
-    }
+     {
+         if (!IsOwnerSimulator())
+             return false;
+         // ChangeEnemyState does nothing when already in this state or frozen.
+         // Do not overwrite an active swing ID or spend another cooldown then.
+         if (IsSpawnedNetworkEnemy() && (mobile == null || mobile.FreezeAnims || mobile.IsPlayingOneShot()))
+             return false;
 
-    if (senses.TargetInSight && senses.TargetIsWithinYawAngle(22.5f, senses.LastKnownTargetPos))
-    {
-        float distance = MeleeDistance;
+         if (!senses.TargetInSight || !senses.TargetIsWithinYawAngle(22.5f, senses.LastKnownTargetPos))
+             return false;
 
-        if (!DaggerfallUnity.Settings.EnhancedCombatAI && senses.Target != GameManager.Instance.PlayerEntityBehaviour)
-            distance = ClassicMeleeDistanceVsAI;
+         float distance = MeleeDistance;
+         if (!DaggerfallUnity.Settings.EnhancedCombatAI &&
+             senses.Target != GameManager.Instance.PlayerEntityBehaviour)
+             distance = ClassicMeleeDistanceVsAI;
+         if (senses.DistanceToTarget > distance + senses.TargetRateOfApproach)
+             return false;
 
-        if (senses.DistanceToTarget > distance + senses.TargetRateOfApproach)
-            return false;
+         global::EnemySwingDiagnostics.RecordAcceptedMelee(this);
+         if (sounds)
+             sounds.PlayAttackSound();
 
-        global::EnemySwingDiagnostics.RecordAcceptedMelee(this);
+         if (IsSpawnedNetworkEnemy())
+         {
+             NetworkIdentity targetIdentity = senses.Target != null
+                 ? senses.Target.GetComponent<NetworkIdentity>() : null;
+             ownerHasActiveTarget = targetIdentity != null;
+             activeOwnerSwingTarget = ownerHasActiveTarget ? senses.Target : null;
+             activeOwnerTargetNetId = ownerHasActiveTarget ? targetIdentity.netId : 0;
+             activeOwnerSwingId = nextOwnerSwingId++;
+             if (nextOwnerSwingId == 0) nextOwnerSwingId = 1;
+             ownerSwingStartedAt = Time.unscaledTime;
 
-        // 🔹 **Play melee sound for everyone (Single-player & Multiplayer)**
-        if (sounds)
-        {
-            Debug.Log($"[MeleeAnimation] Playing attack sound on {gameObject.name}");
-            sounds.PlayAttackSound();
-        }
+             // The player shell can have netId 0 on the listen host; that is
+             // still a valid explicit player target for the server resolver.
+             if (isServer)
+             {
+                 lastServerMeleeAnimationAt = Time.unscaledTime;
+                 serverApprovedSwingId = activeOwnerSwingId;
+                 serverApprovedSwingTargetId = activeOwnerTargetNetId;
+                 serverApprovedSwingAt = Time.unscaledTime;
+                 mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
+                 global::EnemySwingDiagnostics.RecordAttackRpc(this, "SERVER_SEND");
+                 RpcPlayAttackAnimation();
+             }
+             else if (hasAuthority)
+             {
+                 // Immediate owner animation for responsiveness. The server
+                 // relays it only to observers after validating ownership.
+                 mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
+                 CmdRelayOwnerMeleeAnimation(activeOwnerTargetNetId, activeOwnerSwingId);
+             }
+         }
+         else
+         {
+             // Original vanilla/console-local path, no network event required.
+             mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
+         }
+         return true;
+     }
 
-        // 🔹 **Single-Player Mode: Play Animation Locally**
-        if (!NetworkServer.active) 
-        {
-            Debug.Log($"[MeleeAnimation] Playing attack animation in single-player mode.");
-            mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
-        }
-        else 
-        {
-            Debug.Log($"[MeleeAnimation] Host is executing attack animation.");
-            mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
+     [Command(requiresAuthority = true)]
+     private void CmdRelayOwnerMeleeAnimation(uint targetNetId, uint swingId,
+         NetworkConnectionToClient sender = null)
+     {
+         if (!isServer || sender == null || swingId == 0 ||
+             GetComponent<NetworkIdentity>().connectionToClient != sender ||
+             Time.unscaledTime - lastServerMeleeAnimationAt < 0.25f)
+             return;
+         lastServerMeleeAnimationAt = Time.unscaledTime;
+         serverApprovedSwingId = swingId;
+         serverApprovedSwingTargetId = targetNetId;
+         serverApprovedSwingAt = Time.unscaledTime;
+         // Server records the event; listen-host presentation runs in the RPC.
+         // Dedicated servers do not need an attack animation to validate a hit.
+         global::EnemySwingDiagnostics.RecordAttackRpc(this, "SERVER_SEND");
+         RpcPlayAttackAnimation();
+     }
 
-            // 🔹 **Tell all clients to play the animation**
-            global::EnemySwingDiagnostics.RecordAttackRpc(this, "SERVER_SEND");
-            RpcPlayAttackAnimation();
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-[ClientRpc]
-void RpcPlayAttackAnimation()
-{
-    if (isServer) return; // 🔹 Host already played animation, ignore it
-
-    global::EnemySwingDiagnostics.RecordAttackRpc(this, "CLIENT_RECEIVE");
-    Debug.Log($"[RpcPlayAttackAnimation] Client received animation RPC. Playing attack animation.");
-    mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
-}
+     [ClientRpc]
+     private void RpcPlayAttackAnimation()
+     {
+         if (IsOwnerSimulator())
+             return; // Owner started it locally; non-owner host is an observer too.
+         if (mobile == null) mobile = GetComponentInChildren<MobileUnit>();
+         if (mobile == null || !mobile.IsSetup) return;
+         global::EnemySwingDiagnostics.RecordAttackRpc(this, "CLIENT_RECEIVE");
+         mobile.ChangeEnemyState(MobileStates.PrimaryAttack);
+     }
 
 
 private void MeleeDamage()
 {
+    if (IsSpawnedNetworkEnemy())
+    {
+        ReportOwnerMeleeHit();
+        return;
+    }
+
+    // Unspawned/console/SP actors preserve their original local damage path.
     if (entityBehaviour == null)
     {
         Debug.LogWarning($"[EnemyAttack] MeleeDamage() called but entityBehaviour is NULL! ({gameObject.name})");
@@ -382,6 +644,171 @@ else
 }
 
 
+
+// Owner-only hit reporting. No observer EnemySenses is consulted for melee.
+private void ReportOwnerMeleeHit()
+{
+    if (!IsOwnerSimulator() || !ownerHasActiveTarget || activeOwnerSwingTarget == null ||
+        Time.unscaledTime - ownerSwingStartedAt > 3f ||
+        activeOwnerSwingId == 0 || activeOwnerSwingId == lastReportedOwnerSwingId)
+        return;
+
+    // The owner chose this target at the animation's START, after checking
+    // sensing / LOS / facing. The damage frame may arrive several frames later
+    // after senses updates to a different target. Never rely on an observer's
+    // current senses, or on a mutable owner target, to route the swing.
+    NetworkIdentity targetIdentity = activeOwnerSwingTarget.GetComponent<NetworkIdentity>();
+    if (targetIdentity == null || activeOwnerTargetNetId != targetIdentity.netId)
+        return;
+
+    uint swingId = activeOwnerSwingId;
+    lastReportedOwnerSwingId = swingId;
+    if (isServer)
+        ServerResolveOwnerHit(activeOwnerSwingTarget, false, swingId, null);
+    else if (hasAuthority)
+        CmdReportOwnerMeleeHit(activeOwnerTargetNetId, swingId);
+}
+
+[Command(requiresAuthority = true)]
+private void CmdReportOwnerMeleeHit(uint targetNetId, uint swingId,
+    NetworkConnectionToClient sender = null)
+{
+    if (!isServer || sender == null || swingId == 0)
+        return;
+    NetworkIdentity attacker = GetComponent<NetworkIdentity>();
+    if (attacker == null || attacker.connectionToClient != sender)
+        return;
+    // A client may report the damage frame only for an animation the server
+    // previously accepted from that same current owner. Commands are reliable
+    // and ordered; ownership changes invalidate the sender check above.
+    if (serverApprovedSwingId != swingId ||
+        serverApprovedSwingTargetId != targetNetId ||
+        Time.unscaledTime - serverApprovedSwingAt > 3f)
+        return;
+    // Each server-approved swing can submit exactly one damage report.
+    // Consume it even if the server later rejects the hit as out-of-range.
+    serverApprovedSwingAt = -999f;
+    DaggerfallEntityBehaviour targetEntity = ServerResolveCombatTarget(targetNetId);
+    ServerResolveOwnerHit(targetEntity, false, swingId, sender);
+}
+
+[Command(requiresAuthority = true)]
+private void CmdReportOwnerBowPlayerHit(uint targetNetId, NetworkConnectionToClient sender = null)
+{
+    if (!isServer || sender == null)
+        return;
+    NetworkIdentity attacker = GetComponent<NetworkIdentity>();
+    if (attacker == null || attacker.connectionToClient != sender)
+        return;
+    ServerResolveOwnerHit(ServerResolveCombatTarget(targetNetId), true, 0, sender);
+}
+
+[Server]
+private DaggerfallEntityBehaviour ServerResolveCombatTarget(uint targetNetId)
+{
+    NetworkIdentity identity;
+    if (targetNetId != 0 && NetworkServer.spawned.TryGetValue(targetNetId, out identity) && identity != null)
+        return identity.GetComponent<DaggerfallEntityBehaviour>();
+
+    // Existing project allows host player netId 0. Resolve it without
+    // mistaking it for a missing enemy ID.
+    if (targetNetId == 0 && NetworkServer.localConnection != null &&
+        NetworkServer.localConnection.identity != null)
+    {
+        PlayerMultiplayer hostPM = NetworkServer.localConnection.identity.GetComponent<PlayerMultiplayer>();
+        if (hostPM != null)
+            return hostPM.GetComponent<DaggerfallEntityBehaviour>();
+    }
+    return null;
+}
+
+[Server]
+private void ServerResolveOwnerHit(DaggerfallEntityBehaviour victim, bool ranged,
+    uint swingId, NetworkConnectionToClient sender)
+{
+    if (!isServer || victim == null || victim == entityBehaviour || victim.Entity == null)
+        return;
+    if (entityBehaviour == null) entityBehaviour = GetComponent<DaggerfallEntityBehaviour>();
+    if (entityBehaviour == null || !(entityBehaviour.Entity is EnemyEntity attackerEnemy))
+        return;
+
+    // Throttle and de-duplicate at the server, even across late animation
+    // callbacks and ownership transitions. The identity Command permission
+    // prevents observers from submitting somebody else's attacks.
+    float now = Time.unscaledTime;
+    if (!ranged && now - lastServerOwnerHitAt < MinServerMeleeHitInterval)
+        return;
+    if (!ranged && sender == lastServerSwingConnection && swingId == lastServerSwingId)
+        return;
+
+    float allowed = ranged ? 300f :
+        Mathf.Max(MeleeDistance, ClassicMeleeDistanceVsAI) + 1.25f;
+    if ((transform.position - victim.transform.position).sqrMagnitude > allowed * allowed)
+        return;
+
+    PlayerMultiplayer victimPlayer = victim.GetComponent<PlayerMultiplayer>();
+    if (victimPlayer != null)
+    {
+        if (victimPlayer.LifeState != PlayerMultiplayer.MultiplayerLifeState.Alive ||
+            victimPlayer.IsDownedForRevive)
+            return;
+        NetworkConnection victimConnection = victimPlayer.connectionToClient;
+        // Listen host's physical PlayerAdvanced is available only on the host.
+        if (victimPlayer.isLocalPlayer && NetworkServer.active && NetworkClient.active)
+        {
+            Items.DaggerfallUnityItem hostWeapon = attackerEnemy.ItemEquipTable.GetItem(Items.EquipSlots.RightHand);
+            ApplyDamageToPlayer(hostWeapon);
+        }
+        else if (victimConnection != null && victimConnection.isReady)
+        {
+            TargetApplyOwnerHitToPlayer(victimConnection, ranged);
+        }
+        else
+            return;
+    }
+    else if (victim.Entity is EnemyEntity victimEnemy)
+    {
+        if (senses == null) senses = GetComponent<EnemySenses>();
+        if (senses != null && senses.IsQuestInfightingTargetBlocked(victim))
+            return;
+        Items.DaggerfallUnityItem weapon = attackerEnemy.ItemEquipTable.GetItem(Items.EquipSlots.RightHand);
+        if (weapon != null && victimEnemy.MobileEnemy.MinMetalToHit >
+            (Items.WeaponMaterialTypes)weapon.NativeMaterialValue)
+            weapon = null;
+        int applied = ApplyDamageToExplicitNonPlayerTarget(victim, weapon,
+            transform.forward, ranged, -1, true);
+        NetworkIdentity victimId = victim.GetComponent<NetworkIdentity>();
+        if (victimId != null && victimId.netId != 0)
+            RpcApplyEnemyHitEffectsExplicit(victimId.netId, applied, ranged);
+    }
+    else
+        return;
+
+    if (!ranged)
+    {
+        lastServerOwnerHitAt = now;
+        lastServerSwingId = swingId;
+        lastServerSwingConnection = sender;
+        serverApprovedSwingAt = -999f;
+    }
+}
+
+// The victim applies its own normal DFU damage/dodge/guard/enchanted-strike
+// mechanics. No enemy sight/target data is needed on the victim's machine.
+[TargetRpc]
+private void TargetApplyOwnerHitToPlayer(NetworkConnection target, bool ranged)
+{
+    PlayerMultiplayer local = PlayerMultiplayer.GetLocalPlayer();
+    if (local == null || !local.isLocalPlayer ||
+        GameManager.Instance == null || GameManager.Instance.PlayerEntity == null ||
+        GameManager.Instance.PlayerEntity.CurrentHealth <= 0)
+        return;
+    if (entityBehaviour == null) entityBehaviour = GetComponent<DaggerfallEntityBehaviour>();
+    if (entityBehaviour == null || !(entityBehaviour.Entity is EnemyEntity attackerEntity))
+        return;
+    Items.DaggerfallUnityItem weapon = attackerEntity.ItemEquipTable.GetItem(Items.EquipSlots.RightHand);
+    ApplyDamageToPlayer(weapon);
+}
 
 [Command(requiresAuthority = true)]
 private void CmdApplyEnemyInfightingDamage(uint targetNetId, Vector3 direction)
@@ -562,6 +989,11 @@ void RpcApplyEnemyHitEffects(uint targetNetId, Items.DaggerfallUnityItem weapon,
 
         private void ShootBow()
         {
+            if (IsSpawnedNetworkEnemy())
+            {
+                ShootOwnerArrow();
+                return;
+            }
             if (entityBehaviour)
             {
                 DaggerfallMissile missile = Instantiate(ArrowMissilePrefab);

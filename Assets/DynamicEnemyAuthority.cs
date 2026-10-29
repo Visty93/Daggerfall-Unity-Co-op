@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using UnityEngine;
 using Mirror;
 using DaggerfallWorkshop.Game;
@@ -7,10 +7,35 @@ using DaggerfallWorkshop.Game.Entity;
 using DaggerfallWorkshop.Game.Questing;
 using DaggerfallWorkshop.Game.Utility;
 using DaggerfallConnect;
+using DaggerfallWorkshop.Game.MagicAndEffects;
 
 [RequireComponent(typeof(NetworkIdentity))]
 public class DynamicEnemyAuthority : NetworkBehaviour
 {
+    [System.NonSerialized] public bool KeepForDungeonGridTest;
+    [System.NonSerialized] public bool PassiveDungeonGridTest;
+
+    // Test-only local simulator override. Mirror ownership remains genuine.
+    public bool IsDungeonGridObserverTest => NetworkServer.active && PassiveDungeonGridTest;
+
+    public void ConfigureDungeonGridTest(bool observer)
+    {
+        if (!NetworkServer.active) return;
+        KeepForDungeonGridTest = true;
+        PassiveDungeonGridTest = observer;
+        CancelDestroyCountdown();
+        if (observer)
+        {
+            var identity = GetComponent<NetworkIdentity>();
+            if (identity != null && identity.netId != 0 && identity.connectionToClient != null)
+                identity.RemoveClientAuthority();
+            SetAuthorityDeactivated(false);
+        }
+        ApplyAuthorityMotionGate();
+        RefreshVisualAndAudioState();
+        RefreshLocalCollisionState();
+    }
+
             Coroutine _ntResetCo = null;
 // One-shot resnap for CreateFoe wave spawns when this client gains authority.
     private bool _didCreateFoeAuthorityResnap = false;
@@ -206,7 +231,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         {
             if (netIdentity.connectionToClient != null)
                 netIdentity.RemoveClientAuthority();
-            netIdentity.AssignClientAuthority(persistentOwnerConnection);
+            { EnemyInterestManagement.PrepareOwner(netIdentity, persistentOwnerConnection); netIdentity.AssignClientAuthority(persistentOwnerConnection); }
             currentOwner = persistentOwnerConnection;
             ApplyAuthorityMotionGate();
             ResetNetworkTransformBuffers();
@@ -264,8 +289,8 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     // - localPerPlayerCulled is only for THIS client/host-client view when this specific
     //   local player is far away in DF space/Y slot while somebody else might still be near.
     //
-    // Important: never disable the enemy CharacterController/colliders globally here.
-    // We only use pairwise Physics.IgnoreCollision(localPlayerCollider, enemyCollider).
+    // Presentation relevance also gates LOCAL observer collision suspension.
+    // The simulation owner retains its physics; ownership selection is unchanged.
     private const float LocalPerPlayerCullInterval = 0.25f;
     // Local visibility/ghost distance for this specific player only.
     // 200 Unity units ~= 8000 DF units with unityPerDF=0.025.
@@ -277,6 +302,359 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     // a Dungeon object exists in scene; do not let that force Y-only culling/targeting above ground.
     private const float NetworkDungeonModeYThreshold = -300f;
     private bool localPerPlayerCulled = false;
+    public bool IsLocalPresentationSuspended => authorityDeactivated || localPerPlayerCulled ||
+        (netId != 0 && NetworkServer.active && !NetworkClient.active);
+    // Suspend Unity ticks only for hidden observers; networking stays alive.
+    private EnemySenses observerSenses;
+    private EnemyAttack observerAttack;
+    private bool observerComponentsCached;
+    private bool suspendedMotor, suspendedSenses, suspendedAttack;
+
+    private static void SetObserverTickSuspended(Behaviour component, bool suspend, ref bool changed)
+    {
+        if (component == null) { changed = false; return; }
+        if (suspend)
+        {
+            // Remember only components this feature actually disabled.
+            if (component.enabled) { changed = true; component.enabled = false; }
+        }
+        else if (changed)
+        {
+            changed = false;
+            component.enabled = true;
+        }
+    }
+
+    private void RefreshHiddenObserverTicks(bool visible)
+    {
+        // Leave time for all native Start methods and spawn setup to complete.
+        bool suspend = retainedRuntimeStarted && netId != 0 &&
+            (NetworkServer.active || NetworkClient.active) && !visible &&
+            Time.time - spawnTime >= LocalPerPlayerCullSpawnGrace &&
+            presentationMotor != null && !presentationMotor.ShouldSimulateMotor();
+        if (!observerComponentsCached)
+        {
+            if (!suspend) return;
+            observerSenses = GetComponent<EnemySenses>();
+            observerAttack = GetComponent<EnemyAttack>();
+            observerComponentsCached = true;
+        }
+        bool wasSuspended = suspendedMotor || suspendedSenses || suspendedAttack;
+        if (observerAttack != null && (suspend != wasSuspended))
+            observerAttack.RefreshObserverCombatOwnership();
+        // Custom subclasses may have their own lifecycle or observer work.
+        if (presentationMotor != null && presentationMotor.GetType() == typeof(EnemyMotor))
+            SetObserverTickSuspended(presentationMotor, suspend, ref suspendedMotor);
+        if (observerSenses != null && observerSenses.GetType() == typeof(EnemySenses))
+            SetObserverTickSuspended(observerSenses, suspend, ref suspendedSenses);
+        if (observerAttack != null && observerAttack.GetType() == typeof(EnemyAttack))
+            SetObserverTickSuspended(observerAttack, suspend, ref suspendedAttack);
+    }
+
+    private void RestoreHiddenObserverTicks()
+    {
+        if (observerAttack != null && (suspendedMotor || suspendedSenses || suspendedAttack))
+            observerAttack.RefreshObserverCombatOwnership();
+        SetObserverTickSuspended(presentationMotor, false, ref suspendedMotor);
+        SetObserverTickSuspended(observerSenses, false, ref suspendedSenses);
+        SetObserverTickSuspended(observerAttack, false, ref suspendedAttack);
+    }
+
+    private void OnDisable()
+    {
+        RestoreObserverRuntime();
+        RestoreObserverCollisions();
+        RestoreHiddenObserverTicks();
+    }
+
+    // Coordinated observer dormancy. Root GameObject, network identity, SyncVars,
+    // RPCs, quest resources, death handlers and transform synchronization stay alive.
+    private static bool observerRuntimeEnabled = true;
+    private static bool observerRuntimeCommandRegistered;
+    [SerializeField] private bool observerRuntimeDormant;
+    public bool IsObserverRuntimeDormant => observerRuntimeDormant;
+    private float observerRuntimeWakeUntil;
+    private bool observerRuntimeCached;
+    private DaggerfallEntityBehaviour dormantEntity;
+    private SetupDemoEnemy dormantSetup;
+    private EntityEffectManager dormantEffects;
+    private bool dormantEntityChanged, dormantSetupChanged, dormantEffectsChanged;
+    private Behaviour[] dormantCosmetics;
+    private bool[] dormantCosmeticChanged;
+
+    // Explicit wake keeps existing network messages and effect/death entry points live.
+    public void WakeObserverRuntime()
+    {
+        observerRuntimeWakeUntil = Time.unscaledTime + 1f;
+        RestoreObserverRuntime();
+    }
+
+    private bool CanUseObserverRuntime(bool visible)
+    {
+        if (!observerRuntimeEnabled || observerRuntimeFaulted || !isActiveAndEnabled || !retainedRuntimeStarted || netId == 0 ||
+            (!NetworkServer.active && !NetworkClient.active) || visible ||
+            Time.time - spawnTime < LocalPerPlayerCullSpawnGrace ||
+            Time.unscaledTime < observerRuntimeWakeUntil || observerPhysicsSettleDepth != 0 ||
+            HasLocalOwnershipClaim || persistentOwnerPlayerNetId != 0 ||
+            presentationMotor == null || presentationMotor.GetType() != typeof(EnemyMotor) ||
+            presentationMotor.ShouldSimulateMotor()) return false;
+        var saves = DaggerfallWorkshop.Game.Serialization.SaveLoadManager.Instance;
+        if (saves != null && saves.LoadInProgress) return false;
+        return true;
+    }
+
+    private void CacheObserverRuntime()
+    {
+        if (observerRuntimeCached) return;
+        observerRuntimeCached = true;
+        dormantEntity = GetComponent<DaggerfallEntityBehaviour>();
+        dormantSetup = GetComponent<SetupDemoEnemy>();
+        dormantEffects = GetComponent<EntityEffectManager>();
+        var cosmetics = new System.Collections.Generic.List<Behaviour>();
+        foreach (Behaviour component in GetComponentsInChildren<Behaviour>(true))
+        {
+            if (component == null || component.GetComponentInParent<NetworkIdentity>() != netIdentity) continue;
+            System.Type type = component.GetType();
+            if (type == typeof(DaggerfallAudioSource) || type == typeof(EnemySounds) ||
+                type == typeof(EntityConcealmentBehaviour)) cosmetics.Add(component);
+        }
+        dormantCosmetics = cosmetics.ToArray();
+        dormantCosmeticChanged = new bool[dormantCosmetics.Length];
+    }
+
+    private void RefreshObserverRuntime(bool visible)
+    {
+        if (!CanUseObserverRuntime(visible))
+        {
+            RestoreObserverRuntime();
+            return;
+        }
+        CacheObserverRuntime();
+        // Respect custom subclasses, incomplete spawn setup, and external disabled states.
+        if (dormantEntity == null || dormantEntity.GetType() != typeof(DaggerfallEntityBehaviour) ||
+            dormantEntity.Entity == null || dormantEntity.Entity.GetType() != typeof(EnemyEntity) ||
+            dormantEntity.Entity.CurrentHealth <= 0 ||
+            dormantSetup == null || dormantSetup.GetType() != typeof(SetupDemoEnemy) ||
+            dormantEffects == null || dormantEffects.GetType() != typeof(EntityEffectManager) ||
+            !dormantEffects.CanSuspendNetworkObserverUpdates ||
+            (isClientOnly && !dormantSetup.HasReceivedInitialServerSettings()) ||
+            (!observerRuntimeDormant && (!dormantEntity.enabled || !dormantSetup.enabled || !dormantEffects.enabled)))
+        {
+            RestoreObserverRuntime();
+            return;
+        }
+        if (observerRuntimeDormant) return;
+        if (!dormantEffects.PrepareNetworkObserverDormancy() || !CanUseObserverRuntime(visible)) return;
+        observerRuntimeDormant = true;
+        SetObserverTickSuspended(dormantEffects, true, ref dormantEffectsChanged);
+        SetObserverTickSuspended(dormantSetup, true, ref dormantSetupChanged);
+        SetObserverTickSuspended(dormantEntity, true, ref dormantEntityChanged);
+        for (int i = 0; i < dormantCosmetics.Length; i++)
+            SetObserverTickSuspended(dormantCosmetics[i], true, ref dormantCosmeticChanged[i]);
+        lastObserverServiceTime = Time.unscaledTime;
+        EnqueueObserverService(lastObserverServiceTime + LocalPerPlayerCullInterval);
+    }
+
+    private void RestoreObserverRuntime()
+    {
+        RemoveObserverService();
+        if (!observerRuntimeDormant) return;
+        observerRuntimeDormant = false;
+        // Entity first: effect code checks entityBehaviour.enabled.
+        SetObserverTickSuspended(dormantEntity, false, ref dormantEntityChanged);
+        SetObserverTickSuspended(dormantSetup, false, ref dormantSetupChanged);
+        SetObserverTickSuspended(dormantEffects, false, ref dormantEffectsChanged);
+        for (int i = 0; i < dormantCosmetics.Length; i++)
+            SetObserverTickSuspended(dormantCosmetics[i], false, ref dormantCosmeticChanged[i]);
+    }
+
+    private void TickObserverRuntimeMaintenance()
+    {
+        // Serviced by the shared bounded queue. No new per-enemy coroutine.
+        // Do not StopAllCoroutines: corpse and network initialization work must survive.
+        if (!observerRuntimeDormant) return;
+        UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.Maintenance");
+        try
+        {
+            UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.SetupState");
+            try { dormantSetup.TickDormantNetworkObserver(dormantEntity, presentationMotor); }
+            finally { UnityEngine.Profiling.Profiler.EndSample(); }
+            if (!observerRuntimeDormant || !gameObject.activeInHierarchy) return;
+            UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.EffectState");
+            try { dormantEffects.TickDormantNetworkObserver(); }
+            finally { UnityEngine.Profiling.Profiler.EndSample(); }
+            if (!observerRuntimeDormant || !gameObject.activeInHierarchy) return;
+            UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.HealthState");
+            try { dormantEntity.TickDormantNetworkObserver(dormantSetup); }
+            finally { UnityEngine.Profiling.Profiler.EndSample(); }
+        }
+        finally
+        {
+            UnityEngine.Profiling.Profiler.EndSample();
+        }
+    }
+
+    // Intrusive FIFO: O(1) registration/removal, no per-frame scene scan or allocation.
+    private static DynamicEnemyAuthority observerServiceHead, observerServiceTail;
+    private static int observerServiceCount;
+    private static int observerServiceFrame = -1;
+    private static int observerServiceLastCount, observerServiceErrors;
+    private static float observerServiceLastMs, observerServicePeakMs;
+    private const int ObserverServiceMaxPerFrame = 512;
+    private const double ObserverServiceBudgetSeconds = 0.002;
+    private DynamicEnemyAuthority observerServicePrevious, observerServiceNext;
+    private bool observerServiceQueued, observerRuntimeFaulted;
+    private float observerServiceDue, lastObserverServiceTime;
+
+    private void EnqueueObserverService(float due)
+    {
+        if (observerServiceQueued || !observerRuntimeDormant || !isActiveAndEnabled) return;
+        observerServiceDue = due;
+        observerServicePrevious = observerServiceTail;
+        observerServiceNext = null;
+        if (!ReferenceEquals(observerServiceTail, null)) observerServiceTail.observerServiceNext = this;
+        else observerServiceHead = this;
+        observerServiceTail = this;
+        observerServiceQueued = true;
+        observerServiceCount++;
+    }
+
+    private void RemoveObserverService()
+    {
+        if (!observerServiceQueued) return;
+        if (!ReferenceEquals(observerServicePrevious, null)) observerServicePrevious.observerServiceNext = observerServiceNext;
+        else observerServiceHead = observerServiceNext;
+        if (!ReferenceEquals(observerServiceNext, null)) observerServiceNext.observerServicePrevious = observerServicePrevious;
+        else observerServiceTail = observerServicePrevious;
+        observerServicePrevious = observerServiceNext = null;
+        observerServiceQueued = false;
+        observerServiceCount--;
+    }
+
+    private static void ProcessObserverServiceQueue()
+    {
+        if (observerServiceFrame == Time.frameCount) return;
+        observerServiceFrame = Time.frameCount;
+        observerServiceLastCount = 0;
+        observerServiceLastMs = 0f;
+        if (ReferenceEquals(observerServiceHead, null)) return;
+
+        // Aim for one pass per 0.25s, but never replay a whole overdue population
+        // after a stall. Under load, FIFO fairness wins over catch-up bursts.
+        int limit = Mathf.Clamp(Mathf.CeilToInt(observerServiceCount *
+            Mathf.Min(Time.unscaledDeltaTime, 0.05f) / LocalPerPlayerCullInterval),
+            1, Mathf.Min(ObserverServiceMaxPerFrame, observerServiceCount));
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
+        double budgetTicks = ObserverServiceBudgetSeconds * System.Diagnostics.Stopwatch.Frequency;
+        float now = Time.unscaledTime;
+        UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.Scheduler");
+        try
+        {
+            while (observerServiceLastCount < limit && !ReferenceEquals(observerServiceHead, null))
+            {
+                DynamicEnemyAuthority enemy = observerServiceHead;
+                // Normally due order follows FIFO order. Newly sleeping enemies are
+                // appended; their first pass can wait behind the oldest queued entry.
+                if (enemy != null && enemy.observerServiceDue > now) break;
+                enemy.RemoveObserverService();
+                observerServiceLastCount++;
+                if (enemy != null && enemy.isActiveAndEnabled && enemy.observerRuntimeDormant)
+                {
+                    try
+                    {
+                        enemy.RefreshObserverLocalState();
+                        if (enemy != null && enemy.isActiveAndEnabled && enemy.observerRuntimeDormant)
+                            enemy.TickObserverRuntimeMaintenance();
+                        if (enemy != null && enemy.isActiveAndEnabled && enemy.observerRuntimeDormant)
+                        {
+                            enemy.lastObserverServiceTime = now;
+                            enemy.EnqueueObserverService(now + LocalPerPlayerCullInterval);
+                        }
+                    }
+                    catch (System.Exception exception)
+                    {
+                        // A broken mod/state must not stall every other enemy's queue.
+                        observerServiceErrors++;
+                        if (enemy != null)
+                        {
+                            enemy.observerRuntimeFaulted = true;
+                            enemy.WakeObserverRuntime();
+                        }
+                        Debug.LogException(exception);
+                    }
+                }
+                // Soft time budget: the current enemy operation is never interrupted.
+                if (System.Diagnostics.Stopwatch.GetTimestamp() - started >= budgetTicks) break;
+            }
+        }
+        finally
+        {
+            observerServiceLastMs = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - started) *
+                1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            observerServicePeakMs = Mathf.Max(observerServicePeakMs, observerServiceLastMs);
+            UnityEngine.Profiling.Profiler.EndSample();
+        }
+    }
+
+    private static void RegisterObserverRuntimeCommand()
+    {
+        if (observerRuntimeCommandRegistered) return;
+        Wenzil.Console.ConsoleCommandsDatabase.RegisterCommand("enemyobserver",
+            "Inspect or toggle hidden observer runtime suspension (local process only).",
+            "enemyobserver status|on|off", ObserverRuntimeCommand);
+        observerRuntimeCommandRegistered = true;
+    }
+
+    private static string ObserverRuntimeCommand(params string[] args)
+    {
+        string action = args.Length == 0 ? "status" : args[0].ToLowerInvariant();
+        if (action != "status" && action != "on" && action != "off")
+            return "Usage: enemyobserver status|on|off";
+        // A diagnostic command may scan once; the runtime path never does this scan.
+        var enemies = FindObjectsOfType<DynamicEnemyAuthority>();
+        if (action != "status")
+        {
+            observerRuntimeEnabled = action == "on";
+            foreach (var enemy in enemies)
+                if (!observerRuntimeEnabled) enemy.RestoreObserverRuntime();
+        }
+        int networked = 0, dormant = 0, collisions = 0, busyEffects = 0;
+        int entityTicksOff = 0, setupTicksOff = 0, effectTicksOff = 0;
+        float oldestServiceAge = 0f;
+        foreach (var enemy in enemies)
+        {
+            if (enemy.netId == 0) continue;
+            networked++;
+            if (enemy.observerCollisionsSuspended) collisions++;
+            if (enemy.dormantEffects != null && !enemy.dormantEffects.CanSuspendNetworkObserverUpdates) busyEffects++;
+            if (!enemy.observerRuntimeDormant) continue;
+            dormant++;
+            oldestServiceAge = Mathf.Max(oldestServiceAge, Time.unscaledTime - enemy.lastObserverServiceTime);
+            if (enemy.dormantEntity != null && !enemy.dormantEntity.enabled) entityTicksOff++;
+            if (enemy.dormantSetup != null && !enemy.dormantSetup.enabled) setupTicksOff++;
+            if (enemy.dormantEffects != null && !enemy.dormantEffects.enabled) effectTicksOff++;
+        }
+        return $"Enemy observer runtime enabled={observerRuntimeEnabled}; networked={networked}; dormant={dormant}; " +
+            $"entityTicksOff={entityTicksOff}; setupTicksOff={setupTicksOff}; effectTicksOff={effectTicksOff}; " +
+            $"collisionSuspended={collisions}; cachedBusyEffects={busyEffects}; " +
+            $"queue={observerServiceCount}; servicedLastFrame={observerServiceLastCount}; " +
+            $"serviceLastMs={observerServiceLastMs:F2}; oldestServiceAge={oldestServiceAge:F2}s; " +
+            $"servicePeakMs={observerServicePeakMs:F2}; maintenanceErrors={observerServiceErrors}. " +
+            "Local process only; collision suspension and earlier motor/senses/attack gates are unchanged. " +
+            "Allow 2 seconds after a toggle before measuring. Do not combine with bench scripts/physics.";
+    }
+
+    private EnemyMotor presentationMotor;
+    private DaggerfallMobileUnit[] presentationMobiles;
+    private EnemySounds[] presentationSounds;
+    private Light[] presentationLights;
+    private ParticleSystem[] presentationParticles;
+    private bool[] presentationLightStates;
+    private bool[] presentationParticleStates;
+    private bool presentationStateApplied;
+    private bool lastPresentationVisible;
+    private bool lastPresentationSimulator;
+
     private float nextLocalPerPlayerCullCheckTime = 0f;
     private Collider[] cachedEnemyColliders = null;
     private Collider[] cachedLocalPlayerColliders = null;
@@ -330,7 +708,11 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     public void ResetRetainedActorToLocal()
     {
+        RestoreObserverRuntime();
+        RestoreObserverCollisions();
+        RestoreHiddenObserverTicks();
         StopAllCoroutines();
+        observerPhysicsSettleDepth = 0;
         if (_ntResetCo != null)
         {
             var pendingTransform = GetComponent<NetworkTransform>();
@@ -356,6 +738,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     {
         if (retainedRuntimeStarted) return;
         retainedRuntimeStarted = true;
+        RegisterObserverRuntimeCommand();
         netIdentity = GetComponent<NetworkIdentity>();
         enemyTransform = transform;
         visual = transform.Find("MobileUnitBillboard")?.gameObject;
@@ -377,10 +760,16 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
         if (NetworkServer.active)
             retainedAuthorityRoutine = StartCoroutine(AuthorityCheckRoutine());
+
+        RefreshVisualAndAudioState();
+        // Authority callbacks can precede Start, before visual was resolved.
+        if (visual != null)
+            visual.SetActive(lastPresentationVisible || lastPresentationSimulator);
     }
 
     void LateUpdate()
     {
+        ProcessObserverServiceQueue();
         LocalActorUpdate?.Invoke(this);
         NormalizeExteriorTerrainFrameNearLocalPlayer();
         HoldRemotePassiveFixedSpawnOnServer();
@@ -726,12 +1115,15 @@ public class DynamicEnemyAuthority : NetworkBehaviour
                 ApplyAuthorityMotionGate();
             }
         }
+        RefreshVisualAndAudioState();
     }
 
     void UpdateAuthority()
     {
         if (!NetworkServer.active || !netIdentity)
             return;
+
+        if (PassiveDungeonGridTest) return;
 
         if (MaintainPersistentAuthority())
             return;
@@ -858,7 +1250,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
                 if (currentOwner != null)
                     netIdentity.RemoveClientAuthority();
 
-                netIdentity.AssignClientAuthority(newOwner);
+                { EnemyInterestManagement.PrepareOwner(netIdentity, newOwner); netIdentity.AssignClientAuthority(newOwner); }
                 currentOwner = newOwner;
                 SetAuthorityDeactivated(false);
 
@@ -883,7 +1275,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
                 netIdentity.RemoveClientAuthority();
 
             if (fallbackOwner != null)
-                netIdentity.AssignClientAuthority(fallbackOwner);
+                { EnemyInterestManagement.PrepareOwner(netIdentity, fallbackOwner); netIdentity.AssignClientAuthority(fallbackOwner); }
 
             currentOwner = fallbackOwner;
         }
@@ -901,16 +1293,33 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     private void UpdateLocalPerPlayerCulling()
     {
-        if (!NetworkClient.active)
-            return;
+        if (!NetworkClient.active && !NetworkServer.active) return;
+        // Dormant relevance checks and maintenance run together through the bounded queue.
+        if (observerRuntimeDormant) return;
+        float now = Time.unscaledTime;
+        if (now < nextLocalPerPlayerCullCheckTime) return;
+        // Anchor each non-dormant check to its own phase; now+interval would merge
+        // their phases again after a long frame. Missed checks are not replayed.
+        float phase = (authoritySlot % AuthorityStaggerSlots) *
+            (LocalPerPlayerCullInterval / AuthorityStaggerSlots);
+        nextLocalPerPlayerCullCheckTime =
+            (Mathf.Floor((now - phase) / LocalPerPlayerCullInterval) + 1f) * LocalPerPlayerCullInterval + phase;
+        RefreshObserverLocalState();
+    }
 
-        if (Time.time < nextLocalPerPlayerCullCheckTime)
-            return;
-
-        nextLocalPerPlayerCullCheckTime = Time.time + LocalPerPlayerCullInterval;
-
-        bool shouldCull = ShouldCullForLocalPlayer();
-        SetLocalPerPlayerCulled(shouldCull);
+    private void RefreshObserverLocalState()
+    {
+        bool shouldCull;
+        UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.Relevance");
+        try { shouldCull = NetworkClient.active && ShouldCullForLocalPlayer(); }
+        finally { UnityEngine.Profiling.Profiler.EndSample(); }
+        UnityEngine.Profiling.Profiler.BeginSample("EnemyObserver.StateRefresh");
+        try
+        {
+            if (localPerPlayerCulled != shouldCull) SetLocalPerPlayerCulled(shouldCull);
+            else RefreshVisualAndAudioState();
+        }
+        finally { UnityEngine.Profiling.Profiler.EndSample(); }
     }
 
     private bool ShouldCullForLocalPlayer()
@@ -926,17 +1335,38 @@ public class DynamicEnemyAuthority : NetworkBehaviour
             return false;
 
         Vector3 localPlayerPos = GameManager.Instance.PlayerObject.transform.position;
-        float absY = Mathf.Abs(localPlayerPos.y - transform.position.y);
 
-        bool useDungeonSlotRules = IsActualNetworkDungeonEnemyForLocalRules();
+        // Decide location relevance by identity, never by spacing between dungeon roots.
+        // Unknown identity deliberately stays visible until a trustworthy stamp arrives.
+        if (worldPosition == null) worldPosition = GetComponent<EnemyWorldPosition>();
+        if (worldPosition == null) return false;
+        var enterExit = GameManager.Instance.PlayerEnterExit;
+        if (enterExit == null) return false;
+        string dungeonId = worldPosition.PresentationDungeonInstanceId;
+        if (!string.IsNullOrEmpty(dungeonId))
+        {
+            if (!enterExit.IsPlayerInsideDungeon) return true;
+            var localDungeon = enterExit.Dungeon;
+            if (localDungeon == null || string.IsNullOrEmpty(localDungeon.DungeonInstanceId)) return false;
+            return dungeonId != localDungeon.DungeonInstanceId;
+        }
+        if (worldPosition.isDungeonSpawn) return false;
+        if (worldPosition.isInteriorSpawn)
+        {
+            if (worldPosition.PresentationLocationState != PositionMultiplayer.PartyLocationState.BuildingInterior ||
+                worldPosition.PresentationBuildingKey == 0) return false;
+            if (!enterExit.IsPlayerInsideBuilding || enterExit.IsPlayerInsideDungeon) return true;
+            var localPlayer = PlayerMultiplayer.GetLocalPlayer();
+            var localPosition = localPlayer != null ? localPlayer.GetComponent<PositionMultiplayer>() : null;
+            if (localPosition == null || localPosition.PartyCurrentLocationState != PositionMultiplayer.PartyLocationState.BuildingInterior ||
+                localPosition.PartyBuildingKey == 0) return false;
+            return worldPosition.PresentationBuildingKey != localPosition.PartyBuildingKey ||
+                worldPosition.PresentationRegionName != localPosition.PartyRegionName ||
+                worldPosition.PresentationLocationName != localPosition.PartyLocationName;
+        }
+        if (enterExit.IsPlayerInsideDungeon || enterExit.IsPlayerInsideBuilding) return true;
 
-        // Real network dungeon enemies live far below the exterior and their DF X/Z is
-        // only the dungeon entrance anchor. For them, local Unity/Y distance is the only
-        // useful per-player visibility rule.
-        if (useDungeonSlotRules)
-            return Vector3.Distance(localPlayerPos, transform.position) > LocalPerPlayerCullDistanceUnity;
-
-        // Exterior and building/interior enemies need DF X/Z. This fixes the case where
+        // Exterior enemies need DF X/Z. This fixes the case where
         // another player is in a totally different DF world area but happens to share
         // similar local Unity coordinates.
         // IMPORTANT: do not require EnemyWorldPosition.initialized here. That flag is not
@@ -955,10 +1385,8 @@ public class DynamicEnemyAuthority : NetworkBehaviour
             return distU > LocalPerPlayerCullDistanceUnity;
         }
 
-        // Last-resort fallback only when DF metadata is unavailable after the short grace.
-        // This will not solve cross-world same-Unity-coordinate cases, but it is safer than
-        // making a visible nearby enemy pass-through because metadata is missing.
-        return Vector3.Distance(localPlayerPos, transform.position) > LocalPerPlayerCullDistanceUnity;
+        // Keep unknown locations visible rather than guessing from Unity coordinates.
+        return false;
     }
 
     private bool IsActualNetworkDungeonEnemyForLocalRules()
@@ -986,13 +1414,45 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     private void RefreshVisualAndAudioState()
     {
-        bool visible = !authorityDeactivated && !localPerPlayerCulled;
+        bool visible = !IsLocalPresentationSuspended;
+        if (presentationMotor == null) presentationMotor = GetComponent<EnemyMotor>();
+        bool simulator = presentationMotor != null && presentationMotor.ShouldSimulateCombat();
+        // Restore physics before re-enabling a local simulator's native ticks.
+        RefreshObserverCollisions();
+        RefreshObserverRuntime(visible);
+        RefreshHiddenObserverTicks(visible);
+        if (presentationStateApplied && lastPresentationVisible == visible && lastPresentationSimulator == simulator)
+            return;
+        bool visibilityChanged = !presentationStateApplied || lastPresentationVisible != visible;
+        presentationStateApplied = true;
+        lastPresentationVisible = visible;
+        lastPresentationSimulator = simulator;
+        if (presentationMobiles == null) presentationMobiles = GetComponentsInChildren<DaggerfallMobileUnit>(true);
+        if (presentationSounds == null) presentationSounds = GetComponentsInChildren<EnemySounds>(true);
+        foreach (var mobile in presentationMobiles)
+            if (mobile != null) mobile.SetNetworkPresentationSuspended(!visible, simulator);
+        foreach (var sound in presentationSounds)
+            if (sound != null) sound.PresentationSuspended = !visible;
+        if (visibilityChanged && !visible) RefreshPresentationLightsAndParticles(false);
 
         // Keep the old direct visual toggle, but also toggle all child renderers.
         // Some enemy prefabs/visuals do not use a direct child named MobileUnitBillboard,
         // so renderer toggling makes local culling actually hide the sprite/model too.
         if (visual != null)
-            visual.SetActive(visible);
+            visual.SetActive(visible || simulator);
+
+        // Restore only after reactivating the billboard. On hidden ownership gain,
+        // suppress any play-on-awake effects without replacing their saved states.
+        if (visibilityChanged && visible) RefreshPresentationLightsAndParticles(true);
+        if (!visible)
+        {
+            if (presentationLights != null)
+                foreach (var light in presentationLights)
+                    if (light != null) light.enabled = false;
+            if (presentationParticles != null)
+                foreach (var particles in presentationParticles)
+                    if (particles != null && particles.isPlaying) particles.Pause(false);
+        }
 
         Renderer[] renderers = GetCachedRenderers();
         if (renderers != null)
@@ -1012,6 +1472,40 @@ public class DynamicEnemyAuthority : NetworkBehaviour
                 if (audioSources[i] != null)
                     audioSources[i].enabled = visible;
             }
+        }
+    }
+
+    private void RefreshPresentationLightsAndParticles(bool visible)
+    {
+        if (presentationLights == null)
+        {
+            presentationLights = GetComponentsInChildren<Light>(true);
+            presentationLightStates = new bool[presentationLights.Length];
+            for (int i = 0; i < presentationLights.Length; i++)
+                presentationLightStates[i] = presentationLights[i] != null && presentationLights[i].enabled;
+        }
+        if (presentationParticles == null)
+        {
+            presentationParticles = GetComponentsInChildren<ParticleSystem>(true);
+            presentationParticleStates = new bool[presentationParticles.Length];
+        }
+        for (int i = 0; i < presentationLights.Length; i++)
+        {
+            Light light = presentationLights[i];
+            if (light == null) continue;
+            if (!visible) { presentationLightStates[i] = light.enabled; light.enabled = false; }
+            else light.enabled = presentationLightStates[i];
+        }
+        for (int i = 0; i < presentationParticles.Length; i++)
+        {
+            ParticleSystem particles = presentationParticles[i];
+            if (particles == null) continue;
+            if (!visible)
+            {
+                presentationParticleStates[i] = particles.isPlaying;
+                if (particles.isPlaying) particles.Pause(false);
+            }
+            else if (presentationParticleStates[i]) particles.Play(false);
         }
     }
 
@@ -1051,11 +1545,81 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         return cachedLocalPlayerColliders;
     }
 
+    // Local collision suspension: no GameObject, network identity, or owner changes.
+    private bool observerCollisionsSuspended;
+    private int observerPhysicsSettleDepth;
+    private readonly System.Collections.Generic.List<Collider> observerDisabledColliders =
+        new System.Collections.Generic.List<Collider>();
+
+    private static void OnObserverPhysicsAuthorityChanged(NetworkConnection connection,
+        NetworkIdentity identity, bool assigned)
+    {
+        // RemoveClientAuthority invokes this BEFORE clearing connectionToClient.
+        // Restore unconditionally so a server fallback has physics immediately.
+        // The normal local visibility refresh decides when to suspend again.
+        if (identity == null) return;
+        var authority = identity.GetComponent<DynamicEnemyAuthority>();
+        if (authority != null)
+        {
+            authority.WakeObserverRuntime();
+            authority.RestoreObserverCollisions();
+        }
+    }
+
+    private void RefreshObserverCollisions()
+    {
+        bool suspend = isActiveAndEnabled && retainedRuntimeStarted && netId != 0 &&
+            (NetworkServer.active || NetworkClient.active) && IsLocalPresentationSuspended &&
+            Time.time - spawnTime >= LocalPerPlayerCullSpawnGrace &&
+            observerPhysicsSettleDepth == 0 && presentationMotor != null &&
+            presentationMotor.GetType() == typeof(EnemyMotor) &&
+            !presentationMotor.ShouldSimulateMotor();
+        if (!suspend)
+        {
+            RestoreObserverCollisions();
+            return;
+        }
+        if (observerCollisionsSuspended) return;
+
+        // Snapshot on each suspension transition, not every frame. Include inactive
+        // descendants, but never another network actor parented beneath this enemy.
+        Collider[] colliders = GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < colliders.Length; i++)
+        {
+            Collider collider = colliders[i];
+            if (collider == null || !collider.enabled ||
+                collider.GetComponentInParent<NetworkIdentity>() != netIdentity) continue;
+            // Unknown mod-driven dynamic bodies still need collision support.
+            Rigidbody body = collider.attachedRigidbody;
+            if (body != null && !body.isKinematic) continue;
+            observerDisabledColliders.Add(collider);
+            collider.enabled = false;
+        }
+        observerCollisionsSuspended = true;
+    }
+
+    private void RestoreObserverCollisions()
+    {
+        if (!observerCollisionsSuspended) return;
+        observerCollisionsSuspended = false;
+        for (int i = 0; i < observerDisabledColliders.Count; i++)
+        {
+            Collider collider = observerDisabledColliders[i];
+            if (collider != null) collider.enabled = true;
+        }
+        observerDisabledColliders.Clear();
+        // Unity can discard pair-ignore state when a collider is disabled.
+        if (localCollisionPairsIgnored)
+        {
+            localCollisionPairsIgnored = false;
+            SetLocalPlayerCollisionIgnored(true);
+        }
+    }
+
     private void RefreshLocalCollisionState()
     {
-        // If the enemy is globally deactivated or locally culled, the local player should
-        // be able to pass through it. This is pairwise only; enemy colliders/controllers
-        // stay enabled for server/owner simulation.
+        RefreshObserverCollisions();
+        // Retain the existing local-player ghost rule, including for deactivated owners.
         SetLocalPlayerCollisionIgnored(authorityDeactivated || localPerPlayerCulled);
     }
 
@@ -1082,8 +1646,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
                 if (ec == null || ec == pc)
                     continue;
 
-                // Never disable the enemy CharacterController/collider itself. Pair-ignore
-                // is local to this physics scene and does not make EnemyMotor's controller inactive.
+                // Pair-ignore remains separate from hidden observer suspension.
                 Physics.IgnoreCollision(pc, ec, ignored);
             }
         }
@@ -1103,7 +1666,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         bool clientOwned = server && id != null && id.connectionToClient != null;
 
         if (server && rb)
-            rb.isKinematic = authorityDeactivated || clientOwned;
+            rb.isKinematic = PassiveDungeonGridTest || authorityDeactivated || clientOwned;
     }
 
     
@@ -1253,6 +1816,14 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     public override void OnStartServer()
     {
         base.OnStartServer();
+        netIdentity = GetComponent<NetworkIdentity>();
+        EnemyInterestManagement.Install();
+        // Use DF relevance, including prefabs previously set ForceShown to bypass Unity distance AOI.
+        if (NetworkServer.aoi is EnemyInterestManagement && netIdentity.visible == Visibility.ForceShown)
+            netIdentity.visible = Visibility.Default;
+        // One static handler, not one subscriber per enemy. Mirror clears it on reset.
+        NetworkIdentity.clientAuthorityCallback -= OnObserverPhysicsAuthorityChanged;
+        NetworkIdentity.clientAuthorityCallback += OnObserverPhysicsAuthorityChanged;
         ApplyAuthorityMotionGate(); // RB inert if needed; CC untouched here
 
         // Server-side spawn settle closes the gap before the first client authority assignment.
@@ -1265,6 +1836,9 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     public override void OnStartAuthority()
     {
         base.OnStartAuthority();
+        WakeObserverRuntime();
+        RestoreObserverCollisions();
+        RefreshVisualAndAudioState();
 
         // Owner: clear local NT buffers immediately.
         ResetNetworkTransformBuffers();
@@ -1291,6 +1865,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     public override void OnStopAuthority()
     {
         base.OnStopAuthority();
+        RefreshVisualAndAudioState();
         ResetNetworkTransformBuffers();
     }
 
@@ -1334,6 +1909,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
 
     void TryStartDestroyCountdown()
     {
+        if (KeepForDungeonGridTest) return;
         if (persistentOwnerPlayerNetId != 0)
             return;
 
@@ -1358,7 +1934,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
     {
         yield return new WaitForSeconds(destroyGracePeriod);
 
-        if (persistentOwnerPlayerNetId == 0 && !IsAnyPlayerStillOutOfRange()) // double check before destroy
+        if (!KeepForDungeonGridTest && persistentOwnerPlayerNetId == 0 && !IsAnyPlayerStillOutOfRange()) // double check before destroy
         {
             Debug.Log($"[DynamicEnemyAuthority] Still no players near. Destroying enemy '{name}' (NetID: {netIdentity.netId})");
             NetworkServer.Destroy(gameObject);
@@ -1516,6 +2092,10 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         var cc = GetComponent<CharacterController>();
         var rb = GetComponent<Rigidbody>();
 
+        // Do not capture a controller disabled by observer culling as its normal state.
+        WakeObserverRuntime();
+        RestoreObserverCollisions();
+        observerPhysicsSettleDepth++;
         bool ccWasEnabled = cc && cc.enabled;
         bool rbHad = rb != null;
         bool rbWasKinematic = rbHad && rb.isKinematic;
@@ -1561,6 +2141,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         if (cc && ccWasEnabled) cc.enabled = true;
         if (settleMotor != null)
             RestoreSettledMotorState(settleMotor, motorWasEnabled, "create-foe-settle");
+        observerPhysicsSettleDepth--;
 
         _serverCreateFoeSpawnSettleCo = null;
     }
@@ -1658,6 +2239,10 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         var rb = GetComponent<Rigidbody>();
 
         // Temporarily disable physics resolution while we settle.
+        // Do not capture a controller disabled by observer culling as its normal state.
+        WakeObserverRuntime();
+        RestoreObserverCollisions();
+        observerPhysicsSettleDepth++;
         bool ccWasEnabled = cc && cc.enabled;
         bool rbHad = rb != null;
         bool rbWasKinematic = rbHad && rb.isKinematic;
@@ -1706,6 +2291,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         if (cc && ccWasEnabled) cc.enabled = true;
         if (settleMotor != null)
             RestoreSettledMotorState(settleMotor, motorWasEnabled, "create-foe-settle");
+        observerPhysicsSettleDepth--;
 
         _didCreateFoeAuthorityResnap = true;
         _createFoeAuthorityResnapCo = null;
@@ -1775,6 +2361,10 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         var cc = GetComponent<CharacterController>();
         var rb = GetComponent<Rigidbody>();
 
+        // Do not capture a controller disabled by observer culling as its normal state.
+        WakeObserverRuntime();
+        RestoreObserverCollisions();
+        observerPhysicsSettleDepth++;
         bool ccWasEnabled = cc && cc.enabled;
         bool rbHad = rb != null;
         bool rbWasKinematic = rbHad && rb.isKinematic;
@@ -1821,6 +2411,7 @@ public class DynamicEnemyAuthority : NetworkBehaviour
         if (cc && ccWasEnabled) cc.enabled = true;
         if (settleMotor != null)
             RestoreSettledMotorState(settleMotor, motorWasEnabled, "create-foe-settle");
+        observerPhysicsSettleDepth--;
     }
 
 

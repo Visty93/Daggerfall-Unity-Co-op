@@ -86,7 +86,7 @@ namespace DaggerfallWorkshop.Game
 
         // Save/load recovery for saves made inside MP/network dungeons.
         bool pendingRecoveredNetworkDungeonSave = false;
-        float pendingRecoveredNetworkDungeonY = 0f;
+        Vector3 pendingRecoveredNetworkDungeonOrigin = Vector3.zero;
 
         // Seamless local/save dungeon -> host-authoritative MP dungeon conversion.
         // While this is pending the source dungeon has been captured/removed, the HUD
@@ -117,7 +117,7 @@ namespace DaggerfallWorkshop.Game
         string pendingPureClientDungeonLoadRegionName = string.Empty;
         string pendingPureClientDungeonLoadLocationName = string.Empty;
         Vector3 pendingPureClientDungeonLoadLocalPosition = Vector3.zero;
-        float pendingPureClientDungeonLoadAuthoritativeY = 0f;
+        Vector3 pendingPureClientDungeonLoadAuthoritativeOrigin = Vector3.zero;
         int pendingPureClientDungeonLoadWorldX = 0;
         int pendingPureClientDungeonLoadWorldZ = 0;
 
@@ -1058,7 +1058,7 @@ namespace DaggerfallWorkshop.Game
             // Backward compatibility for saves made before explicit local position was added.
             // MP saves know their old dungeon Y; normal SP dungeons use the standard root at Y=0.
             if (playerPosition.savedInsideNetworkDungeon)
-                return playerPosition.position - new Vector3(0f, playerPosition.savedNetworkDungeonY, 0f);
+                return playerPosition.position - playerPosition.GetSavedDungeonOrigin();
 
             return playerPosition.position;
         }
@@ -1513,11 +1513,11 @@ namespace DaggerfallWorkshop.Game
                 pendingPureClientDungeonLoadRegionName = location.RegionName ?? string.Empty;
                 pendingPureClientDungeonLoadLocationName = location.Name ?? string.Empty;
                 pendingPureClientDungeonLoadLocalPosition = transform.position - liveDungeon.transform.position;
-                pendingPureClientDungeonLoadAuthoritativeY = liveDungeon.PositionY;
+                pendingPureClientDungeonLoadAuthoritativeOrigin = liveDungeon.GridPosition;
                 pendingPureClientDungeonLoadWorldX = pendingNetworkDungeonWorldX;
                 pendingPureClientDungeonLoadWorldZ = pendingNetworkDungeonWorldZ;
 
-                Debug.Log($"[NetworkDungeonConversion][PostLoadY] Captured pure-client finalization. dungeon='{location.RegionName}/{location.Name}' netId={liveDungeon.netId} authoritativeY={pendingPureClientDungeonLoadAuthoritativeY} local={pendingPureClientDungeonLoadLocalPosition} world={pendingPureClientDungeonLoadWorldX}/{pendingPureClientDungeonLoadWorldZ}");
+                Debug.Log($"[NetworkDungeonConversion][PostLoadY] Captured pure-client finalization. dungeon='{location.RegionName}/{location.Name}' netId={liveDungeon.netId} authoritativeY={pendingPureClientDungeonLoadAuthoritativeOrigin} local={pendingPureClientDungeonLoadLocalPosition} world={pendingPureClientDungeonLoadWorldX}/{pendingPureClientDungeonLoadWorldZ}");
             }
 
             ClearPendingNetworkDungeonConversionState();
@@ -1573,8 +1573,7 @@ namespace DaggerfallWorkshop.Game
             // Reassert the host-authored dungeon root itself first. This also covers the case
             // where some late pure-client restore touched the spawned dungeon transform rather
             // than only the player's transform.
-            liveDungeon.PositionY = pendingPureClientDungeonLoadAuthoritativeY;
-            liveDungeon.transform.position = new Vector3(0f, pendingPureClientDungeonLoadAuthoritativeY, 0f);
+            liveDungeon.SetGridPosition(pendingPureClientDungeonLoadAuthoritativeOrigin);
 
             dungeon = liveDungeon;
             isPlayerInside = true;
@@ -1611,8 +1610,7 @@ namespace DaggerfallWorkshop.Game
             // CommitSavedDungeonWorldContext can rebuild StreamingWorld, so make the final
             // authoritative root + player write after it. No coroutine or arbitrary delay is
             // used: SaveLoadManager calls this after its complete restore phase.
-            liveDungeon.PositionY = pendingPureClientDungeonLoadAuthoritativeY;
-            liveDungeon.transform.position = new Vector3(0f, pendingPureClientDungeonLoadAuthoritativeY, 0f);
+            liveDungeon.SetGridPosition(pendingPureClientDungeonLoadAuthoritativeOrigin);
             transform.position = liveDungeon.transform.position + pendingPureClientDungeonLoadLocalPosition;
             SetStanding();
             ClearTransitionFallingDamageWindow(reason + "-post-load-final");
@@ -1631,7 +1629,7 @@ namespace DaggerfallWorkshop.Game
             pendingPureClientDungeonLoadRegionName = string.Empty;
             pendingPureClientDungeonLoadLocationName = string.Empty;
             pendingPureClientDungeonLoadLocalPosition = Vector3.zero;
-            pendingPureClientDungeonLoadAuthoritativeY = 0f;
+            pendingPureClientDungeonLoadAuthoritativeOrigin = Vector3.zero;
             pendingPureClientDungeonLoadWorldX = 0;
             pendingPureClientDungeonLoadWorldZ = 0;
         }
@@ -2345,10 +2343,21 @@ namespace DaggerfallWorkshop.Game
             // Y slot so the serialized player/enemy positions still line up locally.
             if (playerPosition.savedInsideNetworkDungeon)
             {
+                Vector3 recoveredOrigin = playerPosition.GetSavedDungeonOrigin();
+                // Old vertical-stack saves can be below FloatingOrigin's 5000-unit reset.
+                // Keep a margin for room height; recover outside instead of shifting only the player.
+                if (!NetworkDungeonGrid.IsSafeRecoveryOrigin(recoveredOrigin))
+                {
+                    pendingRecoveredNetworkDungeonSave = false;
+                    pendingRecoveredNetworkDungeonOrigin = Vector3.zero;
+                    playerPosition.suppressNetworkDungeonPositionRestore = true;
+                    RespawnPlayerDungeonExteriorForNetworkSafety(playerPosition.worldPosX, playerPosition.worldPosZ, "unsafe-saved-grid-origin");
+                    return;
+                }
                 pendingRecoveredNetworkDungeonSave = true;
-                pendingRecoveredNetworkDungeonY = playerPosition.savedNetworkDungeonY;
+                pendingRecoveredNetworkDungeonOrigin = recoveredOrigin;
 
-                Debug.Log($"[NetworkDungeonSave] Loading MP dungeon save in SP. Reconstructing local recovery dungeon at y={pendingRecoveredNetworkDungeonY}");
+                Debug.Log($"[NetworkDungeonSave] Loading MP dungeon save in SP. Reconstructing local recovery dungeon at y={pendingRecoveredNetworkDungeonOrigin}");
             }
 
             // Start the respawn process based on saved player location
@@ -3281,6 +3290,41 @@ public static void DestroyIfMultiplayerSafe(GameObject obj)
 }
 
 
+// An unrelated dungeon may be present as metadata only on a pure client.
+// Its original DFU entry method needs a fully built StartMarker and colliders.
+// Continue the same vanilla/network transition when the layout is ready.
+private Coroutine lazyDungeonEntranceCoroutine;
+
+private IEnumerator CompleteLazyDungeonEntrance(
+    DaggerfallDungeon destination, Transform doorOwner, StaticDoor door,
+    DFLocation location, bool doFade)
+{
+    float timeoutAt = Time.realtimeSinceStartup + 25f;
+    while (destination != null &&
+           (!destination.isSet || destination.StartMarker == null ||
+            !destination.InitialSavedActionStateReady) &&
+           Time.realtimeSinceStartup < timeoutAt)
+    {
+        yield return null;
+    }
+
+    lazyDungeonEntranceCoroutine = null;
+    if (destination == null || !destination.isSet || destination.StartMarker == null ||
+        !destination.InitialSavedActionStateReady)
+    {
+        Debug.LogError($"[LazyDungeon] Dungeon entry failed to load '{location.Name}' before timeout.");
+        RaiseOnFailedTransition(TransitionType.ToDungeonInterior);
+        yield break;
+    }
+
+    if (!NetworkClient.isConnected || NetworkServer.active || IsPlayerInsideDungeon ||
+        networkDungeonConversionInProgress)
+        yield break;
+
+    Debug.Log($"[LazyDungeon] Loaded existing dungeon '{location.Name}'; resuming entrance.");
+    TransitionDungeonInterior(doorOwner, door, location, doFade);
+}
+
 /// <summary>
 /// Transition player through a dungeon entrance door into dungeon interior.
 /// </summary>
@@ -3307,6 +3351,37 @@ public void TransitionDungeonInterior(Transform doorOwner, StaticDoor door, DFLo
             OverrideLocation.Summary.LocationName);
         if (overrideLocation.Loaded)
             location = overrideLocation;
+    }
+
+    // Pure clients receive the networked dungeon root/metadata at session join,
+    // but do not generate its geometry until they actually visit it.
+    // Only defer an ordinary entry: saved-game conversion and TeleportPc have
+    // their own exact-object entry paths, and the listen host still builds all.
+    if (NetworkClient.active && !NetworkServer.active &&
+        !isPlayerInsideDungeon && !networkDungeonConversionInProgress)
+    {
+        DaggerfallDungeon[] knownDungeons = FindObjectsOfType<DaggerfallDungeon>();
+        foreach (DaggerfallDungeon candidate in knownDungeons)
+        {
+            if (candidate == null || !candidate.IsNetworkDungeonInstance ||
+                candidate.Summary.ID != location.MapTableData.MapId ||
+                !string.Equals(candidate.Summary.RegionName, location.RegionName, StringComparison.Ordinal) ||
+                !string.Equals(candidate.Summary.LocationName, location.Name, StringComparison.Ordinal))
+                continue;
+
+            if (!candidate.isSet && candidate.Summary.LocationData.Loaded)
+            {
+                if (lazyDungeonEntranceCoroutine == null)
+                {
+                    Debug.Log($"[LazyDungeon] Loading '{location.Name}' for normal entrance (netId={candidate.netId}).");
+                    candidate.ScheduleDeferredGeneration(candidate.PositionY);
+                    lazyDungeonEntranceCoroutine = StartCoroutine(CompleteLazyDungeonEntrance(
+                        candidate, doorOwner, door, location, doFade));
+                }
+                return;
+            }
+            break;
+        }
     }
 
     RaiseOnPreTransitionEvent(TransitionType.ToDungeonInterior, door);
@@ -3369,16 +3444,16 @@ public void TransitionDungeonInterior(Transform doorOwner, StaticDoor door, DFLo
             return;
         }
 
-        float assignedY = DaggerfallDungeon.GetNextAvailableDungeonY();
+        Vector3 assignedPosition = NetworkDungeonGrid.Allocate(location);
+        float assignedY = assignedPosition.y;
 
         GameObject obj = Instantiate(prefab);
         obj.name = dungeonSceneName;
-        obj.transform.position = new Vector3(0, assignedY, 0);
-
-        NetworkServer.Spawn(obj);
+        obj.transform.position = assignedPosition;
 
         dungeon = obj.GetComponent<DaggerfallDungeon>();
-        dungeon.PositionY = assignedY;
+        dungeon.SetGridPosition(assignedPosition);
+        NetworkServer.Spawn(obj);
 
         // Keep the local requester's already-resolved physical layout. Re-looking the
         // location up by name here can discard quest-specific Small/Full dungeon state.
@@ -3620,7 +3695,7 @@ private void HandleDungeonTransition(PlayerEnterExit.TransitionEventArgs args)
 
             if (pendingRecoveredNetworkDungeonSave && dungeon != null)
             {
-                dungeon.ConfigureRecoveredNetworkDungeonSave(pendingRecoveredNetworkDungeonY, string.Empty);
+                dungeon.ConfigureRecoveredNetworkDungeonSave(pendingRecoveredNetworkDungeonOrigin, string.Empty);
             }
 
             dungeon.SetDungeon(location, importEnemies);
@@ -3663,9 +3738,9 @@ private void HandleDungeonTransition(PlayerEnterExit.TransitionEventArgs args)
 
             if (pendingRecoveredNetworkDungeonSave)
             {
-                Debug.Log($"[NetworkDungeonSave] Finished SP recovery dungeon setup y={pendingRecoveredNetworkDungeonY}");
+                Debug.Log($"[NetworkDungeonSave] Finished SP recovery dungeon setup y={pendingRecoveredNetworkDungeonOrigin}");
                 pendingRecoveredNetworkDungeonSave = false;
-                pendingRecoveredNetworkDungeonY = 0f;
+                pendingRecoveredNetworkDungeonOrigin = Vector3.zero;
             }
         }
 

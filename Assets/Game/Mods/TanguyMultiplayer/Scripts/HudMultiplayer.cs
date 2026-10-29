@@ -1,4 +1,4 @@
-﻿using System.Collections;
+using System.Collections;
 using UnityEngine;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.UserInterface;
@@ -57,6 +57,8 @@ public class HudMultiplayer : MonoBehaviour
     bool lastConnectedLayoutState;
     float lastOptionsCanvasHeight = -1f;
 
+    GameObject hostModMatchingButton;
+
     void Start()
     {
         OptionsMultiplayer.EnsureLocalRespawnSettings();
@@ -73,6 +75,7 @@ public class HudMultiplayer : MonoBehaviour
         BuildPaperdollDisplaySetting();
         BuildHostQuestDefaultsSetting();
         BuildLootSettings();
+        BuildHostModMatching();
         RefreshLegacyOptionsAvailability();
         FitOptionsPanelToCanvas();
         StartCoroutine(Check());
@@ -108,6 +111,7 @@ public class HudMultiplayer : MonoBehaviour
             RefreshPaperdollDisplaySetting();
             RefreshHostQuestDefaultsSetting();
             RefreshLootSettings();
+            RefreshHostModMatching();
             if (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf)
                 RefreshRespawnSettings();
             bool sessionActive = NetworkServer.active || NetworkClient.active ||
@@ -330,6 +334,58 @@ public class HudMultiplayer : MonoBehaviour
     // including on clients, so the active policy can be read without changing it.
     // Compact, host-controlled loot submenu. One setting for now; more can be
     // added here later without a separate UI component or a prefab change.
+    ModCompatibilityAuthenticator HostModAuthenticator()
+    {
+        return connectionManager == null ? null :
+            connectionManager.GetComponent<ModCompatibilityAuthenticator>();
+    }
+
+    bool CanConfigureHostMods()
+    {
+        return !DfuDedicatedServerOptions.Requested &&
+            (NetworkServer.active || (!NetworkClient.active && PlayerMultiplayer.state == 0));
+    }
+
+    void BuildHostModMatching()
+    {
+        if (options == null || existingOptionsPanel == null) return;
+        Transform parent = existingOptionsPanel.transform;
+        hostModMatchingButton = Instantiate(options, parent);
+        hostModMatchingButton.name = "Host mod matching";
+        hostModMatchingButton.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
+        var rect = hostModMatchingButton.GetComponent<RectTransform>();
+        if (rect != null) rect.sizeDelta = new Vector2(220, 40);
+        var button = hostModMatchingButton.GetComponent<UnityEngine.UI.Button>();
+        if (button != null)
+        {
+            button.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
+            button.onClick.AddListener(() =>
+            {
+                var auth = HostModAuthenticator();
+                if (!CanConfigureHostMods() || auth == null) return;
+                auth.SetListenHostExact(!auth.ListenHostExact);
+                RefreshHostModMatching();
+            });
+        }
+        RefreshHostModMatching();
+    }
+
+    void RefreshHostModMatching()
+    {
+        if (hostModMatchingButton == null) return;
+        bool visible = CanConfigureHostMods();
+        if (hostModMatchingButton.activeSelf != visible)
+        {
+            hostModMatchingButton.SetActive(visible);
+            FitOptionsPanelToCanvas();
+        }
+        var auth = HostModAuthenticator();
+        var button = hostModMatchingButton.GetComponent<UnityEngine.UI.Button>();
+        if (button != null) button.interactable = visible && auth != null;
+        SetButtonText(hostModMatchingButton, "Host mods: " +
+            (auth != null ? auth.ListenHostModeLabel : "Relaxed"));
+    }
+
     void BuildLootSettings()
     {
         if (options == null || existingOptionsPanel == null || canvas == null)

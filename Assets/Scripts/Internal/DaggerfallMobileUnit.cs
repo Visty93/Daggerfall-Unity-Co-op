@@ -56,6 +56,24 @@ namespace DaggerfallWorkshop
         bool doMeleeDamage = false;
         bool shootArrow = false;
         bool restartAnims = true;
+        Coroutine animationRoutine;
+        bool presentationSuspended;
+        bool observerAnimationSuspended;
+
+        public void SetNetworkPresentationSuspended(bool hidden, bool keepSimulation)
+        {
+            bool suspendAnimation = hidden && !keepSimulation;
+            if (presentationSuspended == hidden && observerAnimationSuspended == suspendAnimation) return;
+            presentationSuspended = hidden;
+            observerAnimationSuspended = suspendAnimation;
+            if (suspendAnimation && animationRoutine != null)
+            {
+                StopCoroutine(animationRoutine);
+                animationRoutine = null;
+            }
+            restartAnims = animationRoutine == null;
+        }
+
         bool freezeAnims = false;
         bool animReversed = false;
         int frameSpeedDivisor = 1;
@@ -129,7 +147,8 @@ namespace DaggerfallWorkshop
             if (Application.isPlaying)
             {
                 // Get component references
-                mainCamera = GameObject.FindGameObjectWithTag("MainCamera").GetComponent<Camera>();
+                GameObject cameraObject = GameObject.FindGameObjectWithTag("MainCamera");
+                mainCamera = cameraObject != null ? cameraObject.GetComponent<Camera>() : null;
                 meshFilter = GetComponent<MeshFilter>();
                 meshRenderer = GetComponent<MeshRenderer>();
             }
@@ -137,20 +156,23 @@ namespace DaggerfallWorkshop
 
         void OnDisable()
         {
+            if (animationRoutine != null) StopCoroutine(animationRoutine);
+            animationRoutine = null;
             restartAnims = true;
         }
 
         void Update()
         {
+            if (observerAnimationSuspended) return;
             // Restart animation coroutine if not running
             if (restartAnims)
             {
-                StartCoroutine(AnimateEnemy());
+                animationRoutine = StartCoroutine(AnimateEnemy());
                 restartAnims = false;
             }
 
             // Rotate to face camera in game
-            if (mainCamera && Application.isPlaying)
+            if (!presentationSuspended && mainCamera && Application.isPlaying)
             {
                 // Rotate billboard based on camera facing
                 cameraPosition = mainCamera.transform.position;
@@ -314,6 +336,13 @@ namespace DaggerfallWorkshop
         /// </summary>
         private void UpdateOrientation()
         {
+            if (presentationSuspended)
+            {
+                // Owner animation timing needs a valid record, but no camera work.
+                if (summary.StateAnims != null && summary.StateAnims.Length > 0)
+                    OrientEnemy(lastOrientation >= 0 && lastOrientation < summary.StateAnims.Length ? lastOrientation : 0);
+                return;
+            }
             Transform parent = transform.parent;
             if (parent == null)
                 return;
@@ -397,6 +426,13 @@ namespace DaggerfallWorkshop
                 return;
             }
             
+            if (presentationSuspended)
+            {
+                summary.AnimStateRecord = summary.StateAnims[orientation].Record;
+                lastOrientation = orientation;
+                return;
+            }
+
             // Get mesh filter
             if (meshFilter == null)
                 meshFilter = GetComponent<MeshFilter>();

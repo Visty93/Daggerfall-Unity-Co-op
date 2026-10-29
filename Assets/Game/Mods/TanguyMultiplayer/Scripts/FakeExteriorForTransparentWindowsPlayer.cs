@@ -33,6 +33,7 @@
 //   disabling, or destroying the local player object.
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using Mirror;
@@ -157,6 +158,31 @@ public class FakeExteriorForTransparentWindowsPlayer : NetworkBehaviour
         public bool enabled;
         public bool drawHeightmap;
         public bool drawTreesAndFoliage;
+    }
+
+    private void Awake()
+    {
+        // Remote copies never need a Unity Update callback either.
+        enabled = false;
+    }
+
+    public override void OnStartLocalPlayer()
+    {
+        base.OnStartLocalPlayer();
+        enabled = false;
+        StartCoroutine(InitializeModActivation());
+    }
+
+    private IEnumerator InitializeModActivation()
+    {
+        if (forceEnableForTesting || !requireTransparentWindowsMod)
+        { enabled = true; yield break; }
+        while (ModManager.Instance == null || !ModManager.Instance.Initialized)
+            yield return null;
+        yield return null;
+        transparentWindowsChecked = true;
+        transparentWindowsLoaded = DetectTransparentWindowsLoaded();
+        enabled = transparentWindowsLoaded;
     }
 
     private void Update()
@@ -285,97 +311,10 @@ public class FakeExteriorForTransparentWindowsPlayer : NetworkBehaviour
 
     private bool DetectTransparentWindowsLoaded()
     {
-        try
-        {
-            ModManager modManager = ModManager.Instance;
-            if (modManager == null)
-                return false;
-
-            object manager = modManager;
-            Type managerType = manager.GetType();
-
-            MethodInfo getMod = managerType.GetMethod("GetMod", new Type[] { typeof(string) });
-            if (getMod != null)
-            {
-                object mod = getMod.Invoke(manager, new object[] { "Transparent Windows" });
-                if (mod != null)
-                    return true;
-            }
-
-            MethodInfo getAllModTitles = managerType.GetMethod("GetAllModTitles", Type.EmptyTypes);
-            if (getAllModTitles != null)
-            {
-                object titlesObj = getAllModTitles.Invoke(manager, null);
-                string[] titles = titlesObj as string[];
-
-                if (titles != null)
-                {
-                    for (int i = 0; i < titles.Length; i++)
-                    {
-                        if (LooksLikeTransparentWindows(titles[i]))
-                            return true;
-                    }
-                }
-            }
-
-            string[] possibleListMethods = new string[]
-            {
-                "GetAllMods",
-                "GetMods",
-                "GetLoadedMods"
-            };
-
-            for (int i = 0; i < possibleListMethods.Length; i++)
-            {
-                MethodInfo method = managerType.GetMethod(possibleListMethods[i], Type.EmptyTypes);
-                if (method == null)
-                    continue;
-
-                object listObj = method.Invoke(manager, null);
-                if (ListContainsTransparentWindows(listObj))
-                    return true;
-            }
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning("[FakeExteriorTW] Transparent Windows detection failed: " + ex.Message);
-        }
-
-        return false;
-    }
-
-    private bool ListContainsTransparentWindows(object listObj)
-    {
-        if (listObj == null)
-            return false;
-
-        System.Collections.IEnumerable enumerable = listObj as System.Collections.IEnumerable;
-        if (enumerable == null)
-            return false;
-
-        foreach (object item in enumerable)
-        {
-            if (item == null)
-                continue;
-
-            if (LooksLikeTransparentWindows(item.ToString()))
-                return true;
-
-            Type t = item.GetType();
-            string[] propNames = new string[] { "Title", "Name", "ModTitle", "Filename", "FileName", "Path" };
-
-            for (int i = 0; i < propNames.Length; i++)
-            {
-                PropertyInfo p = t.GetProperty(propNames[i], BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (p == null || p.PropertyType != typeof(string))
-                    continue;
-
-                string value = p.GetValue(item, null) as string;
-                if (LooksLikeTransparentWindows(value))
-                    return true;
-            }
-        }
-
+        var manager = ModManager.Instance;
+        if (manager == null) return false;
+        foreach (var mod in manager.Mods)
+            if (mod != null && mod.Enabled && (LooksLikeTransparentWindows(mod.Title) || LooksLikeTransparentWindows(mod.FileName))) return true;
         return false;
     }
 
@@ -1062,6 +1001,8 @@ public class FakeExteriorForTransparentWindowsPlayer : NetworkBehaviour
             Log("Restored source exterior visuals: " + reason + " renderers=" + restoredRenderers + " terrains=" + restoredTerrains);
     }
 
+    private bool orphanCleanupChecked;
+
     private void DestroyFakeRootOnly(string reason)
     {
         if (fakeRoot != null)
@@ -1074,6 +1015,8 @@ public class FakeExteriorForTransparentWindowsPlayer : NetworkBehaviour
         transformCloneMap.Clear();
 
         // Remove only our local fake root by exact name. Do this only from local owner.
+        if (orphanCleanupChecked) return;
+        orphanCleanupChecked = true;
         GameObject existing = GameObject.Find(FakeRootName);
         if (existing != null)
         {

@@ -175,6 +175,7 @@ namespace DaggerfallWorkshop.Game.Items
         /// <returns>DaggerfallUnityItem array.</returns>
         public static DaggerfallUnityItem[] GenerateRandomLoot(LootChanceMatrix matrix, PlayerEntity playerEntity)
         {
+            var generationContext = SetupDemoEnemy.GetLootRollContext(playerEntity);
             // Notes: The first part of the DF Chronicles explanation of how loot is generated does not match the released game.
             // It says the chance for each item category is the matrix amount * the level of the NPC. Actual behavior in the
             // released game is (matrix amount * PC level) for the first 4 item categories (temperate plants, warm plants,
@@ -191,7 +192,7 @@ namespace DaggerfallWorkshop.Game.Items
             Random.InitState(items.GetHashCode());
 
             // Random gold
-            int goldCount = Random.Range(matrix.MinGold, matrix.MaxGold + 1) * playerEntity.Level;
+            int goldCount = Random.Range(matrix.MinGold, matrix.MaxGold + 1) * generationContext.Level;
             if (goldCount > 0)
             {
                 items.Add(ItemBuilder.CreateGoldPieces(goldCount));
@@ -201,7 +202,7 @@ namespace DaggerfallWorkshop.Game.Items
             chance = matrix.WP;
             while (Dice100.SuccessRoll((int)chance))
             {
-                items.Add(ItemBuilder.CreateRandomWeapon(playerEntity.Level));
+                items.Add(ItemBuilder.CreateRandomWeapon(generationContext.Level));
                 chance *= 0.5f;
             }
 
@@ -209,16 +210,16 @@ namespace DaggerfallWorkshop.Game.Items
             chance = matrix.AM;
             while (Dice100.SuccessRoll((int)chance))
             {
-                items.Add(ItemBuilder.CreateRandomArmor(playerEntity.Level, playerEntity.Gender, playerEntity.Race));
+                items.Add(ItemBuilder.CreateRandomArmor(generationContext.Level, generationContext.Gender, generationContext.Race));
                 chance *= 0.5f;
             }
 
             // Random ingredients
-            RandomIngredient(matrix.C1 * playerEntity.Level, ItemGroups.CreatureIngredients1, items);
-            RandomIngredient(matrix.C2 * playerEntity.Level, ItemGroups.CreatureIngredients2, items);
+            RandomIngredient(matrix.C1 * generationContext.Level, ItemGroups.CreatureIngredients1, items);
+            RandomIngredient(matrix.C2 * generationContext.Level, ItemGroups.CreatureIngredients2, items);
             RandomIngredient(matrix.C3, ItemGroups.CreatureIngredients3, items);
-            RandomIngredient(matrix.P1 * playerEntity.Level, ItemGroups.PlantIngredients1, items);
-            RandomIngredient(matrix.P2 * playerEntity.Level, ItemGroups.PlantIngredients2, items);
+            RandomIngredient(matrix.P1 * generationContext.Level, ItemGroups.PlantIngredients1, items);
+            RandomIngredient(matrix.P2 * generationContext.Level, ItemGroups.PlantIngredients2, items);
             RandomIngredient(matrix.M1, ItemGroups.MiscellaneousIngredients1, items);
             RandomIngredient(matrix.M2, ItemGroups.MiscellaneousIngredients2, items);
 
@@ -226,7 +227,7 @@ namespace DaggerfallWorkshop.Game.Items
             chance = matrix.MI;
             while (Dice100.SuccessRoll((int)chance))
             {
-                items.Add(ItemBuilder.CreateRandomMagicItem(playerEntity.Level, playerEntity.Gender, playerEntity.Race));
+                items.Add(ItemBuilder.CreateRandomMagicItem(generationContext.Level, generationContext.Gender, generationContext.Race));
                 chance *= 0.5f;
             }
 
@@ -234,7 +235,7 @@ namespace DaggerfallWorkshop.Game.Items
             chance = matrix.CL;
             while (Dice100.SuccessRoll((int)chance))
             {
-                items.Add(ItemBuilder.CreateRandomClothing(playerEntity.Gender, playerEntity.Race));
+                items.Add(ItemBuilder.CreateRandomClothing(generationContext.Gender, generationContext.Race));
                 chance *= 0.5f;
             }
 

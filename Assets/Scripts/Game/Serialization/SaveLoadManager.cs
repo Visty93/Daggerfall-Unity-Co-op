@@ -1279,6 +1279,18 @@ namespace DaggerfallWorkshop.Game.Serialization
             pendingMultiplayerInteriorEnemySavedPlayerPosition = Vector3.zero;
             pendingNetworkDungeonInitialActionState = string.Empty;
 
+            if (!networkActive && playerPosition.savedInsideNetworkDungeon &&
+                !DaggerfallWorkshop.NetworkDungeonGrid.IsSafeRecoveryOrigin(playerPosition.GetSavedDungeonOrigin()))
+            {
+                // PlayerEnterExit will recover at the exterior entrance. Do not restore
+                // entities or mechanisms into the abandoned unsafe underground slot.
+                saveData.enemyData = null;
+                saveData.lootContainers = null;
+                saveData.dungeonData = null;
+                RemoveTargetDungeonFromSavedSceneCache(saveData, playerPosition);
+                return;
+            }
+
             if (networkActive && playerPosition.insideBuilding)
             {
                 // Every building interior loaded while multiplayer is already active is rebuilt at
@@ -1328,7 +1340,7 @@ namespace DaggerfallWorkshop.Game.Serialization
                 int lootCount = saveData.lootContainers != null ? saveData.lootContainers.Length : 0;
 
                 Vector3 sourceDungeonRoot = playerPosition.savedInsideNetworkDungeon
-                    ? new Vector3(0f, playerPosition.savedNetworkDungeonY, 0f)
+                    ? playerPosition.GetSavedDungeonOrigin()
                     : Vector3.zero;
 
                 if (saveData.dungeonData != null)

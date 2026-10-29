@@ -1,4 +1,4 @@
-﻿// Multiplayer compatibility for Vanilla Enhanced by carademono and contributors.
+// Multiplayer compatibility for Vanilla Enhanced by carademono and contributors.
 // Core compatibility was implemented against the formerly public Vanilla Enhanced source code.
 // Vanilla Enhanced is not included and no Vanilla Enhanced assets are redistributed.
 // https://www.nexusmods.com/daggerfallunity/mods/273
@@ -12,12 +12,14 @@ using UnityEngine;
 using Mirror;
 using DaggerfallWorkshop;
 using DaggerfallWorkshop.Game;
+using DaggerfallWorkshop.Game.Utility.ModSupport;
 
 /// <summary>
 /// Compatibility bridge for Vanilla Enhanced visual-replacement mods in multiplayer.
 ///
 /// This helper is intentionally inert unless multiplayer is active (Mirror client or host/server).
-/// It does not depend on any mod title. Player bridging is only installed when DFU's current
+/// It is enabled after mod initialization only when VE or a supported visual module is enabled.
+/// Player bridging is only installed when DFU's current
 /// DaggerfallEnemy.MobileUnit is actually different from SpriteMultiplayer's concrete unit.
 ///
 /// Important player detail:
@@ -145,6 +147,28 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
 
         instance = this;
         DontDestroyOnLoad(gameObject);
+        enabled = false;
+        StartCoroutine(EnableForInstalledMods());
+    }
+
+    IEnumerator EnableForInstalledMods()
+    {
+        while (ModManager.Instance == null || !ModManager.Instance.Initialized)
+            yield return null;
+        // Init compiles mods synchronously; resume after that frame completes.
+        yield return null;
+        foreach (var mod in ModManager.Instance.Mods)
+        {
+            if (mod == null || !mod.Enabled) continue;
+            string name = ((mod.Title ?? string.Empty) + " " + (mod.FileName ?? string.Empty))
+                .Replace(" ", "").Replace("-", "").Replace("_", "").ToLowerInvariant();
+            if (name.Contains("vanillaenhanced") || name.Contains("villainvariety") ||
+                name.Contains("villagervariety") || name.Contains("animatedpeople"))
+            {
+                enabled = true;
+                yield break;
+            }
+        }
     }
 
     void Update()
@@ -205,12 +229,26 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
 
     /// <summary>
     /// Only touches actual PlayerMultiplayer scene actors while Mirror is active.
-    /// Discovery intentionally does not depend on NetworkClient.spawned because the host path
+    /// Cached discovery intentionally does not depend on NetworkClient.spawned because the host path
     /// can have a valid PlayerMultiplayer before/without the client dictionary state we expected.
     /// </summary>
+    static PlayerMultiplayer[] cachedPlayers = new PlayerMultiplayer[0];
+    static float nextPlayerDiscovery;
+
+    static PlayerMultiplayer[] GetCachedPlayers()
+    {
+        // Keep the early-spawn fallback from the original helper, but never search twice per frame.
+        if (Time.realtimeSinceStartup >= nextPlayerDiscovery)
+        {
+            nextPlayerDiscovery = Time.realtimeSinceStartup + 0.5f;
+            cachedPlayers = GameObject.FindObjectsOfType<PlayerMultiplayer>();
+        }
+        return cachedPlayers;
+    }
+
     static void ReconcileMultiplayerPlayerVisuals(ref bool playerDiscoveryLogged)
     {
-        PlayerMultiplayer[] players = GameObject.FindObjectsOfType<PlayerMultiplayer>();
+        PlayerMultiplayer[] players = GetCachedPlayers();
         if (players == null || players.Length == 0)
             return;
 
@@ -468,18 +506,30 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
     /// redirects EnemyMotor's existing animation calls to the same MobileUnit DFU currently owns.
     /// The NetworkIdentity requirement keeps ordinary single-player enemies completely untouched.
     /// </summary>
+    static readonly List<EnemyMotor> networkMotors = new List<EnemyMotor>();
+    static readonly List<EnemyMotor> actorMotors = new List<EnemyMotor>();
+    static readonly HashSet<EnemyMotor> seenNetworkMotors = new HashSet<EnemyMotor>();
+
     static void ReconcileNetworkedEnemyMotorVisuals()
     {
         if (!EnsureEnemyMotorReflection())
             return;
 
-        EnemyMotor[] motors = GameObject.FindObjectsOfType<EnemyMotor>();
-        if (motors == null || motors.Length == 0)
-            return;
-
-        for (int i = 0; i < motors.Length; i++)
+        // Collect from actual network actors, skipping retained dungeon geometry.
+        networkMotors.Clear();
+        seenNetworkMotors.Clear();
+        var spawned = NetworkServer.active ? NetworkServer.spawned : NetworkClient.spawned;
+        foreach (NetworkIdentity actor in spawned.Values)
         {
-            EnemyMotor motor = motors[i];
+            if (!actor || !actor.gameObject.activeInHierarchy || actor.GetComponent<DaggerfallDungeon>() ||
+                actor.GetComponent<DaggerfallInterior>()) continue;
+            actor.GetComponentsInChildren<EnemyMotor>(false, actorMotors);
+            foreach (var motor in actorMotors)
+                if (motor && seenNetworkMotors.Add(motor)) networkMotors.Add(motor);
+        }
+        for (int i = 0; i < networkMotors.Count; i++)
+        {
+            EnemyMotor motor = networkMotors[i];
             if (!motor)
                 continue;
 
@@ -561,106 +611,101 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
     {
         CleanupDungeonStaticNpcRdbPlacements();
 
-        DaggerfallDungeon[] dungeons = GameObject.FindObjectsOfType<DaggerfallDungeon>();
-        if (dungeons == null || dungeons.Length == 0)
+        var ee = GameManager.Instance != null ? GameManager.Instance.PlayerEnterExit : null;
+        if (ee == null || !ee.IsPlayerInsideDungeon || ee.Dungeon == null) return;
+        DaggerfallDungeon dungeon = ee.Dungeon;
+        if (!dungeon)
             return;
 
-        for (int d = 0; d < dungeons.Length; d++)
+        NetworkIdentity dungeonIdentity = dungeon.GetComponent<NetworkIdentity>();
+        if (!dungeonIdentity || dungeonIdentity.netId == 0)
+            return;
+
+        StaticNPC[] npcs = dungeon.GetComponentsInChildren<StaticNPC>(true);
+        if (npcs == null || npcs.Length == 0)
+            return;
+
+        for (int i = 0; i < npcs.Length; i++)
         {
-            DaggerfallDungeon dungeon = dungeons[d];
-            if (!dungeon)
+            StaticNPC npc = npcs[i];
+            if (!npc || !npc.gameObject.activeInHierarchy)
                 continue;
 
-            NetworkIdentity dungeonIdentity = dungeon.GetComponent<NetworkIdentity>();
-            if (!dungeonIdentity || dungeonIdentity.netId == 0)
-                continue;
-
-            StaticNPC[] npcs = dungeon.GetComponentsInChildren<StaticNPC>(true);
-            if (npcs == null || npcs.Length == 0)
-                continue;
-
-            for (int i = 0; i < npcs.Length; i++)
+            // RDBLayout-authored dungeon people only. Quest-injected NPCs are Context.Custom.
+            if (npc.Data.context != StaticNPC.Context.Dungeon)
             {
-                StaticNPC npc = npcs[i];
-                if (!npc || !npc.gameObject.activeInHierarchy)
-                    continue;
-
-                // RDBLayout-authored dungeon people only. Quest-injected NPCs are Context.Custom.
-                if (npc.Data.context != StaticNPC.Context.Dungeon)
-                {
-                    LogDungeonNpcStatus(npc, "skipped-context-" + npc.Data.context, null);
-                    continue;
-                }
-
-                string customVisualType;
-                if (!HasCustomDungeonStaticNpcVisual(npc, out customVisualType))
-                {
-                    LogDungeonNpcStatus(npc, "skipped-no-AnimatedPeople-component", null);
-                    continue;
-                }
-
-                int key = npc.GetInstanceID();
-                DungeonStaticNpcRdbPlacement placement;
-                if (!dungeonStaticNpcRdbPlacements.TryGetValue(key, out placement) || placement == null ||
-                    placement.npc != npc || placement.parent != npc.transform.parent)
-                {
-                    string reason;
-                    if (!TryResolveDungeonStaticNpcRdbPlacement(npc, dungeon, out placement, out reason))
-                    {
-                        LogDungeonNpcStatus(npc, reason, null);
-                        continue;
-                    }
-
-                    dungeonStaticNpcRdbPlacements[key] = placement;
-                    placement.firstObservedFrame = Time.frameCount;
-                    LogDungeonNpcStatus(npc, "RDB-discovered-before-height-check", placement);
-                    continue;
-                }
-
-                // Dynamic objects can be discovered before Unity calls their Start(). V5
-                // immediately restored the importer offset, which could allow subsequent
-                // mod initialization to add its own lift on top. Observe at least one frame
-                // boundary before intervening; do not use a guessed delay in seconds.
-                if (Time.frameCount <= placement.firstObservedFrame)
-                    continue;
-
-                if (!placement.afterStartLogged)
-                {
-                    placement.afterStartLogged = true;
-                    LogDungeonNpcStatus(npc, "RDB-after-start-height-check", placement);
-                }
-
-                float currentLocalY = npc.transform.localPosition.y;
-                float downwardShift = placement.authoredLocalY - currentLocalY;
-
-                // This compatibility path is only for the observed sunk replacement case.
-                // Never pull an NPC down and never react to tiny animation/pivot noise.
-                if (downwardShift < DungeonStaticNpcMinDownwardShift ||
-                    downwardShift > DungeonStaticNpcMaxDownwardShift)
-                {
-                    if (!placement.correctionLogged)
-                        LogDungeonNpcStatus(npc, "RDB-no-downward-correction", placement);
-                    continue;
-                }
-
-                Vector3 local = npc.transform.localPosition;
-                local.y = placement.authoredLocalY;
-                npc.transform.localPosition = local;
-
-                if (placement.correctionLogged)
-                    continue;
-                placement.correctionLogged = true;
-                Debug.Log(
-                    LogPrefix + "Restored custom dungeon StaticNPC '" + npc.gameObject.name +
-                    "' to exact RDB flat Y. shift=" + downwardShift.ToString("0.000") +
-                    "m, localY=" + currentLocalY.ToString("0.000") + "->" +
-                    placement.authoredLocalY.ToString("0.000") +
-                    ", flat=" + placement.archive + "." + placement.record +
-                    ", block='" + placement.blockName + "'" +
-                    ", visual=" + customVisualType +
-                    ", dungeon='" + dungeon.gameObject.name +
-                    "' netId=" + dungeonIdentity.netId + ".");
+                LogDungeonNpcStatus(npc, "skipped-context-" + npc.Data.context, null);
+                continue;
             }
+
+            string customVisualType;
+            if (!HasCustomDungeonStaticNpcVisual(npc, out customVisualType))
+            {
+                LogDungeonNpcStatus(npc, "skipped-no-AnimatedPeople-component", null);
+                continue;
+            }
+
+            int key = npc.GetInstanceID();
+            DungeonStaticNpcRdbPlacement placement;
+            if (!dungeonStaticNpcRdbPlacements.TryGetValue(key, out placement) || placement == null ||
+                placement.npc != npc || placement.parent != npc.transform.parent)
+            {
+                string reason;
+                if (!TryResolveDungeonStaticNpcRdbPlacement(npc, dungeon, out placement, out reason))
+                {
+                    LogDungeonNpcStatus(npc, reason, null);
+                    continue;
+                }
+
+                dungeonStaticNpcRdbPlacements[key] = placement;
+                placement.firstObservedFrame = Time.frameCount;
+                LogDungeonNpcStatus(npc, "RDB-discovered-before-height-check", placement);
+                continue;
+            }
+
+            // Dynamic objects can be discovered before Unity calls their Start(). V5
+            // immediately restored the importer offset, which could allow subsequent
+            // mod initialization to add its own lift on top. Observe at least one frame
+            // boundary before intervening; do not use a guessed delay in seconds.
+            if (Time.frameCount <= placement.firstObservedFrame)
+                continue;
+
+            if (!placement.afterStartLogged)
+            {
+                placement.afterStartLogged = true;
+                LogDungeonNpcStatus(npc, "RDB-after-start-height-check", placement);
+            }
+
+            float currentLocalY = npc.transform.localPosition.y;
+            float downwardShift = placement.authoredLocalY - currentLocalY;
+
+            // This compatibility path is only for the observed sunk replacement case.
+            // Never pull an NPC down and never react to tiny animation/pivot noise.
+            if (downwardShift < DungeonStaticNpcMinDownwardShift ||
+                downwardShift > DungeonStaticNpcMaxDownwardShift)
+            {
+                if (!placement.correctionLogged)
+                    LogDungeonNpcStatus(npc, "RDB-no-downward-correction", placement);
+                continue;
+            }
+
+            Vector3 local = npc.transform.localPosition;
+            local.y = placement.authoredLocalY;
+            npc.transform.localPosition = local;
+
+            if (placement.correctionLogged)
+                continue;
+            placement.correctionLogged = true;
+            Debug.Log(
+                LogPrefix + "Restored custom dungeon StaticNPC '" + npc.gameObject.name +
+                "' to exact RDB flat Y. shift=" + downwardShift.ToString("0.000") +
+                "m, localY=" + currentLocalY.ToString("0.000") + "->" +
+                placement.authoredLocalY.ToString("0.000") +
+                ", flat=" + placement.archive + "." + placement.record +
+                ", block='" + placement.blockName + "'" +
+                ", visual=" + customVisualType +
+                ", dungeon='" + dungeon.gameObject.name +
+                "' netId=" + dungeonIdentity.netId + ".");
         }
     }
 
@@ -914,13 +959,13 @@ public sealed class VanillaEnhancedMultiplayerCompat : MonoBehaviour
     /// </summary>
     static void RepairRemoteSoftSyncCivilianVisuals()
     {
-        MobilePersonNPC[] npcs = GameObject.FindObjectsOfType<MobilePersonNPC>();
-        if (npcs == null || npcs.Length == 0)
-            return;
-
-        for (int i = 0; i < npcs.Length; i++)
+        if (!EnsureNpcReflection()) return;
+        IDictionary ghosts = mobileNpcRemoteGhostsField.GetValue(null) as IDictionary;
+        if (ghosts == null) return;
+        foreach (DictionaryEntry entry in ghosts)
         {
-            MobilePersonNPC npc = npcs[i];
+            if (entry.Value == null) continue;
+            MobilePersonNPC npc = remoteRecordNpcField.GetValue(entry.Value) as MobilePersonNPC;
             if (!npc || !IsRemoteSoftSyncNpc(npc))
                 continue;
 
