@@ -39,6 +39,12 @@ public class LootMultiplayer : MonoBehaviour
     Action editAction;
     uint editRequest;
     bool editGranted, commitSent;
+    // Keep the exact proposed commit until the server acknowledges it.
+    // Retrying the same request cannot transfer an item twice: server deduplicates.
+    string pendingCommitItems;
+    string[] pendingCommitConsumed;
+    float nextCommitAttempt;
+    int commitAttempts;
     string externalQuestConsumption;
     int deferredVersion = -1;
     string deferredItems;
@@ -71,6 +77,8 @@ public class LootMultiplayer : MonoBehaviour
         {
             editRequest = 0;
             editGranted = commitSent = false;
+            pendingCommitItems = null;
+            pendingCommitConsumed = null;
             externalQuestConsumption = null;
             ApplyFinalSnapshot(version, items);
             Debug.Log("[ExternalQuestPickup] Consumption deferred; awaiting state or retry. lootId=" + lootId);
@@ -78,11 +86,9 @@ public class LootMultiplayer : MonoBehaviour
         }
         bool valid = isActiveAndEnabled &&
             PartyQuestLootOverlay.ExternalConsumptionStillValid(lootId, externalQuestConsumption);
-        commitSent = true;
         // Return the server's ordinary contents unchanged. Only the reserved quest
         // symbol is consumed; no unrelated local inventory changes are published.
-        lootCatcher.CommitLootEdit(lootId, editRequest, items,
-            valid ? new[] { externalQuestConsumption } : null);
+        BeginReliableCommit(items, valid ? new[] { externalQuestConsumption } : null);
         Debug.Log("[ExternalQuestPickup] Consumption commit lootId=" + lootId + " valid=" + valid);
         return true;
     }
@@ -121,6 +127,9 @@ public class LootMultiplayer : MonoBehaviour
         if (!accepted)
         {
             editRequest = 0;
+            editGranted = commitSent = false;
+            pendingCommitItems = null;
+            pendingCommitConsumed = null;
             editAction = null;
             partyQuestLootEditToken = null;
             partyQuestLootClickedItem = null;
@@ -163,10 +172,51 @@ public class LootMultiplayer : MonoBehaviour
         partyQuestLootEditToken = null;
         partyQuestLootClickedItem = null;
 
-        commitSent = true;
         // Also covers ordinary inventory actions completing after a split popup.
         ExternalPickups.Remember(false);
-        lootCatcher.CommitLootEdit(lootId, editRequest, LootCatcher.SerializeLootItems(loot), partyConsumed);
+        try
+        {
+            BeginReliableCommit(LootCatcher.SerializeLootItems(loot), partyConsumed);
+        }
+        catch (Exception ex)
+        {
+            // Never unlock here: the inventory action has ALREADY moved an item.
+            // Discarding this transaction or applying an old snapshot could duplicate
+            // or lose it. Preserve a pending state and report the fatal encoding issue.
+            commitSent = true;
+            Debug.LogError("[LootTransaction] Unable to encode edited loot; preserving reservation to avoid item loss: " + ex);
+            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot serialization failed. Do not save or close this session; see Player.log.");
+        }
+    }
+
+    void BeginReliableCommit(string items, string[] consumed)
+    {
+        pendingCommitItems = items ?? string.Empty;
+        pendingCommitConsumed = consumed;
+        commitSent = true;
+        commitAttempts = 0;
+        RetryCommit();
+    }
+
+    void RetryCommit()
+    {
+        if (!commitSent || editRequest == 0 || lootCatcher == null ||
+            !lootCatcher.isLocalPlayer || pendingCommitItems == null) return;
+        nextCommitAttempt = Time.realtimeSinceStartup + 6f;
+        ++commitAttempts;
+        try
+        {
+            lootCatcher.CommitLootEdit(lootId, editRequest, pendingCommitItems, pendingCommitConsumed);
+            if (commitAttempts > 1)
+                Debug.LogWarning("[LootTransaction] Retried unacknowledged commit. lootId=" + lootId +
+                    " request=" + editRequest + " attempt=" + commitAttempts);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[LootTransaction] Commit send failed; retaining local changes for retry: " + ex);
+            if (commitAttempts == 1)
+                DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot transfer not acknowledged. Retrying safely.");
+        }
     }
 
     public void ReceiveEditCommit(uint request, int version, string items)
@@ -176,6 +226,8 @@ public class LootMultiplayer : MonoBehaviour
         editRequest = 0;
         externalQuestConsumption = null;
         editGranted = commitSent = false;
+        pendingCommitItems = null;
+        pendingCommitConsumed = null;
         editAction = null;
         partyQuestLootEditToken = null;
         partyQuestLootClickedItem = null;
@@ -331,7 +383,14 @@ public class LootMultiplayer : MonoBehaviour
 
     // Inventory changes are sent only by an acknowledged edit. Observers must
     // never echo an incoming snapshot as a new local inventory operation.
-    void Update() { }
+    void Update()
+    {
+        // This is not an inventory poll. Retry only an already-approved and executed
+        // transaction if its specific server acknowledgement has not arrived.
+        if (commitSent && editRequest != 0 && pendingCommitItems != null &&
+            Time.realtimeSinceStartup >= nextCommitAttempt)
+            RetryCommit();
+    }
 
     void LateUpdate()
     {

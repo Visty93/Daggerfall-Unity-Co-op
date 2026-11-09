@@ -2933,6 +2933,11 @@ PrefabInstance:
   m_Modification:
     m_TransformParent: {fileID: 0}
     m_Modifications:
+    - target: {fileID: 2800712056572462712, guid: 36c7108778dfa7f4eac90d13f075af88,
+        type: 3}
+      propertyPath: Timeout
+      value: 30000
+      objectReference: {fileID: 0}
     - target: {fileID: 2800712056572462713, guid: 36c7108778dfa7f4eac90d13f075af88,
         type: 3}
       propertyPath: m_Enabled

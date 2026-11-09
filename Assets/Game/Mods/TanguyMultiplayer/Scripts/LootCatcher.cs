@@ -552,7 +552,14 @@ public class LootCatcher : NetworkBehaviour
     static readonly HashSet<uint> capturedCorpseIds = new HashSet<uint>();
     static ulong corpseSequence;
     static readonly HashSet<uint> retiredCorpseIds = new HashSet<uint>();
-    static readonly Dictionary<string, float> emptyCorpsePixels = new Dictionary<string, float>();
+    // An unoccupied-area grace timer belongs to the individual corpse, not to a shared
+    // exterior map pixel. This avoids newly added or actively edited corpses inheriting
+    // another corpse's already-expired cleanup timer.
+    static readonly Dictionary<uint, float> corpseUnloadedSince = new Dictionary<uint, float>();
+    // StreamingWorld exposes TerrainDistance=1..4 locally; it is not network-synced.
+    // Preserve exterior corpses across every *possible* client loaded-terrain range,
+    // rather than retiring loot still visible to a client with TerrainDistance=4.
+    const int CorpseExteriorMaxTerrainDistance = 4;
     static float nextCorpseCleanup;
 
     readonly Queue<PendingCorpse> pendingCorpses = new Queue<PendingCorpse>();
@@ -572,7 +579,7 @@ public class LootCatcher : NetworkBehaviour
     }
     static void ResetCorpseReplaySession()
     {
-        corpseLedgers.Clear(); capturedCorpseIds.Clear(); retiredCorpseIds.Clear(); emptyCorpsePixels.Clear(); nextCorpseCleanup = 0; corpseSequence = 0;
+        corpseLedgers.Clear(); capturedCorpseIds.Clear(); retiredCorpseIds.Clear(); corpseUnloadedSince.Clear(); nextCorpseCleanup = 0; corpseSequence = 0;
         currentCorpseAreaFrame = -1; cachedCorpseArea = null; cachedCorpseRoot = null;
         // Enemy IDs can be reused in a new session. Other container types are untouched.
         foreach (uint id in new List<uint>(localLootById.Keys))
@@ -779,7 +786,7 @@ public class LootCatcher : NetworkBehaviour
         }
         var pixel = MapsFile.WorldCoordToMapPixel(pixelWorldX, pixelWorldZ);
         data.mapPixelX = pixel.X; data.mapPixelY = pixel.Y;
-        emptyCorpsePixels.Remove(CorpsePixelKey(pixel.X, pixel.Y));
+        corpseUnloadedSince.Remove(id);
         string bucket = area == "E" ? CorpseCellKey(data.worldX, data.worldZ) : area;
         CorpseLedger ledger;
         if (!corpseLedgers.TryGetValue(bucket, out ledger) || (area.StartsWith("D:", StringComparison.Ordinal) && ledger.dungeon == null))
@@ -979,7 +986,21 @@ public class LootCatcher : NetworkBehaviour
         StartCoroutine(CleanupUnoccupiedCorpsePixels());
     }
 
-    static string CorpsePixelKey(int x, int y) { return x + ":" + y; }
+    // Daggerfall's StreamingWorld keeps loose exterior objects until their map pixel
+    // leaves the loaded terrain square, not merely until the player steps into the
+    // neighboring pixel. The server cannot read each remote client's TerrainDistance;
+    // use the maximum supported setting (4) to avoid premature loot loss.
+    static bool IsWithinAnyLoadedExteriorTerrain(int corpsePixelX, int corpsePixelY, List<Vector2Int> playerPixels)
+    {
+        for (int i = 0; i < playerPixels.Count; i++)
+        {
+            Vector2Int pixel = playerPixels[i];
+            if (Math.Abs(corpsePixelX - pixel.x) <= CorpseExteriorMaxTerrainDistance &&
+                Math.Abs(corpsePixelY - pixel.y) <= CorpseExteriorMaxTerrainDistance)
+                return true;
+        }
+        return false;
+    }
 
     IEnumerator CleanupUnoccupiedCorpsePixels()
     {
@@ -998,49 +1019,91 @@ public class LootCatcher : NetworkBehaviour
     [Server]
     void CleanupCorpsePixels()
     {
-        var occupied = new HashSet<string>();
+        var playerPixels = new List<Vector2Int>();
+        var occupiedBuildingAreas = new HashSet<string>();
         foreach (var connection in NetworkServer.connections.Values)
         {
             if (connection == null || connection.identity == null) continue;
             var position = connection.identity.GetComponent<PositionMultiplayer>();
-            // A join/transition with unknown location must not be interpreted as absence.
+            // Never mistake an incomplete location update/transition for an empty area.
             if (position == null || !position.EnemyInterestLocationKnown || position.x <= 0 || position.z <= 0)
-            { emptyCorpsePixels.Clear(); return; }
+            {
+                corpseUnloadedSince.Clear();
+                return;
+            }
+
+            string playerArea = ServerCorpseArea(position);
+            if (playerArea == null)
+            {
+                corpseUnloadedSince.Clear();
+                return;
+            }
             int x = position.x, z = position.z;
             if (position.EnemyInterestState == PositionMultiplayer.PartyLocationState.BuildingInterior)
             {
-                if (!position.EnemyInterestBuildingAnchorValid) { emptyCorpsePixels.Clear(); return; }
-                x = position.EnemyInterestBuildingAnchorX; z = position.EnemyInterestBuildingAnchorZ;
+                if (!position.EnemyInterestBuildingAnchorValid)
+                {
+                    corpseUnloadedSince.Clear();
+                    return;
+                }
+                x = position.EnemyInterestBuildingAnchorX;
+                z = position.EnemyInterestBuildingAnchorZ;
+                occupiedBuildingAreas.Add(playerArea);
             }
-            // Dungeon x/z are already its exterior entrance anchor.
+            // Other states (including dungeons) retain their known exterior world pixel.
             var pixel = MapsFile.WorldCoordToMapPixel(x, z);
-            occupied.Add(CorpsePixelKey(pixel.X, pixel.Y));
+            playerPixels.Add(new Vector2Int(pixel.X, pixel.Y));
         }
+
         var retired = new List<uint>();
         var emptyBuckets = new List<string>();
-        var retainedPixels = new HashSet<string>();
         float now = Time.realtimeSinceStartup;
         foreach (var entry in corpseLedgers)
         {
             var list = entry.Value.corpses;
+            bool isDungeon = entry.Key.StartsWith("D:", StringComparison.Ordinal);
+            // A network dungeon's actual Unity lifetime owns its corpses. They must
+            // never be retired because an enemy or player crossed a map-pixel edge.
+            if (isDungeon && entry.Value.dungeon != null)
+                continue;
+
             for (int i = list.Count - 1; i >= 0; i--)
             {
                 var corpse = list[i];
-                string pixel = CorpsePixelKey(corpse.mapPixelX, corpse.mapPixelY);
-                if (occupied.Contains(pixel)) { emptyCorpsePixels.Remove(pixel); continue; }
-                float since;
-                if (!emptyCorpsePixels.TryGetValue(pixel, out since))
-                { emptyCorpsePixels[pixel] = now; continue; }
-                // Brief transition grace, not a corpse age/expiry timer.
-                if (now - since < 2f) { retainedPixels.Add(pixel); continue; }
-                retired.Add(corpse.id); list.RemoveAt(i);
+                if (!isDungeon)
+                {
+                    bool isBuilding = corpse.area != null && corpse.area.StartsWith("B:", StringComparison.Ordinal);
+                    bool stillLoaded = isBuilding
+                        ? occupiedBuildingAreas.Contains(corpse.area) ||
+                          IsWithinAnyPlayerPixel(corpse.mapPixelX, corpse.mapPixelY, playerPixels)
+                        : IsWithinAnyLoadedExteriorTerrain(corpse.mapPixelX, corpse.mapPixelY, playerPixels);
+
+                    // An edit transaction must never lose its server record mid-commit.
+                    if (stillLoaded || lootEdits.ContainsKey(corpse.id))
+                    {
+                        corpseUnloadedSince.Remove(corpse.id);
+                        continue;
+                    }
+                    float since;
+                    if (!corpseUnloadedSince.TryGetValue(corpse.id, out since))
+                    {
+                        corpseUnloadedSince[corpse.id] = now;
+                        continue;
+                    }
+                    // Grace for loading/teleporting across area boundaries (real time).
+                    if (now - since < 2f)
+                        continue;
+                }
+
+                // For a dungeon: the dungeon object is gone. For other corpses:
+                // their corresponding loaded area has genuinely been abandoned.
+                corpseUnloadedSince.Remove(corpse.id);
+                retired.Add(corpse.id);
+                list.RemoveAt(i);
             }
             if (list.Count == 0) emptyBuckets.Add(entry.Key);
         }
         foreach (string bucket in emptyBuckets) corpseLedgers.Remove(bucket);
-        foreach (string pixel in new List<string>(emptyCorpsePixels.Keys))
-            if (!retainedPixels.Contains(pixel) && now - emptyCorpsePixels[pixel] >= 2f)
-                emptyCorpsePixels.Remove(pixel);
         for (int i = 0; i < retired.Count; i++)
         {
             uint id = retired[i];
@@ -1052,6 +1115,16 @@ public class LootCatcher : NetworkBehaviour
         }
         for (int i = 0; i < retired.Count; i += 64)
             RpcRetireCorpses(retired.GetRange(i, Math.Min(64, retired.Count - i)).ToArray());
+    }
+
+    // Interiors use SP's scene-cache lifetime: leaving the building is fine as
+    // long as at least one player remains in its *map pixel* (not the building).
+    static bool IsWithinAnyPlayerPixel(int corpsePixelX, int corpsePixelY, List<Vector2Int> playerPixels)
+    {
+        for (int i = 0; i < playerPixels.Count; i++)
+            if (playerPixels[i].x == corpsePixelX && playerPixels[i].y == corpsePixelY)
+                return true;
+        return false;
     }
 
     [ClientRpc]

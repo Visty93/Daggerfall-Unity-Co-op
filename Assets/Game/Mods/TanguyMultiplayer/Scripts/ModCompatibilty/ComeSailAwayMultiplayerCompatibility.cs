@@ -1,4 +1,4 @@
-// Unofficial Come Sail Away multiplayer compatibility helper — v15l.
+// Unofficial Come Sail Away multiplayer compatibility helper — v15n.
 // For Come Sail Away by RedRoryOTheGlen:
 // https://github.com/RedRoryOTheGlen/DFU-mods-released/tree/main/ComeSailAway
 // Developed with reference to CSA's source; requires the original installed mod.
@@ -80,10 +80,33 @@ public struct CSAMPDeckPose : NetworkMessage
     public Quaternion rotation;
 }
 
+// Services are deliberately separate from motion/deck packets.
+public struct CSAMPServiceRequest : NetworkMessage
+{
+    public uint owner, boat, request;
+    public byte service;
+}
+public struct CSAMPServiceResult : NetworkMessage
+{
+    public uint owner, boat, request;
+    public byte service, result; // 0=allowed, 1=party required, 2=unavailable
+}
+public struct CSAMPCargoSeed : NetworkMessage
+{
+    public uint owner, boat;
+    public string items;
+}
+public struct CSAMPCargoState : NetworkMessage
+{
+    public uint owner, boat, loot;
+    public int version;
+    public string items;
+}
+
 [DefaultExecutionOrder(-32000)]
 public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
 {
-    const string Prefix = "[SailMP v15l] ";
+    const string Prefix = "[SailMP v15n] ";
     const float Units = 40f, VisibleRange = 1800f;
     const int BoatLimit = 16, PartLimit = 32;
     const BindingFlags Fields = BindingFlags.Public | BindingFlags.Instance;
@@ -224,10 +247,12 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
     float supportSeenRealtime = -100f, correctionSupportUntil;
     int correctionSupportSteps;
 
-    // A failed CSA enumerator is captured by identity from its actual exception.
+    // Recover an exception-reported or verified terminal CSA enumerator by identity.
     // Never time out a healthy disembark coroutine (pause can legitimately delay it).
     readonly HashSet<ulong> loadReleasedLeases = new HashSet<ulong>();
-    IEnumerator failedDisembark;
+    IEnumerator failedDisembark, terminalDisembarkCandidate;
+    Type disembarkIteratorType;
+    FieldInfo disembarkIteratorState;
     bool recoveringSteering, boatLoadInProgress;
     bool BoatLoadSuspended
     {
@@ -251,11 +276,15 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
         NetworkServer.ReplaceHandler<CSAMPDoorRequest>(ReceiveDoorRequest);
         NetworkServer.ReplaceHandler<CSAMPDriveRequest>(ReceiveDriveRequest);
         NetworkServer.ReplaceHandler<CSAMPDeckPose>(ReceiveDeckPoseFromPlayer);
+        NetworkServer.ReplaceHandler<CSAMPServiceRequest>(ReceiveBoatServiceRequest);
+        NetworkServer.ReplaceHandler<CSAMPCargoSeed>(ReceiveCargoSeed);
         NetworkClient.ReplaceHandler<CSAMPBoatState>(ReceiveRemoteState);
         NetworkClient.ReplaceHandler<CSAMPBoatMotionState>(ReceiveRemoteMotion);
         NetworkClient.ReplaceHandler<CSAMPDoorState>(ReceiveDoorState);
         NetworkClient.ReplaceHandler<CSAMPDriveState>(ReceiveDriveState);
         NetworkClient.ReplaceHandler<CSAMPDeckPose>(ReceiveDeckPose);
+        NetworkClient.ReplaceHandler<CSAMPServiceResult>(ReceiveBoatServiceResult);
+        NetworkClient.ReplaceHandler<CSAMPCargoState>(ReceiveCargoState);
     }
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -280,6 +309,8 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
             NetworkServer.ReplaceHandler<CSAMPDoorRequest>(ReceiveDoorRequest);
             NetworkServer.ReplaceHandler<CSAMPDriveRequest>(ReceiveDriveRequest);
             NetworkServer.ReplaceHandler<CSAMPDeckPose>(ReceiveDeckPoseFromPlayer);
+            NetworkServer.ReplaceHandler<CSAMPServiceRequest>(ReceiveBoatServiceRequest);
+            NetworkServer.ReplaceHandler<CSAMPCargoSeed>(ReceiveCargoSeed);
         }
         if (NetworkClient.active && !clientWasActive)
         {
@@ -288,9 +319,11 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
             NetworkClient.ReplaceHandler<CSAMPDoorState>(ReceiveDoorState);
             NetworkClient.ReplaceHandler<CSAMPDriveState>(ReceiveDriveState);
             NetworkClient.ReplaceHandler<CSAMPDeckPose>(ReceiveDeckPose);
+            NetworkClient.ReplaceHandler<CSAMPServiceResult>(ReceiveBoatServiceResult);
+            NetworkClient.ReplaceHandler<CSAMPCargoState>(ReceiveCargoState);
         }
-        if (!NetworkServer.active && serverWasActive) { cache.Clear(); viewers.Clear(); budgets.Clear(); serverDoorStates.Clear(); serverDrivers.Clear(); }
-        if (!NetworkClient.active && clientWasActive) { loadReleasedLeases.Clear(); StopRemoteDriveLocal(false); RestoreAllHiddenOwnedBoats(); RestoreAllRemoteDriverPresentationOverrides(); releasingRemoteDrive = false; releasingRemoteDriveKey = 0; ClearPausedDeckAttachment(); RestoreRemoteDeckFollowerSpeed(); ClearRemotes(); remoteDeckPoses.Clear(); sentDeckAttachment = false; locals.Clear(); clientDoorStates.Clear(); clientDrivers.Clear(); ClearEnemyPassengerState(); }
+        if (!NetworkServer.active && serverWasActive) { ClearBoatServicesServer(); cache.Clear(); viewers.Clear(); budgets.Clear(); serverDoorStates.Clear(); serverDrivers.Clear(); }
+        if (!NetworkClient.active && clientWasActive) { ClearBoatServicesClient(); loadReleasedLeases.Clear(); StopRemoteDriveLocal(false); RestoreAllHiddenOwnedBoats(); RestoreAllRemoteDriverPresentationOverrides(); releasingRemoteDrive = false; releasingRemoteDriveKey = 0; ClearPausedDeckAttachment(); RestoreRemoteDeckFollowerSpeed(); ClearRemotes(); remoteDeckPoses.Clear(); sentDeckAttachment = false; locals.Clear(); clientDoorStates.Clear(); clientDrivers.Clear(); ClearEnemyPassengerState(); }
         serverWasActive = NetworkServer.active;
         clientWasActive = NetworkClient.active;
         if (!NetworkClient.active && !NetworkServer.active) return;
@@ -304,7 +337,7 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
         if (NetworkClient.ready && ModAvailable() && Time.unscaledTime >= nextSubscribe)
         {
             nextSubscribe = Time.unscaledTime + 5f;
-            NetworkClient.Send(new CSAMPSubscribe { version = 5 });
+            NetworkClient.Send(new CSAMPSubscribe { version = 6 });
         }
 
         RecoverFailedDisembark();
@@ -332,6 +365,7 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
         // physics-frame passenger. Advance remote boats in our early FixedUpdate()
         // instead so PlayerGroundMotor consumes the same platform step.
 
+        TickBoatServices();
         UpdateRemoteDeckFollowerSpeed();
     }
 
@@ -963,6 +997,7 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
                     local.native = native;
                     local.root = root;
                     ConfigureLocalDoorInteractions(local);
+                    ConfigureBoatServices(native, root, PlayerMultiplayer.GetLocalPlayerNetIdSafe(), local.id, false);
                     ApplyCachedDoorStatesToLocal(local);
 
                     if (sendVisual)
@@ -1143,7 +1178,7 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
     }
     void Subscribe(NetworkConnection connection, CSAMPSubscribe message)
     {
-        if (message.version != 5 || connection == null || connection.identity == null || !connection.isReady) return;
+        if (message.version != 6 || connection == null || connection.identity == null || !connection.isReady) return;
         var budget = GetBudget(connection);
         if (Time.unscaledTime - budget.subscription < 2f) return;
         budget.subscription = Time.unscaledTime;
@@ -1168,6 +1203,9 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
                 result = 0,
             });
         }
+
+        foreach (var cargo in serverCargo)
+            SendCargoState(connection, (uint)(cargo.Key >> 32), (uint)cargo.Key, cargo.Value);
 
         foreach (var boatEntry in serverDoorStates)
         {
@@ -1903,9 +1941,8 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
         remote.root.transform.SetParent(null, true);
         remote.mesh = Read<GameObject>(remote.native, "MeshObject");
         remote.root.AddComponent<CSAMPRemoteDeck>();
-        // Keep installed solid geometry. Start with all trigger colliders disabled,
-        // then selectively restore only CSA's board (112401) and door (112403)
-        // activators below. Driving/cargo/variant/status controls stay disabled.
+        // Keep solid geometry; restore only recognized interaction colliders below.
+        // Observer boats remain outside CSA's native ownership/cleanup collection.
         foreach (var collider in remote.root.GetComponentsInChildren<Collider>(true))
             if (collider.isTrigger || collider is CharacterController) collider.enabled = false;
         foreach (var body in remote.root.GetComponentsInChildren<Rigidbody>(true)) { body.isKinematic = true; body.detectCollisions = true; }
@@ -1923,18 +1960,15 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
                 Destroy(script);
             }
         }
-        var cargo = Get(remote.native, "Cargo") as Component;
-        if (cargo != null) { cargo.gameObject.SetActive(false); Destroy(cargo.gameObject); }
-        // Controls that could make the observer own/modify the ship remain disabled.
-        foreach (string name in new[] { "CargoTrigger", "StatusTrigger", "PositionTrigger", "VariantTrigger" })
-        {
-            var marker = Read<GameObject>(remote.native, name);
-            if (marker != null) marker.SetActive(false);
-        }
-
-        // Boarding and doors are safe observer interactions and are handled entirely
-        // by this adapter. The replicated boat never enters CSA's native AllBoats list.
+        // Keep the replica's hold as a local view of the owner's shared inventory.
+        // It is bound only after the server has assigned a loot transaction ID.
+        var variantMarker = Read<GameObject>(remote.native, "VariantTrigger");
+        if (variantMarker != null) variantMarker.SetActive(false);
         ConfigureRemoteInteractions(remote);
+        ConfigureBoatServices(remote.native, remote.root, remote.state.owner, remote.state.boat, true);
+        CSAMPCargoState cargoState;
+        if (cargoStates.TryGetValue(Key(remote.state.owner, remote.state.boat), out cargoState))
+            TryBindBoatCargo(Key(remote.state.owner, remote.state.boat), cargoState);
         ApplyCachedDoorStatesToRemote(remote);
         var variants = Read<GameObject>(remote.native, "VariantObject");
         if (variants != null)
@@ -2429,30 +2463,79 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
     void OnNativeSailingException(string message, string stackTrace, LogType type)
     {
         if (recoveringSteering || (!NetworkClient.active && !NetworkServer.active) ||
-            mod == null || nativeDisembarking == null || type != LogType.Exception) return;
-        // Unity reports iterator failures outside the reflection Invoke caller.
-        if ((message == null || message.IndexOf("StopSailingCoroutine", StringComparison.Ordinal) < 0) &&
-            (stackTrace == null || stackTrace.IndexOf("StopSailingCoroutine", StringComparison.Ordinal) < 0)) return;
+            mod == null || nativeDisembarking == null) return;
+        // Some log forwarding paths report exceptions as Error or text. Still
+        // require CSA's exact iterator in the report, not an unrelated exception.
+        const string iteratorName = "ComeSailAwayMod.ComeSailAway+<StopSailingCoroutine>";
+        if ((message == null || message.IndexOf(iteratorName, StringComparison.Ordinal) < 0) &&
+            (stackTrace == null || stackTrace.IndexOf(iteratorName, StringComparison.Ordinal) < 0)) return;
+        if (type != LogType.Exception && type != LogType.Error &&
+            (message == null || message.IndexOf("Exception", StringComparison.Ordinal) < 0) &&
+            (stackTrace == null || stackTrace.IndexOf("Exception", StringComparison.Ordinal) < 0)) return;
         try { failedDisembark = nativeDisembarking.GetValue(mod) as IEnumerator; }
         catch { /* Do not throw or log recursively inside Unity's log callback. */ }
     }
 
+    bool IsTerminalNativeDisembark(IEnumerator routine)
+    {
+        // Do not advance the iterator ourselves. Roslyn and Mono store -1 when
+        // MoveNext has exited/failed, and a positive resume state at each yield.
+        // A healthy paused WaitForEndOfFrame therefore never qualifies.
+        Type type = routine.GetType();
+        if (type != disembarkIteratorType)
+        {
+            disembarkIteratorType = type;
+            disembarkIteratorState = null;
+            if (type.DeclaringType != modType ||
+                !type.Name.StartsWith("<StopSailingCoroutine>", StringComparison.Ordinal)) return false;
+            const BindingFlags stateFlags = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+            disembarkIteratorState = type.GetField("<>1__state", stateFlags) ?? type.GetField("$PC", stateFlags);
+            if (disembarkIteratorState != null && disembarkIteratorState.FieldType != typeof(int))
+                disembarkIteratorState = null;
+        }
+        // Unknown compiler layouts fail closed; retain the exception callback path.
+        return disembarkIteratorState != null && (int)disembarkIteratorState.GetValue(routine) == -1;
+    }
+
     void RecoverFailedDisembark()
     {
-        if (failedDisembark == null || mod == null || nativeDisembarking == null || BoatLoadSuspended) return;
-        IEnumerator failed = failedDisembark;
-        failedDisembark = null;
-        // A newer coroutine must never be cancelled because an older one failed.
-        if (!ReferenceEquals(nativeDisembarking.GetValue(mod), failed)) return;
-        ResetNativeSteering("aborted StopSailingCoroutine", false);
-        // Normal lease completion publishes the final pose and returns authority.
-        UpdateDriveLeaseClient();
+        if (mod == null || nativeDisembarking == null || BoatLoadSuspended) return;
+        try
+        {
+            IEnumerator routine = nativeDisembarking.GetValue(mod) as IEnumerator;
+            IEnumerator failed = failedDisembark;
+            failedDisembark = null;
+            if (routine == null)
+            { terminalDisembarkCandidate = null; return; }
+
+            bool loggedFailure = failed != null && ReferenceEquals(routine, failed);
+            if (!loggedFailure)
+            {
+                if (!IsTerminalNativeDisembark(routine))
+                { terminalDisembarkCandidate = null; return; }
+                // Observe the SAME terminal iterator on two separate Updates.
+                // No duration/FreezeMotor timeout and no cancellation of a newer
+                // routine on the strength of an older routine's exception.
+                if (!ReferenceEquals(terminalDisembarkCandidate, routine))
+                { terminalDisembarkCandidate = routine; return; }
+            }
+            terminalDisembarkCandidate = null;
+            ResetNativeSteering(loggedFailure ? "aborted StopSailingCoroutine (exception report)" :
+                "stale terminal StopSailingCoroutine (state=-1 on two Updates)", false);
+            UpdateDriveLeaseClient();
+        }
+        catch (Exception e)
+        {
+            terminalDisembarkCandidate = null;
+            Warn("Steering recovery probe: " + e.GetBaseException().Message);
+        }
     }
 
     void ResetNativeSteering(string reason, bool loading)
     {
         if (mod == null || currentBoat == null || recoveringSteering) return;
         recoveringSteering = true;
+        terminalDisembarkCandidate = null;
         try
         {
             object boat = currentBoat.GetValue(mod);
@@ -2570,6 +2653,7 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
         Bind();
         if (mod == null) return;
         boatLoadInProgress = true;
+        ClearBoatServicesClient();
         RemoveNetworkActorsFromBoatCleanup();
         ResetNativeSteering("save load start", true);
         // Release leases BEFORE removing replicas; don't invoke native stop again.
@@ -3244,6 +3328,335 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
             RestoreRemoteDriverPresentationOverride(ids[i]);
 
         remoteDriverPresentationActive.Clear();
+    }
+
+    // Boat services use server-authorized party access. Cargo reuses the existing
+    // LootCatcher/LootMultiplayer transactions and full item serializer.
+    sealed class CargoRecord { public uint id; }
+    sealed class CargoBinding
+    {
+        public DaggerfallLoot loot;
+        public uint id;
+        public Transform parent;
+        public LootContainerTypes originalType;
+        public bool detached;
+    }
+    readonly Dictionary<ulong, CargoRecord> serverCargo = new Dictionary<ulong, CargoRecord>();
+    readonly Dictionary<ulong, CSAMPCargoState> cargoStates = new Dictionary<ulong, CSAMPCargoState>();
+    readonly Dictionary<ulong, CargoBinding> cargoBindings = new Dictionary<ulong, CargoBinding>();
+    readonly Dictionary<GameObject, string> renamedCargoMarkers = new Dictionary<GameObject, string>();
+    float nextBoatServices;
+    uint serviceSequence, pendingServiceRequest;
+    CSAMPBoatInteraction pendingService;
+    Vector3 pendingServiceHit;
+    float pendingServiceAt;
+
+    static bool CargoPayloadFits(string items)
+    {
+        return items != null && System.Text.Encoding.UTF8.GetByteCount(items) <= 28000;
+    }
+
+    void ConfigureBoatServices(object native, GameObject root, uint owner, uint boat, bool remote)
+    {
+        foreach (var service in new[] {
+            new KeyValuePair<string, CSAMPBoatInteraction.Kind>("CargoTrigger", CSAMPBoatInteraction.Kind.Cargo),
+            new KeyValuePair<string, CSAMPBoatInteraction.Kind>("PositionTrigger", CSAMPBoatInteraction.Kind.Position),
+            new KeyValuePair<string, CSAMPBoatInteraction.Kind>("StatusTrigger", CSAMPBoatInteraction.Kind.Status) })
+        {
+            if (!remote && service.Value != CSAMPBoatInteraction.Kind.Cargo) continue;
+            var marker = Read<GameObject>(native, service.Key);
+            if (marker == null) continue;
+            // CSA's cargo callback dereferences a null Boat on replicas. Use our
+            // activable before opening any hold, including the owner's live hold.
+            if (service.Value == CSAMPBoatInteraction.Kind.Cargo)
+            {
+                if (!renamedCargoMarkers.ContainsKey(marker)) renamedCargoMarkers.Add(marker, marker.name);
+                marker.name = "CSAMP Cargo Access";
+                foreach (var collider in marker.GetComponentsInChildren<Collider>(true))
+                {
+                    var target = collider.gameObject;
+                    if (!renamedCargoMarkers.ContainsKey(target)) renamedCargoMarkers.Add(target, target.name);
+                    target.name = "CSAMP Cargo Access";
+                }
+            }
+            AttachRemoteInteraction(marker, service.Value, owner, boat, 0, null, null);
+        }
+        if (!remote) return;
+
+        // CSA creates real DFU bed/fire/billboard objects for other mods to detect.
+        // Restore their activation colliders without fabricating cooking behaviour.
+        foreach (string name in new[] { "BedObject", "FireObject" })
+        {
+            var obj = Read<GameObject>(native, name);
+            if (obj == null) continue;
+            foreach (var collider in obj.GetComponentsInChildren<Collider>(true)) collider.enabled = true;
+            if (name == "BedObject")
+                foreach (var collider in obj.GetComponentsInChildren<Collider>(true))
+                {
+                    var interaction = collider.GetComponent<CSAMPBoatInteraction>();
+                    if (interaction == null) interaction = collider.gameObject.AddComponent<CSAMPBoatInteraction>();
+                    interaction.Configure(this, CSAMPBoatInteraction.Kind.Rest, owner, boat, 0, false, null, null);
+                }
+        }
+        foreach (var billboard in root.GetComponentsInChildren<DaggerfallBillboard>(true))
+            foreach (var collider in billboard.GetComponentsInChildren<Collider>(true)) collider.enabled = true;
+    }
+
+    void ReceiveCargoSeed(NetworkConnection connection, CSAMPCargoSeed seed)
+    {
+        if (connection == null || connection.identity == null || !connection.isReady ||
+            connection.identity.netId != seed.owner || seed.boat == 0 ||
+            !AcceptOwnerPacket(connection) || !CargoPayloadFits(seed.items)) return;
+        ulong key = Key(seed.owner, seed.boat);
+        if (!cache.ContainsKey(key)) return;
+        CargoRecord cargo;
+        if (!serverCargo.TryGetValue(key, out cargo))
+        {
+            uint id = LootCatcher.ServerRegisterWorldContainer(seed.items);
+            if (id == 0) return;
+            cargo = new CargoRecord { id = id };
+            serverCargo.Add(key, cargo);
+        }
+        // Repeated seeds are retries, NEVER replacement inventories.
+        SendCargoState(connection, seed.owner, seed.boat, cargo);
+    }
+
+    bool SendCargoState(NetworkConnection connection, uint owner, uint boat, CargoRecord cargo)
+    {
+        if (connection == null || connection.identity == null || !connection.isReady ||
+            (connection.identity.netId != owner && !ServerSameParty(owner, connection.identity.netId))) return false;
+        int version; string items;
+        if (!LootCatcher.ServerReadWorldContainer(cargo.id, out version, out items) ||
+            !CargoPayloadFits(items)) return false;
+        connection.Send(new CSAMPCargoState { owner = owner, boat = boat,
+            loot = cargo.id, version = version, items = items });
+        return true;
+    }
+
+    void ReceiveBoatServiceRequest(NetworkConnection connection, CSAMPServiceRequest request)
+    {
+        if (connection == null || connection.identity == null || !connection.isReady ||
+            request.request == 0 || request.service < 4 || request.service > 7 || !AcceptOwnerPacket(connection)) return;
+        byte result = 0;
+        ulong key = Key(request.owner, request.boat);
+        if (BoatLoadSuspended || !cache.ContainsKey(key)) result = 2;
+        else if (request.owner != connection.identity.netId && !ServerSameParty(request.owner, connection.identity.netId)) result = 1;
+        else if (request.service == (byte)CSAMPBoatInteraction.Kind.Cargo)
+        {
+            CargoRecord cargo;
+            if (!serverCargo.TryGetValue(key, out cargo) || !SendCargoState(connection, request.owner, request.boat, cargo)) result = 2;
+        }
+        connection.Send(new CSAMPServiceResult { owner = request.owner, boat = request.boat,
+            request = request.request, service = request.service, result = result });
+    }
+
+    internal void ActivateBoatService(CSAMPBoatInteraction interaction, RaycastHit hit)
+    {
+        if (interaction == null || !isActiveAndEnabled || BoatLoadSuspended || !NetworkClient.ready ||
+            !ExteriorReady() || hit.distance > PlayerActivate.DefaultActivationDistance ||
+            GameManager.Instance.PlayerActivate.CurrentMode == PlayerActivateModes.Steal) return;
+        // A mod's registered bed activation has ALREADY run before IPlayerActivable.
+        if (interaction.ServiceKind == CSAMPBoatInteraction.Kind.Rest && PlayerActivate.HasCustomActivation(41000)) return;
+        if (GameManager.IsGamePaused) return;
+        // Preserve native owner access to a pre-existing hold too large for the
+        // existing loot transport. Never substitute an empty shared inventory.
+        if (interaction.ServiceKind == CSAMPBoatInteraction.Kind.Cargo &&
+            interaction.BoatOwner == PlayerMultiplayer.GetLocalPlayerNetIdSafe() &&
+            !cargoBindings.ContainsKey(Key(interaction.BoatOwner, interaction.BoatId)))
+        {
+            var local = FindLocalBoat(interaction.BoatId);
+            var cargo = local != null ? Get(local.native, "Cargo") as DaggerfallLoot : null;
+            if (cargo != null && !CargoPayloadFits(LootCatcher.SerializeLootItems(cargo)))
+            {
+                DaggerfallUI.Instance.InventoryWindow.LootTarget = cargo;
+                DaggerfallUI.PostMessage(DaggerfallUIMessages.dfuiOpenInventoryWindow);
+                return;
+            }
+        }
+        if (pendingService != null && Time.realtimeSinceStartup - pendingServiceAt < 5f) return;
+        pendingService = interaction;
+        pendingServiceHit = interaction.transform.InverseTransformPoint(hit.point);
+        pendingServiceAt = Time.realtimeSinceStartup;
+        pendingServiceRequest = ++serviceSequence;
+        if (pendingServiceRequest == 0) pendingServiceRequest = ++serviceSequence;
+        NetworkClient.Send(new CSAMPServiceRequest { owner = interaction.BoatOwner, boat = interaction.BoatId,
+            request = pendingServiceRequest, service = (byte)interaction.ServiceKind });
+    }
+
+    void ReceiveBoatServiceResult(NetworkConnection connection, CSAMPServiceResult result)
+    {
+        var interaction = pendingService;
+        if (interaction == null || result.request != pendingServiceRequest ||
+            result.owner != interaction.BoatOwner || result.boat != interaction.BoatId ||
+            result.service != (byte)interaction.ServiceKind) return;
+        pendingService = null;
+        if (BoatLoadSuspended || Time.realtimeSinceStartup - pendingServiceAt > 5f || !ExteriorReady()) return;
+        if (result.result != 0)
+        {
+            DaggerfallUI.AddHUDText(result.result == 1 ? "Only the ship owner's party can use this." :
+                "Ship service is synchronizing. Please try again.");
+            return;
+        }
+        if (!interaction.gameObject.activeInHierarchy || GameManager.IsGamePaused ||
+            Vector3.Distance(GameManager.Instance.MainCamera.transform.position,
+                interaction.transform.TransformPoint(pendingServiceHit)) > PlayerActivate.DefaultActivationDistance + 0.5f ||
+            !MultiplayerPartyManager.AreSameParty(PlayerMultiplayer.GetLocalPlayerNetIdSafe(), result.owner)) return;
+        object native = null;
+        LocalBoat local = null;
+        if (result.owner == PlayerMultiplayer.GetLocalPlayerNetIdSafe()) local = FindLocalBoat(result.boat);
+        RemoteBoat remote;
+        if (local != null) native = local.native;
+        else if (remotes.TryGetValue(Key(result.owner, result.boat), out remote)) native = remote.native;
+        if (native == null || !ModAvailable()) return;
+        try
+        {
+            switch (interaction.ServiceKind)
+            {
+                case CSAMPBoatInteraction.Kind.Position:
+                    var position = modType.GetMethod("StartShowBoatPosition", Fields, null, new[] { boatType }, null);
+                    if (position != null) position.Invoke(mod, new[] { native });
+                    break;
+                case CSAMPBoatInteraction.Kind.Status:
+                    DaggerfallUI.MessageBox("Nice Boat!");
+                    break;
+                case CSAMPBoatInteraction.Kind.Rest:
+                    DaggerfallUI.PostMessage(DaggerfallUIMessages.dfuiOpenRestWindow);
+                    break;
+                case CSAMPBoatInteraction.Kind.Cargo:
+                    CargoBinding binding;
+                    if (!cargoBindings.TryGetValue(Key(result.owner, result.boat), out binding) ||
+                        binding.loot == null || binding.loot.GetComponent<LootMultiplayer>() == null)
+                    { DaggerfallUI.AddHUDText("Ship cargo is synchronizing. Please try again."); break; }
+                    DaggerfallUI.Instance.InventoryWindow.LootTarget = binding.loot;
+                    DaggerfallUI.PostMessage(DaggerfallUIMessages.dfuiOpenInventoryWindow);
+                    break;
+            }
+        }
+        catch (Exception e) { Warn("Boat service: " + e.GetBaseException().Message); }
+    }
+
+    void ReceiveCargoState(NetworkConnection connection, CSAMPCargoState state)
+    {
+        if (BoatLoadSuspended || state.owner == 0 || state.boat == 0 || state.loot == 0 ||
+            state.version < 0 || !CargoPayloadFits(state.items)) return;
+        ulong key = Key(state.owner, state.boat);
+        CSAMPCargoState previous;
+        if (cargoStates.TryGetValue(key, out previous) && previous.loot == state.loot && previous.version > state.version) return;
+        cargoStates[key] = state;
+        TryBindBoatCargo(key, state);
+    }
+
+    void TryBindBoatCargo(ulong key, CSAMPCargoState state)
+    {
+        object native = null;
+        LocalBoat local = null;
+        RemoteBoat remote;
+        bool owned = state.owner == PlayerMultiplayer.GetLocalPlayerNetIdSafe();
+        if (owned) local = FindLocalBoat(state.boat);
+        if (local != null) native = local.native;
+        else if (!owned && remotes.TryGetValue(key, out remote)) native = remote.native;
+        var loot = Get(native, "Cargo") as DaggerfallLoot;
+        if (loot == null) return;
+        CargoBinding binding;
+        if (cargoBindings.TryGetValue(key, out binding))
+        {
+            if (binding.loot != loot || binding.id != state.loot) return;
+            var sync = loot.GetComponent<LootMultiplayer>();
+            if (sync != null && state.version > sync.lootVersion && sync.lootCatcher != null)
+                sync.lootCatcher.ApplyLootEditSnapshot(state.loot, state.version, state.items);
+            return;
+        }
+        var originalType = loot.ContainerType;
+        loot.ContainerType = LootContainerTypes.HouseContainers;
+        if (!LootCatcher.BindWorldContainer(state.loot, state.version, loot, state.items))
+        { loot.ContainerType = originalType; return; }
+        binding = new CargoBinding { loot = loot, id = state.loot, parent = loot.transform.parent,
+            originalType = originalType, detached = owned };
+        if (owned) loot.transform.SetParent(transform, true); // Keep the live saved hold active while the owner hull is hidden.
+        cargoBindings.Add(key, binding);
+        Debug.Log(Prefix + "[BoatServices] Shared cargo bound owner=" + state.owner + " boat=" + state.boat + " loot=" + state.loot);
+    }
+
+    void TickBoatServices()
+    {
+        if (Time.realtimeSinceStartup < nextBoatServices) return;
+        nextBoatServices = Time.realtimeSinceStartup + 1f;
+        if (pendingService != null && Time.realtimeSinceStartup - pendingServiceAt > 5f)
+        { pendingService = null; DaggerfallUI.AddHUDText("Ship service did not respond. Please try again."); }
+        if (NetworkServer.active)
+        {
+            var gone = new List<ulong>();
+            foreach (var entry in serverCargo)
+                if (!cache.ContainsKey(entry.Key)) gone.Add(entry.Key);
+            foreach (ulong key in gone)
+            { LootCatcher.ServerForgetWorldContainer(serverCargo[key].id); serverCargo.Remove(key); }
+        }
+        if (!NetworkClient.ready) return;
+        uint owner = PlayerMultiplayer.GetLocalPlayerNetIdSafe();
+        foreach (var local in locals.Values)
+        {
+            if (local.root == null || local.native == null) continue;
+            ulong key = Key(owner, local.id);
+            if (cargoStates.ContainsKey(key)) continue;
+            var loot = Get(local.native, "Cargo") as DaggerfallLoot;
+            if (loot == null) continue;
+            string items = LootCatcher.SerializeLootItems(loot);
+            if (CargoPayloadFits(items))
+                NetworkClient.Send(new CSAMPCargoSeed { owner = owner, boat = local.id, items = items });
+            else Warn("Ship cargo exceeds the existing loot message size; party access remains unavailable.");
+        }
+        foreach (var entry in cargoStates) TryBindBoatCargo(entry.Key, entry.Value);
+        var stale = new List<ulong>();
+        foreach (var entry in cargoBindings)
+        {
+            var b = entry.Value;
+            LocalBoat local = (uint)(entry.Key >> 32) == owner ? FindLocalBoat((uint)entry.Key) : null;
+            RemoteBoat remote;
+            bool alive = local != null && local.root != null;
+            if (!alive && !b.detached) alive = remotes.TryGetValue(entry.Key, out remote) && remote.root != null;
+            if (!alive || b.loot == null || !MultiplayerPartyManager.AreSameParty(owner, (uint)(entry.Key >> 32))) stale.Add(entry.Key);
+            else if (b.detached) b.loot.transform.position = local.root.transform.position;
+        }
+        foreach (ulong key in stale) ReleaseBoatCargo(key);
+    }
+
+    void ReleaseBoatCargo(ulong key)
+    {
+        CargoBinding binding;
+        if (cargoBindings.TryGetValue(key, out binding))
+        {
+            if (binding.loot != null)
+            {
+                var inventory = DaggerfallUI.Instance.InventoryWindow;
+                if (inventory.LootTarget == binding.loot) inventory.LootTarget = null;
+                LootCatcher.UnbindWorldContainer(binding.id, binding.loot);
+                binding.loot.ContainerType = binding.originalType;
+                if (binding.detached)
+                {
+                    if (binding.parent != null) binding.loot.transform.SetParent(binding.parent, true);
+                    else Destroy(binding.loot.gameObject);
+                }
+            }
+            cargoBindings.Remove(key);
+        }
+        cargoStates.Remove(key);
+    }
+
+    void ClearBoatServicesClient()
+    {
+        pendingService = null;
+        foreach (ulong key in new List<ulong>(cargoBindings.Keys)) ReleaseBoatCargo(key);
+        cargoStates.Clear();
+        foreach (var entry in renamedCargoMarkers)
+            if (entry.Key != null && entry.Key.GetComponentInParent<CSAMPRemoteDeck>() == null)
+                entry.Key.name = entry.Value;
+        renamedCargoMarkers.Clear();
+    }
+
+    void ClearBoatServicesServer()
+    {
+        foreach (var cargo in serverCargo.Values) LootCatcher.ServerForgetWorldContainer(cargo.id);
+        serverCargo.Clear();
     }
 
     void ConfigureRemoteInteractions(RemoteBoat remote)
@@ -4004,6 +4417,10 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
     {
         if (remote == null)
             return;
+        // The owner's hidden persistent hold is shared with their observer, so
+        // destroying that observer must not unbind the owner's live save data.
+        if (remote.state.owner != PlayerMultiplayer.GetLocalPlayerNetIdSafe())
+            ReleaseBoatCargo(Key(remote.state.owner, remote.state.boat));
 
         if (remote.localDriving && ReferenceEquals(activeRemoteDrive, remote))
             StopRemoteDriveLocal(true);
@@ -4036,6 +4453,7 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
     void ClearRemotes() { foreach (var remote in remotes.Values) DestroyRemote(remote); remotes.Clear(); }
     void OnDisable()
     {
+        ClearBoatServicesClient();
         ClearSeamSupport("helper disabled");
         if (NetworkClient.active && NetworkClient.ready && sentDeckAttachment)
             NetworkClient.Send(new CSAMPDeckPose { attached = false });
@@ -4054,6 +4472,8 @@ public sealed class ComeSailAwayMultiplayerCompatibility : MonoBehaviour
     }
     void OnDestroy()
     {
+        ClearBoatServicesClient();
+        ClearBoatServicesServer();
         SaveLoadManager.OnStartLoad -= OnBoatStartLoad;
         SaveLoadManager.OnLoad -= OnBoatLoadComplete;
         Application.logMessageReceived -= OnNativeSailingException;
@@ -4110,7 +4530,7 @@ public sealed class CSAMPActorParentGuard : MonoBehaviour
             if (!reported)
             {
                 reported = true;
-                Debug.Log("[SailMP v15l] Blocked additional boat actor reparent: " + gameObject.name +
+                Debug.Log("[SailMP v15n] Blocked additional boat actor reparent: " + gameObject.name +
                     "; kept parent=" + (savedParent == null ? "scene root" : savedParent.name));
             }
         }
@@ -4167,7 +4587,7 @@ public sealed class CSAMPVisualOarEvents : MonoBehaviour
 
 public sealed class CSAMPBoatInteraction : MonoBehaviour, IPlayerActivable
 {
-    public enum Kind : byte { Board = 1, Door = 2, Drive = 3 }
+    public enum Kind : byte { Board = 1, Door = 2, Drive = 3, Position = 4, Status = 5, Rest = 6, Cargo = 7 }
 
     ComeSailAwayMultiplayerCompatibility owner;
     Kind kind;
@@ -4177,6 +4597,7 @@ public sealed class CSAMPBoatInteraction : MonoBehaviour, IPlayerActivable
     Transform boardPosition;
     Animator doorAnimator;
 
+    internal Kind ServiceKind { get { return kind; } }
     internal uint BoatOwner { get { return boatOwner; } }
     internal uint BoatId { get { return boatId; } }
     internal ushort DoorIndex { get { return doorIndex; } }
@@ -4215,6 +4636,8 @@ public sealed class CSAMPBoatInteraction : MonoBehaviour, IPlayerActivable
             owner.ActivateSynchronizedDoor(this, hit);
         else if (kind == Kind.Drive)
             owner.ActivateRemoteDrive(this, hit);
+        else
+            owner.ActivateBoatService(this, hit);
     }
 }
 

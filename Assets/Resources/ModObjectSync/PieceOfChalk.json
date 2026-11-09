@@ -1,0 +1,40 @@
+{
+  "Profiles": [
+    {
+      "Id": "piece-of-chalk-marks",
+      "ModTitle": "Piece of Chalk",
+      "Rules": [
+        {
+          "Id": "arrows",
+          "ModRootName": "Piece of Chalk",
+          "NamePrefix": "ChalkArrowPrefab(Clone)",
+          "Scope": "InteriorOrDungeon",
+          "Visual": "ModPrefab",
+          "PrefabAsset": "ChalkArrowPrefab",
+          "VisibilityMetres": 250,
+          "SyncActiveState": true,
+          "SyncParentActiveState": false,
+          "IncludeLights": false,
+          "IncludeAudio": false,
+          "TrackOriginalParentLifetime": true,
+          "SyncMaterials": true
+        },
+        {
+          "Id": "automap",
+          "ObjectName": "ChalkAutomapMarker",
+          "Scope": "InteriorOrDungeon",
+          "Visual": "Custom",
+          "FactoryId": "dfucoop.runtime-material-visual.v1",
+          "Motion": "Fixed",
+          "PreserveSourceParent": true,
+          "VisibilityMetres": 250,
+          "SyncActiveState": true,
+          "SyncParentActiveState": false,
+          "IncludeLights": false,
+          "IncludeAudio": false,
+          "TrackOriginalParentLifetime": true
+        }
+      ]
+    }
+  ]
+}

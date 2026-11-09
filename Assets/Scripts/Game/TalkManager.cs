@@ -1267,10 +1267,10 @@ namespace DaggerfallWorkshop.Game
                     dictQuestInfo[currentQuestionListItem.questID].resourceInfo[currentQuestionListItem.key].questPlaceResourceHintTypeReceived = QuestResourceInfo.BuildingLocationHintTypeGiven.LocationWasMarkedOnMap;
                 GameManager.Instance.PlayerGPS.DiscoverBuilding(buildingInfo.buildingKey);
 
-                // Multiplayer-only companion path for this exact NPC "mark it on your map"
-                // result. This is mandatory for players who are in the same town at this
-                // moment and is deliberately unrelated to OptionsMultiplayer.sendLocation.
-                global::PositionMultiplayer.ShareNpcMarkedBuildingWithPlayersInTown(
+                // Share NPC map marking only with current party members in this town.
+                // This is independent of OptionsMultiplayer.sendLocation, and uses the
+                // same explicit-discovery network path as Info-mode clicks.
+                global::PositionMultiplayer.ShareDiscoveredBuildingWithParty(
                     GameManager.Instance.PlayerGPS.CurrentMapID,
                     buildingInfo.buildingKey);
 

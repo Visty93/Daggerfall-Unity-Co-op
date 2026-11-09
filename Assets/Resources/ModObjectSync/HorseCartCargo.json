@@ -1,0 +1,84 @@
+{
+  "Profiles": [
+    {
+      "Id": "horse-cart-cargo-visuals",
+      "ModTitle": "Horse Cart and Cargo",
+      "Rules": [
+        {
+          "Id": "horse",
+          "ModRootName": "TrailingWagonHorseRoot",
+          "ObjectName": "TrailingWagonHorseRoot",
+          "Scope": "Exterior",
+          "Visual": "Custom",
+          "FactoryId": "dfucoop.runtime-motion-visual.v1",
+          "Motion": "Smooth",
+          "PreserveSourceParent": true,
+          "VisibilityMetres": 250,
+          "SyncActiveState": true,
+          "SyncParentActiveState": false,
+          "TrackOriginalParentLifetime": true,
+          "IncludeLights": false,
+          "IncludeAudio": false,
+          "PresentationSmoothingSeconds": 0.15,
+          "SpriteComponentType": "TrailingWagon.StationaryHorseBillboard",
+          "SpriteDirectionField": "lastOrientation",
+          "SpriteFrameField": "lastFrame",
+          "SpriteFlipField": "lastFlip",
+          "SpriteTextureFields": [
+            "textures",
+            "walkTextures"
+          ],
+          "SpriteTexturePattern": "^TrailingWagonHorseWalk_(?<direction>\\d+)_(?<frame>\\d+)$",
+          "SpriteDirections": 8,
+          "SpriteAngleSign": -1
+        },
+        {
+          "Id": "wagon",
+          "ModRootName": "TrailingWagonVisual",
+          "ObjectName": "TrailingWagonVisual",
+          "Scope": "Exterior",
+          "Visual": "Custom",
+          "FactoryId": "dfucoop.runtime-motion-visual.v1",
+          "Motion": "Smooth",
+          "PreserveSourceParent": true,
+          "VisibilityMetres": 250,
+          "SyncActiveState": true,
+          "SyncParentActiveState": false,
+          "TrackOriginalParentLifetime": true,
+          "IncludeLights": false,
+          "IncludeAudio": false,
+          "PresentationSmoothingSeconds": 0.15,
+          "ColliderMode": "Mesh",
+          "CarryLocalPlayer": true,
+          "MaxPassengerStepMetres": 3
+        },
+        {
+          "Id": "parked-wagon",
+          "Scope": "Exterior",
+          "Visual": "Custom",
+          "FactoryId": "dfucoop.runtime-motion-visual.v1",
+          "Motion": "Smooth",
+          "PreserveSourceParent": true,
+          "VisibilityMetres": 250,
+          "SyncActiveState": true,
+          "SyncParentActiveState": false,
+          "TrackOriginalParentLifetime": true,
+          "IncludeLights": false,
+          "IncludeAudio": false,
+          "PresentationSmoothingSeconds": 0.15,
+          "ColliderMode": "Mesh",
+          "ReferenceRootName": "Trailing Wagon",
+          "SourceType": "TrailingWagonRuntime",
+          "ReferenceFieldContains": [
+            "park",
+            "stationary",
+            "wagon",
+            "cart"
+          ],
+          "CarryLocalPlayer": true,
+          "MaxPassengerStepMetres": 3
+        }
+      ]
+    }
+  ]
+}

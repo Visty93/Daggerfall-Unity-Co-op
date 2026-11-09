@@ -226,6 +226,24 @@ private PlayerMultiplayer targetPlayer; // Cached reference
             get { return player; }
         }
 
+        // The original DFU player entity and its multiplayer network representation are
+        // different GameObjects. Only the local player's own target should affect the
+        // local PlayerEntity.EnemyAlertActive state, including when hosting alone.
+        public bool IsTargetingLocalPlayer
+        {
+            get
+            {
+                if (GameManager.Instance == null)
+                    return false;
+
+                if (!IsMultiplayerActive())
+                    return Target == GameManager.Instance.PlayerEntityBehaviour;
+
+                PlayerMultiplayer multiplayerTarget = GetPlayerMultiplayerFromBehaviour(Target);
+                return multiplayerTarget != null && multiplayerTarget.isLocalPlayer;
+            }
+        }
+
         private bool IsMultiplayerActive()
         {
             return NetworkServer.active || NetworkClient.active ||
@@ -1422,7 +1440,7 @@ public void SetTarget(DaggerfallEntityBehaviour newTarget)
             // If target is player and in sight then raise enemy alert on player
             // This can only be lowered again by killing an enemy or escaping for some amount of time
             // Any enemies actively targeting player will continue to raise alert state
-            if ((Target == GameManager.Instance.PlayerEntityBehaviour || IsCurrentPlayerTarget(Target)) && TargetInSight)
+            if (TargetInSight && IsTargetingLocalPlayer)
                 GameManager.Instance.PlayerEntity.SetEnemyAlert(true);
         }
 

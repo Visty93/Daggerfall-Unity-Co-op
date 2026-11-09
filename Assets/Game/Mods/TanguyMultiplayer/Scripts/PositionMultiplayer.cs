@@ -85,9 +85,10 @@ public class PositionMultiplayer : NetworkBehaviour
     [SyncVar] public string PartyLocationName = string.Empty;
     [SyncVar] public PartyLocationState PartyCurrentLocationState = PartyLocationState.Unknown;
 
-    // Numeric identity of the town currently containing this player. This is used only
-    // for mandatory NPC building-map reveals and is deliberately independent of both
-    // OptionsMultiplayer.sendLocation and shareCurrentLocationWithParty.
+    // Numeric identity of the town currently containing this player. Used for
+    // party-scoped building reveals (NPC directions and Info-mode clicks), independent
+    // of both OptionsMultiplayer.sendLocation and shareCurrentLocationWithParty.
+    // Keep the existing SyncVar name to preserve prefab serialization.
     // -1 means the player is not currently in a town exterior/building interior.
     [SyncVar] public int NpcBuildingRevealMapID = -1;
 
@@ -703,7 +704,7 @@ public class PositionMultiplayer : NetworkBehaviour
         dungeonInstanceId = string.Empty;
 
         // The HUD text can be hidden, but town identity must still be calculated for
-        // mandatory NPC building-map reveals. OptionsMultiplayer.sendLocation is also
+        // party-scoped building reveals. OptionsMultiplayer.sendLocation is also
         // intentionally not consulted here.
         if (gps == null)
             return false;
@@ -1035,16 +1036,17 @@ public class PositionMultiplayer : NetworkBehaviour
 
 
     // -------------------------------------------------------------------------
-    // Mandatory NPC building-map reveal sync.
+    // Party-scoped building discovery from NPC map marking and Info-mode clicks.
     //
     // This is intentionally separate from SendLocation()/OptionsMultiplayer.sendLocation.
-    // Only TalkManager's genuine "mark it on your map" result calls this path.
+    // Only explicit discovery actions call this path; ordinary door/quest discoveries
+    // continue to use PlayerGPS.DiscoverBuilding() locally.
     // -------------------------------------------------------------------------
 
-    public static void ShareNpcMarkedBuildingWithPlayersInTown(int mapID, int buildingKey)
+    public static void ShareDiscoveredBuildingWithParty(int mapID, int buildingKey)
     {
-        // Preserve normal single-player behavior without requiring TalkManager to know
-        // whether this component or a multiplayer session currently exists.
+        // Keep single-player discovery unchanged, and allow both TalkManager and
+        // PlayerActivate to call this without knowing the multiplayer session state.
         if ((!NetworkClient.active && !NetworkServer.active) || mapID < 0 || buildingKey == 0)
             return;
 
@@ -1054,13 +1056,13 @@ public class PositionMultiplayer : NetworkBehaviour
             PositionMultiplayer player = players[i];
             if (player != null && player.isLocalPlayer)
             {
-                player.RequestShareNpcMarkedBuilding(mapID, buildingKey);
+                player.RequestShareDiscoveredBuilding(mapID, buildingKey);
                 return;
             }
         }
     }
 
-    private void RequestShareNpcMarkedBuilding(int mapID, int buildingKey)
+    private void RequestShareDiscoveredBuilding(int mapID, int buildingKey)
     {
         if (!isLocalPlayer || mapID < 0 || buildingKey == 0)
             return;
@@ -1071,23 +1073,23 @@ public class PositionMultiplayer : NetworkBehaviour
         SendPartyLocationSnapshotIfChanged();
 
         int currentTownMapID;
-        if (!TryGetEligibleNpcBuildingRevealTownMapID(out currentTownMapID) ||
+        if (!TryGetEligibleBuildingRevealTownMapID(out currentTownMapID) ||
             currentTownMapID != mapID)
         {
             Debug.LogWarning(string.Format(
-                "[Multiplayer] Skipped NPC building reveal {0}/{1}: local player is no longer in that town.",
+                "[Multiplayer] Skipped building reveal {0}/{1}: local player is no longer in that town.",
                 mapID,
                 buildingKey));
             return;
         }
 
         if (isServer)
-            ServerShareNpcMarkedBuilding(mapID, buildingKey);
+            ServerShareDiscoveredBuilding(mapID, buildingKey);
         else
-            CmdShareNpcMarkedBuilding(mapID, buildingKey);
+            CmdShareDiscoveredBuilding(mapID, buildingKey);
     }
 
-    private bool TryGetEligibleNpcBuildingRevealTownMapID(out int mapID)
+    private bool TryGetEligibleBuildingRevealTownMapID(out int mapID)
     {
         mapID = -1;
         CacheLocalReferences();
@@ -1129,13 +1131,13 @@ public class PositionMultiplayer : NetworkBehaviour
     }
 
     [Command]
-    private void CmdShareNpcMarkedBuilding(int mapID, int buildingKey)
+    private void CmdShareDiscoveredBuilding(int mapID, int buildingKey)
     {
-        ServerShareNpcMarkedBuilding(mapID, buildingKey);
+        ServerShareDiscoveredBuilding(mapID, buildingKey);
     }
 
     [Server]
-    private void ServerShareNpcMarkedBuilding(int mapID, int buildingKey)
+    private void ServerShareDiscoveredBuilding(int mapID, int buildingKey)
     {
         if (mapID < 0 || buildingKey == 0)
             return;
@@ -1145,12 +1147,18 @@ public class PositionMultiplayer : NetworkBehaviour
         if (NpcBuildingRevealMapID != mapID)
         {
             Debug.LogWarning(string.Format(
-                "[Multiplayer] Rejected NPC building reveal {0}/{1}: sender town ID is {2}.",
+                "[Multiplayer] Rejected building reveal {0}/{1}: sender town ID is {2}.",
                 mapID,
                 buildingKey,
                 NpcBuildingRevealMapID));
             return;
         }
+
+        // Party membership must be resolved on the server. Never trust the client or
+        // use party-HUD display visibility to decide who may receive a discovery.
+        ulong sourcePartyId;
+        if (!MultiplayerPartyManager.ServerTryGetPartyId(netId, out sourcePartyId))
+            return;
 
         PositionMultiplayer[] players = FindObjectsOfType<PositionMultiplayer>();
         for (int i = 0; i < players.Length; i++)
@@ -1159,36 +1167,44 @@ public class PositionMultiplayer : NetworkBehaviour
             if (recipient == null || recipient == this)
                 continue;
 
-            // This test is evaluated only at reveal time. Nothing is queued for players
-            // who enter the town later.
+            // Both the exact town and authoritative party must match at reveal time.
+            // Nothing is queued for players who join the town or party later.
             if (recipient.NpcBuildingRevealMapID != mapID ||
-                recipient.connectionToClient == null)
+                recipient.connectionToClient == null ||
+                !MultiplayerPartyManager.ServerIsPlayerInParty(recipient.netId, sourcePartyId))
                 continue;
 
-            recipient.TargetReceiveNpcMarkedBuilding(
+            recipient.TargetReceiveDiscoveredBuilding(
                 recipient.connectionToClient,
                 mapID,
-                buildingKey);
+                buildingKey,
+                sourcePartyId);
         }
     }
 
     [TargetRpc]
-    private void TargetReceiveNpcMarkedBuilding(
+    private void TargetReceiveDiscoveredBuilding(
         NetworkConnection target,
         int mapID,
-        int buildingKey)
+        int buildingKey,
+        ulong sourcePartyId)
     {
-        if (!isLocalPlayer || mapID < 0 || buildingKey == 0)
+        if (!isLocalPlayer || mapID < 0 || buildingKey == 0 || sourcePartyId == 0UL)
+            return;
+
+        // A player may have switched parties while the RPC was in flight. The server
+        // validated membership when sending; recheck the local party before revealing.
+        if (MultiplayerPartyManager.GetLocalPartyId() != sourcePartyId)
             return;
 
         // Recheck locally in case this player left the town after the server selected
         // recipients but before the targeted RPC arrived.
         int currentTownMapID;
-        if (!TryGetEligibleNpcBuildingRevealTownMapID(out currentTownMapID) ||
+        if (!TryGetEligibleBuildingRevealTownMapID(out currentTownMapID) ||
             currentTownMapID != mapID)
         {
             Debug.Log(string.Format(
-                "[Multiplayer] Ignored NPC building reveal {0}/{1}: recipient changed location.",
+                "[Multiplayer] Ignored building reveal {0}/{1}: recipient changed location.",
                 mapID,
                 buildingKey));
             return;
@@ -1198,14 +1214,14 @@ public class PositionMultiplayer : NetworkBehaviour
         {
             gps.DiscoverBuilding(buildingKey);
             Debug.Log(string.Format(
-                "[Multiplayer] Received NPC building reveal {0}/{1} from another player in town.",
+                "[Multiplayer] Received party building reveal {0}/{1} from another player in town.",
                 mapID,
                 buildingKey));
         }
         catch (System.Exception ex)
         {
             Debug.LogError(string.Format(
-                "[Multiplayer] Failed to apply NPC building reveal {0}/{1}: {2}",
+                "[Multiplayer] Failed to apply party building reveal {0}/{1}: {2}",
                 mapID,
                 buildingKey,
                 ex.Message));

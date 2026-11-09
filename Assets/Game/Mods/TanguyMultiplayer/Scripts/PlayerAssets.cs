@@ -368,7 +368,8 @@ public class PlayerAssets : NetworkBehaviour
 
             currentHorseMounted =
                 transportManager != null &&
-                transportManager.TransportMode == TransportModes.Horse;
+                (transportManager.TransportMode == TransportModes.Horse ||
+                 transportManager.TransportMode == TransportModes.Cart);
         }
         catch
         {
@@ -1501,3 +1502,4 @@ public class PlayerAssets : NetworkBehaviour
     }
 
 }
+

@@ -1,0 +1,39 @@
+{
+  "Profiles": [
+    {
+      "Id": "climates-calories-camps",
+      "ModTitle": "Climates & Calories",
+      "Rules": [
+        {
+          "Id": "tent",
+          "SourceType": "ClimatesCalories.Camping",
+          "StaticField": "Tent",
+          "MapPixelField": "CampMapPixel",
+          "Scope": "Auto",
+          "Visual": "DaggerfallModel",
+          "ModelId": 41606,
+          "VisibilityMetres": 250,
+          "SyncActiveState": false,
+          "IncludeLights": true,
+          "IncludeAudio": true,
+          "TrackOriginalParentLifetime": true
+        },
+        {
+          "Id": "fire",
+          "SourceType": "ClimatesCalories.Camping",
+          "StaticField": "Fire",
+          "MapPixelField": "CampMapPixel",
+          "Scope": "Auto",
+          "Visual": "DaggerfallBillboard",
+          "Archive": 210,
+          "Record": 1,
+          "VisibilityMetres": 250,
+          "SyncActiveState": false,
+          "IncludeLights": true,
+          "IncludeAudio": true,
+          "TrackOriginalParentLifetime": true
+        }
+      ]
+    }
+  ]
+}

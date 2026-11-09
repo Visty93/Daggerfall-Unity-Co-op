@@ -1,6 +1,6 @@
-// LSO compatibility policy lives here. NetworkManager provides generic lifecycle hooks.
+// Companion session transitions for LSO and mod roots registered through MultiplayerAPI.
 // Uses the original NetworkClient and NetworkServer files; no replacement of either is required.
-// Install in the normal TanguyMultiplayer scripts folder, not Editor.
+// Co-op runtime companion-session compatibility.
 using System;
 using System.Collections.Generic;
 using System.Reflection;
@@ -9,6 +9,7 @@ using System.IO.Compression;
 using System.Text;
 using UnityEngine;
 using Mirror;
+using DaggerfallCoop.API;
 using FullSerializer;
 using DaggerfallWorkshop;
 using DaggerfallWorkshop.Utility;
@@ -117,12 +118,14 @@ public sealed class CompanionSessionCompatibility : MonoBehaviour
         instance = null;
     }
 
-    Transform FindParty(Transform actor)
+    Transform FindParty(Transform actor, bool requireLocalOwner = false)
     {
         for (Transform parent = actor.parent; parent != null; parent = parent.parent)
             foreach (string name in partyContainerNames)
                 if (!string.IsNullOrEmpty(name) && parent.name == name) return parent;
-        return null;
+        // Keep the exact local parent for registered hierarchies with nested slots.
+        return MultiplayerAPI.FindRegisteredCompanionRoot(actor.gameObject, requireLocalOwner) != null
+            ? actor.parent : null;
     }
 
     LocalActor Track(GameObject go)
@@ -471,14 +474,16 @@ public sealed class CompanionSessionCompatibility : MonoBehaviour
 
     bool RetainOnShutdown(NetworkIdentity identity)
     {
-        if (identity == null || FindParty(identity.transform) == null) return false;
+        if (identity == null) return false;
+        Transform party = FindParty(identity.transform, requireLocalOwner: true);
+        if (party == null) return false;
         var entity = identity.GetComponent<DaggerfallEntityBehaviour>();
         if (entity == null || entity.Entity == null || entity.Entity.CurrentHealth <= 0) return false;
         LocalActor local = Track(identity.gameObject);
         if (!local.restoring)
         {
             local.snapshot = TryCaptureForShutdown(local.go);
-            local.party = FindParty(local.go.transform);
+            local.party = party;
             local.playerOffset = GameManager.Instance != null && GameManager.Instance.PlayerObject != null
                 ? local.go.transform.position - GameManager.Instance.PlayerObject.transform.position : Vector3.zero;
             local.restoring = true;
@@ -513,7 +518,7 @@ public sealed class CompanionSessionCompatibility : MonoBehaviour
         foreach (LocalActor local in new List<LocalActor>(locals.Values))
         {
             if (local.go == null) continue;
-            if (local.restoring || FindParty(local.go.transform) != null)
+            if (local.restoring || FindParty(local.go.transform, requireLocalOwner: true) != null)
             {
                 if (local.snapshot == null) local.snapshot = TryCaptureForShutdown(local.go);
                 if (!local.restoring)

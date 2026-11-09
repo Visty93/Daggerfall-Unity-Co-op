@@ -9,13 +9,14 @@ using DaggerfallConnect.Arena2;
 using DaggerfallWorkshop;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.Items;
+using DaggerfallWorkshop.Game.Utility.ModSupport;
 using DaggerfallWorkshop.Game.Banking;
 using DaggerfallWorkshop.Game.Serialization;
 using DaggerfallWorkshop.Game.Questing;
 using DaggerfallWorkshop.Utility;
 using Mirror;
 using UnityEngine;
-using UnityEngine.SceneManagement;
+using UnityEngine.Profiling;
 
 public struct WcsContainerRequest : NetworkMessage
 {
@@ -68,6 +69,7 @@ public struct WcsCampReply : NetworkMessage
 // e:areas correspond to locally streamed DFU map-pixel terrains only.
 public struct WcsExteriorRequest : NetworkMessage
 {
+    public uint waShipId;
     public string area;
     public string key;
     public string items;
@@ -81,6 +83,7 @@ public struct WcsExteriorRequest : NetworkMessage
 }
 public struct WcsExteriorSnapshot : NetworkMessage
 {
+    public uint waShipId;
     public string area;
     public string key;
     // For a direct reply only: key used by the requesting client before
@@ -140,13 +143,13 @@ public struct WcsDepleted : NetworkMessage
 /// </summary>
 public sealed class WorldContainerSync : MonoBehaviour
 {
-    const string Tag = "[WorldContainerSync v1.3.4] ";
+    const string Tag = "[WorldContainerSync v1.3.5] ";
     const float ScanSeconds = 0.8f;
     const float PresenceSeconds = 2.0f;
     const float PresenceExpirySeconds = 8f;
     const float StateGraceSeconds = 12f;
     const float CampSettleSeconds = 3.0f;
-    const float EmptyCampDiscoverySeconds = 6f;
+    const float EmptyCampDiscoverySeconds = 15f;
     const float CampRetrySeconds = 3.0f;
     const float DepletionScanSeconds = 0.25f;
     const int MaxItemsText = 12288;
@@ -192,6 +195,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         public float Height;
         public bool Depleted;
         public uint SourcePlayer;
+        public uint WaShipId;
     }
     sealed class ExteriorInterest
     {
@@ -205,6 +209,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         public DaggerfallLoot Loot;
         public uint Id;
         public bool Ready, Replica, Depleted;
+        public uint WaShipId;
         public int WorldX, WorldZ;
         public float Height;
         public float LastRequest;
@@ -236,6 +241,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         public readonly List<DaggerfallLoot> Originals = new List<DaggerfallLoot>();
         public readonly Dictionary<DaggerfallLoot, bool> InitiallyActive = new Dictionary<DaggerfallLoot, bool>();
         public readonly List<DaggerfallLoot> Replicas = new List<DaggerfallLoot>();
+        public int LastDiscoveryFrame = -1;
         public float DiscoveredAt;
         public float LastRequest;
         public WcsCampContainer[] InitialManifest;
@@ -285,6 +291,24 @@ public sealed class WorldContainerSync : MonoBehaviour
         var obj = new GameObject("WorldContainerSync");
         DontDestroyOnLoad(obj);
         instance = obj.AddComponent<WorldContainerSync>();
+    }
+
+    void OnEnable()
+    {
+        StreamingWorld.OnUpdateTerrainsEnd += ScheduleCampDiscovery;
+        StreamingWorld.OnAvailableLocationGameObject += ScheduleCampDiscovery;
+        ScheduleCampDiscovery();
+    }
+
+    void OnDisable()
+    {
+        StreamingWorld.OnUpdateTerrainsEnd -= ScheduleCampDiscovery;
+        StreamingWorld.OnAvailableLocationGameObject -= ScheduleCampDiscovery;
+    }
+
+    void ScheduleCampDiscovery()
+    {
+        nextEmptyCampDiscovery = 0f;
     }
 
     // IMPORTANT: Mirror's transport connection can be established before the local
@@ -874,6 +898,13 @@ public sealed class WorldContainerSync : MonoBehaviour
         // No extra handling for CorpseMarker, DroppedLoot, ShopShelves, etc.
         if (!WorldContainerPolicy.Enabled || !Connected || loot == null || !IsNativeEligible(loot)) return true;
         if (instance == null) return true;
+        uint waShip;
+        if (WarmAshesShipMultiplayerCompatibility.IsWaLoot(loot) &&
+            (!WarmAshesShipMultiplayerCompatibility.TryLootShip(loot, out waShip) || !IsBound(loot)))
+        {
+            DaggerfallUI.AddHUDText("Wreck and treasure are synchronizing...");
+            return false;
+        }
         // Generic exterior replicas are explicitly registered and never re-register.
         if (loot.GetComponent<WorldContainerReplica>() != null)
         {
@@ -1001,6 +1032,9 @@ public sealed class WorldContainerSync : MonoBehaviour
     {
         if (!Connected) return;
         var areas = new List<string>();
+        // Prioritize hull pixels so a large terrain radius cannot exhaust the
+        // interest budget before distant wreck loot has been included.
+        WarmAshesShipMultiplayerCompatibility.AddInterestAreas(areas, MaxExteriorAreas);
         if (IsOutside())
         {
             var game = GameManager.Instance;
@@ -1011,7 +1045,7 @@ public sealed class WorldContainerSync : MonoBehaviour
                 {
                     if (areas.Count >= MaxExteriorAreas) break;
                     GameObject terrain = game.StreamingWorld.GetTerrainFromPixel(x, y);
-                    if (terrain != null && terrain.activeInHierarchy)
+                    if (terrain != null && terrain.activeInHierarchy && !areas.Contains(ExteriorArea(x, y)))
                         areas.Add(ExteriorArea(x, y));
                 }
         }
@@ -1043,7 +1077,7 @@ public sealed class WorldContainerSync : MonoBehaviour
     {
         int ver; string items;
         if (!LootCatcher.ServerReadWorldContainer(c.Id, out ver, out items)) return new WcsExteriorSnapshot();
-        return new WcsExteriorSnapshot { area = c.Area, key = c.Key,
+        return new WcsExteriorSnapshot { area = c.Area, key = c.Key, waShipId = c.WaShipId,
             lootId = c.Id, version = ver, items = items, depleted = c.Depleted,
             image = c.Image, archive = c.Archive, record = c.Record,
             worldX = c.WorldX, worldZ = c.WorldZ, height = c.Height, stockedDate = c.StockedDate };
@@ -1056,6 +1090,8 @@ public sealed class WorldContainerSync : MonoBehaviour
             m.items == null || m.items.Length > MaxItemsText ||
             !ValidExteriorIdentity(m.area, m.key, m.worldX, m.worldZ, m.height) ||
             m.archive < 0 || m.record < 0) return;
+        if (m.waShipId != 0 && !WarmAshesShipMultiplayerCompatibility.ValidateLoot(
+            conn, m.waShipId, m.worldX, m.worldZ, m.height, false)) return;
         NotePresence(conn, m.area);
         SharedExterior c;
         if (!serverExterior.TryGetValue(m.key, out c))
@@ -1076,8 +1112,17 @@ public sealed class WorldContainerSync : MonoBehaviour
             Debug.LogWarning(Tag + "Exterior key collision with different height/position: " + m.key);
             return;
         }
+        if (c != null && c.WaShipId != m.waShipId) return;
         if (c == null)
         {
+            // Only the first hull discoverer can add new piles to that hull's
+            // layout. Other peers may bind existing piles, never add rerolls.
+            if (m.waShipId != 0 && !WarmAshesShipMultiplayerCompatibility.ValidateLoot(
+                conn, m.waShipId, m.worldX, m.worldZ, m.height, true))
+            {
+                conn.Send(new WcsExteriorRejected { area = m.area, key = m.key });
+                return;
+            }
             // Only piles created by a DIFFERENT player are excluded. Same-player
             // clustered treasure is intentionally unaffected. Include adjacent
             // map pixels and already depleted locations to prevent instant rerolls.
@@ -1085,6 +1130,8 @@ public sealed class WorldContainerSync : MonoBehaviour
             bool blocked = false;
             foreach (var prior in serverExterior.Values)
             {
+                // WA uses the accepted hull/layout identity, not a 200m circle.
+                if (m.waShipId != 0 || prior.WaShipId != 0) continue;
                 if (prior.SourcePlayer == conn.identity.netId) continue;
                 long dx = (long)m.worldX - prior.WorldX;
                 long dz = (long)m.worldZ - prior.WorldZ;
@@ -1109,7 +1156,7 @@ public sealed class WorldContainerSync : MonoBehaviour
                 Id = id, StockedDate = m.stockedDate, Image = m.image,
                 Archive = m.archive, Record = m.record,
                 WorldX = m.worldX, WorldZ = m.worldZ, Height = m.height,
-                SourcePlayer = conn.identity.netId };
+                SourcePlayer = conn.identity.netId, WaShipId = m.waShipId };
             serverExterior.Add(m.key, c);
             Debug.Log(Tag + "First generic exterior container " + m.key + " id=" + id);
         }
@@ -1239,6 +1286,7 @@ public sealed class WorldContainerSync : MonoBehaviour
             // the player has already left. Native containers may outlive it.
             if (!IsOutside() ||
                 (ActiveTerrainForArea(pending.Snapshot.area) == null &&
+                 !WarmAshesShipMultiplayerCompatibility.HullReady(pending.Snapshot.waShipId) &&
                  !HasExteriorNativeForSnapshot(pending.Snapshot)))
             {
                 pendingExterior.Remove(pair.Key);
@@ -1283,6 +1331,8 @@ public sealed class WorldContainerSync : MonoBehaviour
 
     bool TryApplyExteriorSnapshot(WcsExteriorSnapshot m, bool allowReplica)
     {
+        // Delivery order alone is insufficient: the hull asset can fail to load.
+        if (m.waShipId != 0 && !WarmAshesShipMultiplayerCompatibility.HullReady(m.waShipId)) return false;
         LocalExterior local;
         localExterior.TryGetValue(m.key, out local);
         // On a direct reply, the server may have mapped our rounded key
@@ -1320,6 +1370,9 @@ public sealed class WorldContainerSync : MonoBehaviour
             return local.Id == m.lootId;
         }
         GameObject terrain = ActiveTerrainForArea(m.area);
+        Transform replicaParent = m.waShipId != 0
+            ? WarmAshesShipMultiplayerCompatibility.LootParent(m.waShipId)
+            : (terrain != null ? terrain.transform : null);
         DaggerfallLoot target = local != null ? local.Loot : null;
         if (target == null)
         {
@@ -1353,13 +1406,13 @@ public sealed class WorldContainerSync : MonoBehaviour
             }
         }
         bool replica = target == null;
-        if (replica && (!allowReplica || terrain == null)) return false;
+        if (replica && (!allowReplica || replicaParent == null)) return false;
         if (replica)
         {
             try
             {
                 target = CreateSafeTreasure(
-                    ExteriorLocalPose(m.worldX, m.worldZ, m.height), terrain.transform,
+                    ExteriorLocalPose(m.worldX, m.worldZ, m.height), replicaParent,
                     m.archive, m.record, m.lootId, InventoryContainerImages.Chest, true);
                 if (target == null) return false;
                 target.gameObject.name = "MP_Exterior_Container_" + m.lootId;
@@ -1373,6 +1426,7 @@ public sealed class WorldContainerSync : MonoBehaviour
                 return false;
             }
         }
+        WarmAshesShipMultiplayerCompatibility.BindLoot(target, m.waShipId);
         if (!LootCatcher.BindWorldContainer(m.lootId, m.version, target, m.items))
         {
             if (replica) Destroy(target.gameObject);
@@ -1394,6 +1448,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         local.WorldX = m.worldX;
         local.WorldZ = m.worldZ;
         local.Height = m.height;
+        local.WaShipId = m.waShipId;
         localExterior[m.key] = local;
         target.stockedDate = m.stockedDate;
         if (m.depleted) localDepleted.Add(m.lootId);
@@ -1490,9 +1545,8 @@ public sealed class WorldContainerSync : MonoBehaviour
                 PrestockNativeHouseContainer(loot);
             RegisterNative(loot, area);
         }
-        // Optional slower pass also finds camps with ZERO local loot objects.
-        // Without it, a client whose WoD randomly generated no containers could
-        // never become the first loader or receive another player's containers.
+        // Streaming events schedule discovery; the slower pass catches roots
+        // instantiated asynchronously after those events.
         if (Time.realtimeSinceStartup >= nextEmptyCampDiscovery)
         {
             nextEmptyCampDiscovery = Time.realtimeSinceStartup + EmptyCampDiscoverySeconds;
@@ -1538,6 +1592,8 @@ public sealed class WorldContainerSync : MonoBehaviour
     void RegisterExterior(DaggerfallLoot loot)
     {
         if (!IsGenericExteriorLoot(loot) || rejectedExterior.ContainsKey(loot)) return;
+        uint waShip;
+        if (!WarmAshesShipMultiplayerCompatibility.TryLootShip(loot, out waShip)) return;
         var preExistingSync = loot.GetComponent<LootMultiplayer>();
         if (preExistingSync != null && preExistingSync.lootId != 0 &&
             FindLocalExteriorByObject(loot) == null) return;
@@ -1587,7 +1643,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         { exteriorFirstSeen[loot] = Time.realtimeSinceStartup; return; }
         if (Time.realtimeSinceStartup - seen < ExteriorInitializeWait || !IsGenericInitialized(loot)) return;
         var c = new LocalExterior { Area = area, Key = key, Loot = loot,
-            WorldX = wx, WorldZ = wz, Height = height };
+            WorldX = wx, WorldZ = wz, Height = height, WaShipId = waShip };
         localExterior[key] = c;
         SendExteriorRequest(c);
     }
@@ -1617,6 +1673,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         }
         ApplyNativeTreasureAppearance(native, old.TextureArchive, old.TextureRecord, c.Id);
         c.Loot = native;
+        WarmAshesShipMultiplayerCompatibility.BindLoot(native, c.WaShipId);
         c.Replica = false;
         Destroy(old.gameObject);
         if (c.Depleted || localDepleted.Contains(c.Id)) native.gameObject.SetActive(false);
@@ -1627,12 +1684,13 @@ public sealed class WorldContainerSync : MonoBehaviour
     void SendExteriorRequest(LocalExterior c)
     {
         if (!Connected || c.Loot == null || !IsGenericInitialized(c.Loot) || c.Ready) return;
+        if (c.WaShipId != 0 && !WarmAshesShipMultiplayerCompatibility.HullReady(c.WaShipId)) return;
         // The frozen initial identity is intentional. Recomputing its rounded
         // coordinates while walking can give one physical pile several IDs.
         string contents = LootCatcher.SerializeLootItems(c.Loot);
         if (contents == null || contents.Length > MaxItemsText) return;
         c.LastRequest = Time.realtimeSinceStartup;
-        NetworkClient.Send(new WcsExteriorRequest { area = c.Area, key = c.Key, items = contents,
+        NetworkClient.Send(new WcsExteriorRequest { area = c.Area, key = c.Key, items = contents, waShipId = c.WaShipId,
             stockedDate = c.Loot.stockedDate, image = (int)c.Loot.ContainerImage,
             archive = c.Loot.TextureArchive, record = c.Loot.TextureRecord,
             worldX = c.WorldX, worldZ = c.WorldZ, height = c.Height });
@@ -1650,8 +1708,9 @@ public sealed class WorldContainerSync : MonoBehaviour
         foreach (var pair in new List<KeyValuePair<string, LocalExterior>>(localExterior))
         {
             var c = pair.Value;
-            bool sourceGone = c.Loot == null || (c.Replica
-                ? ActiveTerrainForArea(c.Area) == null
+            bool sourceGone = c.Loot == null || (c.WaShipId != 0 &&
+                !WarmAshesShipMultiplayerCompatibility.HullReady(c.WaShipId)) || (c.Replica
+                ? (c.WaShipId == 0 && ActiveTerrainForArea(c.Area) == null)
                 : c.Loot.transform.parent != null &&
                   !c.Loot.transform.parent.gameObject.activeInHierarchy);
             if (!IsOutside() || sourceGone)
@@ -1717,41 +1776,41 @@ public sealed class WorldContainerSync : MonoBehaviour
             record = c.Loot.TextureRecord });
     }
 
-    // Location Loader does not expose an ordinary DaggerfallLoot hook for a
-    // camp whose random configuration contains zero treasure. This infrequent,
-    // exterior-only pass recognizes camp prefab ROOTS (never arbitrary terrain
-    // containers) so an empty camp can legitimately win the first-loader race.
-    readonly List<GameObject> campSceneRoots = new List<GameObject>();
-    readonly Stack<Transform> campSearch = new Stack<Transform>();
+    // Empty camps have no DaggerfallLoot to discover through the regular scan.
+    // Resolve the mod component by type, then query only its loaded instances.
+    readonly List<Type> locationDataTypes = new List<Type>();
+    int locationDataAssemblyCount = -1;
 
-    IEnumerable<Transform> EnumerateExteriorTransforms()
+    void ResolveLocationDataTypes()
     {
-        campSearch.Clear();
-        // Include the persistent scene if it contains this helper. GetSceneAt excludes it.
-        Scene persistent = gameObject.scene;
-        bool includedPersistent = false;
-        for (int i = 0; i <= SceneManager.sceneCount; i++)
+        if (locationDataTypes.Count != 0) return;
+        Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+        if (assemblies.Length == locationDataAssemblyCount) return;
+        locationDataAssemblyCount = assemblies.Length;
+        foreach (Assembly assembly in assemblies)
         {
-            Scene scene = i < SceneManager.sceneCount ? SceneManager.GetSceneAt(i) : persistent;
-            if (i == SceneManager.sceneCount && includedPersistent) break;
-            if (scene == persistent) includedPersistent = true;
-            if (!scene.IsValid() || !scene.isLoaded) continue;
-            campSceneRoots.Clear();
-            if (campSceneRoots.Capacity < scene.rootCount + 1) campSceneRoots.Capacity = scene.rootCount + 1;
-            scene.GetRootGameObjects(campSceneRoots);
-            foreach (var root in campSceneRoots) campSearch.Push(root.transform);
-            while (campSearch.Count > 0)
-            {
-                Transform t = campSearch.Pop();
-                if (t == null || !t.gameObject.activeInHierarchy) continue;
-                // Skip whole retained hierarchies, not just their loot after enumerating them.
-                if (t.GetComponent<DaggerfallDungeon>() != null || t.GetComponent<DaggerfallInterior>() != null)
-                    continue;
-                yield return t;
-                for (int c = 0; c < t.childCount; c++) campSearch.Push(t.GetChild(c));
-            }
+            Type[] types;
+            try { types = assembly.GetTypes(); }
+            catch (ReflectionTypeLoadException error) { types = error.Types; }
+            catch (NotSupportedException) { continue; }
+            foreach (Type type in types)
+                if (type != null && type.Name == "LocationData" && !type.IsAbstract &&
+                    typeof(Component).IsAssignableFrom(type) &&
+                    (type.GetProperty("HasSpawnedDynamicObjects") != null ||
+                     type.GetField("HasSpawnedDynamicObjects") != null))
+                    locationDataTypes.Add(type);
         }
-        campSceneRoots.Clear();
+    }
+
+    static bool IsWorldOfDaggerfallEnabled()
+    {
+        var manager = ModManager.Instance;
+        if (manager == null) return false;
+        foreach (var mod in manager.Mods)
+            if (mod != null && mod.Enabled && string.Equals(mod.Title,
+                "World of Daggerfall", StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
     }
 
     void DiscoverEmptyCampRoots()
@@ -1759,23 +1818,38 @@ public sealed class WorldContainerSync : MonoBehaviour
         var game = GameManager.Instance;
         if (game == null || game.PlayerEnterExit == null ||
             game.PlayerEnterExit.IsPlayerInside || game.PlayerGPS == null ||
-            game.PlayerObject == null) return;
-        foreach (Transform t in EnumerateExteriorTransforms())
+            game.PlayerObject == null || !IsWorldOfDaggerfallEnabled()) return;
+
+        Profiler.BeginSample("WorldContainerSync.DiscoverEmptyCampRoots");
+        try
         {
-            if (t == null || !t.gameObject.activeInHierarchy ||
-                t.name.IndexOf("WOD_", StringComparison.OrdinalIgnoreCase) < 0 ||
-                t.name.IndexOf("Camp", StringComparison.OrdinalIgnoreCase) < 0)
-                continue;
-            // Avoid nested camp roots duplicating an outer camp object.
-            Transform root = t;
-            for (Transform parent = t.parent; parent != null; parent = parent.parent)
-                if (parent.name.IndexOf("WOD_", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                    parent.name.IndexOf("Camp", StringComparison.OrdinalIgnoreCase) >= 0)
-                { root = null; break; }
-            if (root == null) continue;
-            string area = CampArea(root);
-            if (!string.IsNullOrEmpty(area)) DiscoverCamp(area, root);
+            ResolveLocationDataTypes();
+            foreach (Type type in locationDataTypes)
+                foreach (var obj in UnityEngine.Object.FindObjectsOfType(type))
+                {
+                    var data = obj as Component;
+                    if (data == null || !data.gameObject.activeInHierarchy) continue;
+                    Transform root = data.transform;
+                    string rootName = root.name;
+                    if (rootName.IndexOf("WOD_", StringComparison.OrdinalIgnoreCase) < 0 ||
+                        rootName.IndexOf("Camp", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+
+                    // Skip nested camp roots, as in the original discovery pass.
+                    bool nested = false;
+                    for (Transform parent = root.parent; parent != null; parent = parent.parent)
+                    {
+                        string parentName = parent.name;
+                        if (parentName.IndexOf("WOD_", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            parentName.IndexOf("Camp", StringComparison.OrdinalIgnoreCase) >= 0)
+                        { nested = true; break; }
+                    }
+                    if (nested) continue;
+                    string area = CampArea(root);
+                    if (!string.IsNullOrEmpty(area)) DiscoverCamp(area, root);
+                }
         }
+        finally { Profiler.EndSample(); }
     }
 
     void DiscoverCamp(string area, Transform root)
@@ -1786,7 +1860,8 @@ public sealed class WorldContainerSync : MonoBehaviour
             camp = new LocalCamp { Area = area, Root = root, DiscoveredAt = Time.realtimeSinceStartup };
             localCamps[area] = camp;
         }
-        if (camp.Root != root) return; // ambiguous overlapping WOD roots: fail closed
+        if (camp.Root != root || camp.LastDiscoveryFrame == Time.frameCount) return;
+        camp.LastDiscoveryFrame = Time.frameCount;
         foreach (var loot in root.GetComponentsInChildren<DaggerfallLoot>(true))
         {
             if (loot == null || loot.ContainerType != LootContainerTypes.RandomTreasure || loot.GetComponent<WorldContainerReplica>() != null ||
@@ -2280,7 +2355,7 @@ public sealed class WorldContainerSync : MonoBehaviour
         var areas = new HashSet<string>();
         foreach (var c in serverContainers.Values) areas.Add(c.Area);
         foreach (var c in serverCamps.Values) areas.Add(c.Area);
-        foreach (var c in serverExterior.Values) areas.Add(c.Area);
+        foreach (var c in serverExterior.Values) if (c.WaShipId == 0) areas.Add(c.Area);
         foreach (var area in areas)
         {
             bool occupied = false;
@@ -2306,7 +2381,7 @@ public sealed class WorldContainerSync : MonoBehaviour
                 serverCamps.Remove(area);
             }
             foreach (var kv in new List<KeyValuePair<string, SharedExterior>>(serverExterior))
-                if (kv.Value.Area == area)
+                if (kv.Value.Area == area && kv.Value.WaShipId == 0)
                 {
                     serverReaders.Remove(kv.Value.Id);
                     LootCatcher.ServerForgetWorldContainer(kv.Value.Id);

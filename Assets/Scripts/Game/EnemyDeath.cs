@@ -132,7 +132,7 @@ namespace DaggerfallWorkshop.Game
             // If this is final enemy targeting player then alert state will remain clear
             // Other enemies still targeting player will continue to raise alert state every update
             EnemySenses senses = entityBehaviour.GetComponent<EnemySenses>();
-            if (senses && senses.Target == GameManager.Instance.PlayerEntityBehaviour)
+            if (senses && senses.IsTargetingLocalPlayer)
                 GameManager.Instance.PlayerEntity.SetEnemyAlert(false);
 
             // Raise static event

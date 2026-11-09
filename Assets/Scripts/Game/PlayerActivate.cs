@@ -1,4 +1,4 @@
-﻿// Project:         Daggerfall Unity
+// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -325,7 +325,7 @@ namespace DaggerfallWorkshop.Game
 
                 // Test ray against scene
                 RaycastHit hit;
-                bool hitSomething = Physics.Raycast(ray, out hit, RayDistance, playerLayerMask);
+                bool hitSomething = TryGetActivationHit(ray, out hit);
                 if (hitSomething)
                 {
                     if (TryActivateDownedMultiplayerPlayer(hit))
@@ -506,6 +506,50 @@ namespace DaggerfallWorkshop.Game
             return ray;
         }
 
+        // Keep the original activation layer mask: corpses and ordinary containers may
+        // legitimately use the Ignore Raycast layer. The local multiplayer proxy must
+        // be skipped by identity rather than excluding that whole layer.
+        bool TryGetActivationHit(Ray ray, out RaycastHit hit)
+        {
+            // Keep the fast single-hit path for ordinary interactions.
+            if (!Physics.Raycast(ray, out hit, RayDistance, playerLayerMask))
+                return false;
+
+            global::PlayerMultiplayer player = hit.collider != null
+                ? hit.collider.GetComponentInParent<global::PlayerMultiplayer>() : null;
+            if (player == null || !player.isLocalPlayer)
+                return true;
+
+            // Our local PlayerMultiplayer shell can overlap the camera ray. Only in
+            // that case, search the remaining hits for the nearest real target.
+            // Do not skip remote players or unrelated colliders.
+            RaycastHit[] hits = Physics.RaycastAll(ray, RayDistance, playerLayerMask);
+            float nearestDistance = float.MaxValue;
+            bool found = false;
+            for (int i = 0; i < hits.Length; i++)
+            {
+                RaycastHit candidate = hits[i];
+                if (candidate.collider == null)
+                    continue;
+
+                global::PlayerMultiplayer candidatePlayer =
+                    candidate.collider.GetComponentInParent<global::PlayerMultiplayer>();
+                if (candidatePlayer != null && candidatePlayer.isLocalPlayer)
+                    continue;
+
+                if (candidate.distance < nearestDistance)
+                {
+                    nearestDistance = candidate.distance;
+                    hit = candidate;
+                    found = true;
+                }
+            }
+
+            if (!found)
+                hit = default(RaycastHit);
+            return found;
+        }
+
         bool UpdateHeldRevive()
         {
             if (!MultiplayerRespawnManager.IsMultiplayerActive() || !Input.GetMouseButton(0))
@@ -626,6 +670,14 @@ namespace DaggerfallWorkshop.Game
                 PlayerGPS.DiscoveredBuilding db;
                 if (GameManager.Instance.PlayerGPS.GetDiscoveredBuilding(building.buildingKey, out db))
                 {
+                    // A deliberate Info-mode click shares this building with party members
+                    // currently in the same town. Clicking an already-known building also
+                    // shares it (useful if a party member arrived after its first reveal).
+                    // Single-player is unaffected by the network helper.
+                    global::PositionMultiplayer.ShareDiscoveredBuildingWithParty(
+                        GameManager.Instance.PlayerGPS.CurrentMapID,
+                        building.buildingKey);
+
                     // Check against quest system for an overriding quest-assigned display name for this building
                     DaggerfallUI.AddHUDText(db.displayName);
 
