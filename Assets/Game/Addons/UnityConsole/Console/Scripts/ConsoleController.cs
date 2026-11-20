@@ -26,7 +26,7 @@ namespace Wenzil.Console
         {
             /* This instantiation causes a bug when Unity rebuilds the project while in play mode
                Solution: move it to class level initialization, and make inputHistoryCapacity a const */
-            // inputHistory = new ConsoleInputHistory(inputHistoryCapacity); 
+            // inputHistory = new ConsoleInputHistory(inputHistoryCapacity);
         }
 
         void Start()
@@ -53,6 +53,18 @@ namespace Wenzil.Console
 
         void Update()
         {
+            if (global::OptionsMultiplayer.ClientConsoleCommandsBlocked)
+            {
+                // Block new commands and undo the reversible persistent cheats
+                // if they were enabled before connecting or before a host changed
+                // this permission. Do not override normal levitation unless noclip
+                // was actually enabled.
+                ResetClientConsoleCheats();
+                // If the host disables commands while the console is open,
+                // close via ToggleConsole so DFU restores the pause state.
+                if (ui != null && ui.isConsoleOpen) ui.ToggleConsole(true);
+                return;
+            }
             if (DaggerfallWorkshop.Game.InputManager.Instance.GetKeyDown(toggleKey))
                 ui.ToggleConsole();
             else if (DaggerfallWorkshop.Game.InputManager.Instance.GetBackButtonDown() && closeOnEscape)
@@ -63,6 +75,35 @@ namespace Wenzil.Console
                 NavigateInputHistory(false);
         }
 
+        private static void ResetClientConsoleCheats()
+        {
+            var game = DaggerfallWorkshop.Game.GameManager.Instance;
+            if (game == null || game.PlayerEntity == null)
+                return;
+
+            // tai disables local game AI, leaving it disabled even after the console
+            // can no longer be opened. Reset it as well when the host disallows commands.
+            if (game.DisableAI)
+                game.DisableAI = false;
+
+            // tgm / nt: local player flags toggled by DFU's console commands.
+            if (game.PlayerEntity.GodMode)
+                game.PlayerEntity.GodMode = false;
+            if (game.PlayerEntity.NoTargetMode)
+                game.PlayerEntity.NoTargetMode = false;
+
+            // tcl changes three things: the NoClipMode flag, levitation and
+            // the player collision layer. Reverse all three as one operation.
+            if (game.PlayerEntity.NoClipMode && game.PlayerMotor != null &&
+                game.PlayerController != null)
+            {
+                var levitate = game.PlayerMotor.GetComponent<DaggerfallWorkshop.Game.LevitateMotor>();
+                game.PlayerEntity.NoClipMode = false;
+                if (levitate != null) levitate.IsLevitating = false;
+                game.PlayerController.gameObject.layer = LayerMask.NameToLayer("Player");
+            }
+        }
+
         private void NavigateInputHistory(bool up)
         {
             string navigatedToInput = inputHistory.Navigate(up);
@@ -71,6 +112,11 @@ namespace Wenzil.Console
 
         private void ExecuteCommand(string input)
         {
+            if (global::OptionsMultiplayer.ClientConsoleCommandsBlocked)
+            {
+                Console.Log("Console commands are disabled by the host.");
+                return;
+            }
             string[] parts = input.Split(' ');
             string command = parts[0];
             string[] args = parts.Skip(1).ToArray();

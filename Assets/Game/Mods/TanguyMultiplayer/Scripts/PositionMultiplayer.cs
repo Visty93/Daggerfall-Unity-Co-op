@@ -78,7 +78,7 @@ public class PositionMultiplayer : NetworkBehaviour
     public float partyLocationCheckInterval = 0.75f;
 
     // Current location display for the light party HUD. This is deliberately separate
-    // from SendLocation()/cmdSendLocation()/rpcSendLocation(), which remain the existing
+    // from SendLocation()/cmdSendLocation()/TargetReceivePartyWorldMapLocation(), which remain the existing
     // shared map-discovery feature.
     [SyncVar] public bool PartyLocationShared = false;
     [SyncVar] public string PartyRegionName = string.Empty;
@@ -524,30 +524,45 @@ public class PositionMultiplayer : NetworkBehaviour
     [Command]
     void cmdSendLocation(string region, string location)
     {
-        rpcSendLocation(region, location);
+        // This is world-map location discovery, NOT party-scoped town building
+        // discovery. The host switch still enables/disables it for ALL parties.
+        if (!OptionsMultiplayer.sendLocation || string.IsNullOrEmpty(region) ||
+            string.IsNullOrEmpty(location) || region.Length > 128 || location.Length > 128)
+            return;
+        ulong partyId;
+        if (!MultiplayerPartyManager.ServerTryGetPartyId(netId, out partyId))
+            return;
+        foreach (NetworkConnection member in MultiplayerPartyManager.ServerGetPartyConnectionsByPartyId(partyId))
+        {
+            if (member == null || !member.isReady || member.identity == null ||
+                member.identity.netId == netId) continue;
+            PositionMultiplayer recipient = member.identity.GetComponent<PositionMultiplayer>();
+            if (recipient != null)
+                recipient.TargetReceivePartyWorldMapLocation(member, region, location);
+        }
     }
 
-    [ClientRpc]
-    void rpcSendLocation(string region, string location)
+    [TargetRpc]
+    void TargetReceivePartyWorldMapLocation(NetworkConnection recipient, string region, string location)
     {
-        if (!isLocalPlayer)
+        if (!isLocalPlayer || !NetworkClient.isConnected || !OptionsMultiplayer.sendLocation)
+            return;
+        try
         {
-            try
+            if (gps == null) CacheLocalReferences();
+            if (gps == null || DaggerfallUnity.Instance == null) return;
+            DFLocation discovered;
+            if (DaggerfallUnity.Instance.ContentReader.GetLocation(region, location, out discovered))
             {
-                if (DaggerfallUnity.Instance.ContentReader.GetLocation(region, location, out DFLocation loc))
-                {
-                    gps.DiscoverLocation(region, location);
-                    Debug.Log($"[Multiplayer] Discovered location {region}/{location}.");
-                }
-                else
-                {
-                    Debug.LogWarning($"[Multiplayer] Location not found: {region}/{location}. Skipping DiscoverLocation.");
-                }
+                gps.DiscoverLocation(region, location);
+                Debug.Log($"[Multiplayer] Party world-map location discovered: {region}/{location}.");
             }
-            catch (System.Exception ex)
-            {
-                Debug.LogError($"[Multiplayer] Exception in DiscoverLocation: {region}/{location} - {ex.Message}");
-            }
+            else
+                Debug.LogWarning($"[Multiplayer] Location not found: {region}/{location}.");
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"[Multiplayer] World-map location discovery failed: {region}/{location} - {ex.Message}");
         }
     }
 
@@ -577,6 +592,14 @@ public class PositionMultiplayer : NetworkBehaviour
 
             yield return new WaitForSecondsRealtime(Mathf.Max(0.25f, partyLocationCheckInterval));
         }
+    }
+
+    public void ForceSendPartyLocationNowForRest()
+    {
+        if (!isLocalPlayer ||
+            (SaveLoadManager.Instance != null && SaveLoadManager.Instance.LoadInProgress)) return;
+        CacheLocalReferences();
+        SendPartyLocationSnapshotIfChanged();
     }
 
     private void SendPartyLocationSnapshotIfChanged()

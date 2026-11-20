@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
 using Mirror;
@@ -33,6 +34,19 @@ namespace DaggerfallWorkshop.Game
             HalfHealth,
             FullHealth,
         }
+
+        // Only map metadata is indexed. This never constructs unloaded locations or buildings.
+        private sealed class SanctuarySite
+        {
+            public int regionIndex, locationIndex, worldX, worldZ;
+            public DFRegion.LocationTypes locationType;
+            public long distanceSquared;
+        }
+        private static readonly List<SanctuarySite> sanctuaryMapIndex = new List<SanctuarySite>();
+        private static bool sanctuaryMapIndexComplete;
+        // Candidate results are not cached permanently: modded building data may change.
+        private const int MaxSanctuaryBuildingChecksPerType = 60;
+        private const int MaxSanctuaryLocationReadsPerType = 256;
 
         private class RespawnMoveResult
         {
@@ -77,6 +91,15 @@ namespace DaggerfallWorkshop.Game
         int respawnSerial;
 
         public bool RespawnInProgress { get { return respawnInProgress; } }
+        public bool IsGroupWipeRespawnAllowed
+        {
+            get
+            {
+                if (!OptionsMultiplayer.requireLocalGroupWipe) return true;
+                global::PlayerMultiplayer player = global::PlayerMultiplayer.GetLocalPlayer();
+                return player != null && player.CanSelfRespawnAfterLocalWipe;
+            }
+        }
 
         void Awake()
         {
@@ -135,6 +158,9 @@ namespace DaggerfallWorkshop.Game
                 return;
 
             if (respawnInProgress)
+                return;
+
+            if (!IsGroupWipeRespawnAllowed)
                 return;
 
             if (!isActiveAndEnabled)
@@ -236,6 +262,12 @@ namespace DaggerfallWorkshop.Game
 
             bool diedInsideDungeon = playerEnterExit != null && playerEnterExit.IsPlayerInsideDungeon;
             bool diedInsideInterior = playerEnterExit != null && playerEnterExit.IsPlayerInside && !diedInsideDungeon;
+            // A local group wipe always exits the death dungeon, regardless of the
+            // ordinary inside/outside dungeon respawn preference.
+            bool requireSanctuary = OptionsMultiplayer.requireLocalGroupWipe ||
+                                    OptionsMultiplayer.nearestSanctuaryRespawn;
+            bool enteredSanctuary = false;
+            string sanctuaryBuildingLabel = string.Empty;
             bool moved = false;
             DFLocation deathLocation;
             bool hasDeathLocation = TryGetBestDeathLocation(out deathLocation);
@@ -253,7 +285,23 @@ namespace DaggerfallWorkshop.Game
             playerEntity.SetHealth(restoreHealth, true);
             playerEntity.SetFatigue(restoreFatigue, true);
 
-            if (diedInsideDungeon)
+            if (requireSanctuary)
+            {
+                RespawnMoveResult sanctuaryResult = new RespawnMoveResult();
+                yield return StartCoroutine(RespawnAtNearestSanctuaryRoutine(
+                    sanctuaryResult, label => sanctuaryBuildingLabel = label,
+                    hasDeathLocation ? deathLocation : default(DFLocation)));
+                moved = sanctuaryResult.Moved;
+                enteredSanctuary = moved;
+                if (moved)
+                {
+                    yield return WaitForTransitionSettle();
+                    if (IsTavernRespawnLabel(sanctuaryBuildingLabel))
+                        yield return MoveRespawnedTavernPlayerToRestMarkerRoutine("nearest-sanctuary");
+                }
+            }
+
+            if (!requireSanctuary && diedInsideDungeon)
             {
                 // Special/off-map dungeons have no usable exterior: retain their live start marker.
                 bool usableExterior = false;
@@ -278,7 +326,7 @@ namespace DaggerfallWorkshop.Game
                     yield return WaitForTransitionSettle();
             }
 
-            if (!moved && !diedInsideDungeon && hasDeathLocation)
+            if (!moved && !requireSanctuary && !diedInsideDungeon && hasDeathLocation)
             {
                 // Inspect the location's buildings regardless of its map classification.
                 // Small tavern sites qualify too; palace dungeon data must not override
@@ -294,9 +342,20 @@ namespace DaggerfallWorkshop.Game
                     yield return null;
                     CacheReferences();
                 }
-                moved = exteriorReady && TryEnterPreferredTownRespawnBuilding(deathLocation, out buildingLabel);
+                // A vampire already in a town should wake in that town's cemetery
+                // before considering the tavern. No remote graveyard dungeon travel.
+                if (exteriorReady && IsRespawningPlayerVampire() && IsTownOrCity(deathLocation) &&
+                    TryPlaceAtTownGraveyard(deathLocation, "current-town-graveyard"))
+                {
+                    moved = true;
+                    buildingLabel = "town-graveyard";
+                }
+                if (!moved)
+                    moved = exteriorReady && TryEnterPreferredTownRespawnBuilding(deathLocation, out buildingLabel);
                 if (moved)
                 {
+                    enteredSanctuary = true;
+                    sanctuaryBuildingLabel = buildingLabel;
                     Debug.Log("[MPRespawn] Respawned inside town " + buildingLabel + ". reason=" + reason);
                     yield return WaitForTransitionSettle();
                     if (IsTavernRespawnLabel(buildingLabel))
@@ -336,6 +395,35 @@ namespace DaggerfallWorkshop.Game
 
             CacheReferences();
 
+            bool graveyardRespawn = enteredSanctuary && moved && IsGraveyardRespawnLabel(sanctuaryBuildingLabel);
+            string healingMessage = graveyardRespawn
+                ? "You awaken among the gravestones, battered but still alive."
+                : null;
+            // The same optional healing fee applies to a successful graveyard, temple,
+            // or tavern sanctuary respawn. Non-sanctuary fallbacks and teammate revives
+            // remain free. Without enough gold, recovery is limited to 10% health.
+            if (enteredSanctuary && moved && OptionsMultiplayer.sanctuaryHealingFeeEnabled &&
+                playerEntity != null)
+            {
+                int level = Mathf.Clamp(playerEntity.Level, 1, 100);
+                int fee = level * Mathf.Clamp(OptionsMultiplayer.sanctuaryGoldPerLevel, 10, 1000);
+                bool paid = false;
+                if (playerEntity.GetGoldAmount() >= fee)
+                {
+                    int unpaid = playerEntity.DeductGoldAmount(fee);
+                    paid = unpaid == 0;
+                    if (!paid)
+                        Debug.LogWarning("[MPRespawn] Incomplete healing/burial fee deduction: " + unpaid + " gold remained.");
+                }
+
+                if (!paid)
+                    restoreHealth = Mathf.Clamp(Mathf.CeilToInt(playerEntity.MaxHealth * 0.10f), 1, playerEntity.MaxHealth);
+
+                healingMessage = graveyardRespawn
+                    ? CreateGraveyardCareMessage(paid, fee)
+                    : CreateSanctuaryCareMessage(IsTavernRespawnLabel(sanctuaryBuildingLabel), paid, fee);
+            }
+
             // Some transitions or collision correction can disturb vitals. Re-apply the
             // exact recovery values once so travel/transition code cannot silently fill fatigue.
             if (playerEntity != null)
@@ -362,6 +450,12 @@ namespace DaggerfallWorkshop.Game
             catch { }
 
             ForcePositionSync("mp-respawn-" + reason);
+            if (!string.IsNullOrEmpty(healingMessage))
+            {
+                // The player is already alive and safely placed before opening a popup.
+                yield return null;
+                DaggerfallUI.MessageBox(healingMessage);
+            }
 
             if (positionRefreshCoroutine != null)
                 StopCoroutine(positionRefreshCoroutine);
@@ -496,6 +590,232 @@ namespace DaggerfallWorkshop.Game
             // exterior should use the same coarse location fast-travel/start-marker placement
             // as the map travel point, not the exact physical dungeon entrance door.
             return TryRespawnAtLocationFastTravel(location, "dungeon-location-fast-travel-" + reason);
+        }
+
+        /// <summary>
+        /// Find a temple then tavern (non-vampire), or town graveyard then tavern
+        /// (vampire), within each settlement in distance order. Prefer the player's
+        /// own town when possible, without loading every town's scene.
+        /// Never search remote standalone graveyard dungeons as vampire sanctuaries.
+        /// </summary>
+        private IEnumerator RespawnAtNearestSanctuaryRoutine(RespawnMoveResult result,
+            Action<string> onBuildingEntered, DFLocation deathLocation)
+        {
+            if (result != null) result.Moved = false;
+            CacheReferences();
+            if (streamingWorld == null || playerGPS == null)
+                yield break;
+
+            bool vampire = IsRespawningPlayerVampire();
+            if (IsTownOrCity(deathLocation) && TryEnsureExterior("sanctuary-current-town"))
+            {
+                // TransitionExterior can finish its object cleanup next frame.
+                yield return null;
+                CacheReferences();
+                if (vampire && TryPlaceAtTownGraveyard(deathLocation, "vampire-current-town"))
+                {
+                    if (result != null) result.Moved = true;
+                    if (onBuildingEntered != null) onBuildingEntered("town-graveyard");
+                    yield break;
+                }
+
+                // Check this town's preferred option before moving to another town:
+                // temple then tavern for mortals; graveyard then tavern for vampires.
+                string localLabel;
+                if (TryEnterPreferredTownRespawnBuilding(deathLocation, out localLabel))
+                {
+                    if (result != null) result.Moved = true;
+                    if (onBuildingEntered != null) onBuildingEntered(localLabel);
+                    yield break;
+                }
+            }
+
+            // Cache only region map-table metadata; constructing locations is deferred.
+            // A cancelled respawn can safely restart indexing on the next attempt.
+            if (!sanctuaryMapIndexComplete)
+            {
+                sanctuaryMapIndex.Clear();
+                var map = DaggerfallUnity.Instance.ContentReader.MapFileReader;
+                for (int region = 0; region < map.RegionCount; region++)
+                {
+                    try
+                    {
+                        DFRegion regionData = map.GetRegion(region);
+                        if (regionData.MapTable != null)
+                        {
+                            for (int index = 0; index < regionData.LocationCount; index++)
+                            {
+                                var entry = regionData.MapTable[index];
+                                var type = entry.LocationType;
+                                if (type != DFRegion.LocationTypes.TownCity &&
+                                    type != DFRegion.LocationTypes.TownVillage &&
+                                    type != DFRegion.LocationTypes.TownHamlet &&
+                                    type != DFRegion.LocationTypes.ReligionTemple &&
+                                    type != DFRegion.LocationTypes.ReligionCult &&
+                                    type != DFRegion.LocationTypes.Tavern)
+                                    continue;
+                                DFPosition pixel = MapsFile.LongitudeLatitudeToMapPixel((int)entry.Longitude, entry.Latitude);
+                                DFPosition world = MapsFile.MapPixelToWorldCoord(pixel.X, pixel.Y);
+                                sanctuaryMapIndex.Add(new SanctuarySite {
+                                    regionIndex = region, locationIndex = index,
+                                    worldX = world.X, worldZ = world.Y, locationType = type,
+                                });
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning("[MPRespawn] Sanctuary map metadata region " + region + ": " + ex.Message);
+                    }
+                    if ((region & 3) == 3) yield return null;
+                }
+                sanctuaryMapIndexComplete = true;
+                Debug.Log("[MPRespawn] Sanctuary metadata indexed " + sanctuaryMapIndex.Count + " candidate settlements.");
+            }
+            if (sanctuaryMapIndex.Count == 0)
+                yield break;
+
+            int originX = playerGPS.WorldX, originZ = playerGPS.WorldZ;
+            global::PlayerMultiplayer local = global::PlayerMultiplayer.GetLocalPlayer();
+            PositionMultiplayer position = local != null ? local.GetComponent<PositionMultiplayer>() : null;
+            if (position != null && position.x > 0 && position.z > 0)
+            {
+                originX = position.x;
+                originZ = position.z;
+            }
+            // Copy metadata, since sorting the static index would scramble other callers.
+            var sorted = new List<SanctuarySite>(sanctuaryMapIndex);
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                long dx = (long)sorted[i].worldX - originX;
+                long dz = (long)sorted[i].worldZ - originZ;
+                sorted[i].distanceSquared = dx * dx + dz * dz;
+            }
+            sorted.Sort((a, b) => a.distanceSquared.CompareTo(b.distanceSquared));
+
+            var mapReader = DaggerfallUnity.Instance.ContentReader.MapFileReader;
+            // One distance-ordered pass for both player types. Per location, the
+            // building-entry routine already tries temple before tavern for mortals,
+            // and tavern only for vampires (after their cemetery check below).
+            // Preserve the old two-pass non-vampire search budget, but do not force
+            // players past a nearer inn just to find a temple in a distant town.
+            int maxInspections = MaxSanctuaryBuildingChecksPerType * (vampire ? 1 : 2);
+            int maxLocationReads = MaxSanctuaryLocationReadsPerType * (vampire ? 1 : 2);
+            int inspections = 0;
+            int locationsRead = 0;
+            foreach (SanctuarySite site in sorted)
+            {
+                if (inspections >= maxInspections || locationsRead >= maxLocationReads) break;
+                locationsRead++;
+                // Reading many distant location records can take time. Spread the
+                // rare broad searches over frames instead of producing a long hitch.
+                if ((locationsRead & 7) == 0) yield return null;
+                // Both temple and tavern can qualify for mortals. Vampires only
+                // seek a tavern if the current site's graveyard is unavailable.
+                DFLocation location;
+                try { location = mapReader.GetLocation(site.regionIndex, site.locationIndex); }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[MPRespawn] Sanctuary map location load failed: " + ex.Message);
+                    continue;
+                }
+                if (!location.Loaded) continue;
+
+                // A town GRVE block is an outdoor vampire destination, even if
+                // the town's building-list header contains no tavern. Consider it
+                // BEFORE the tavern of this same town, not before all taverns in
+                // every other town. Standalone graveyard locations are not indexed.
+                int graveX, graveY;
+                if (vampire && IsTownOrCity(location) &&
+                    TryFindTownGraveyardBlock(location, out graveX, out graveY))
+                {
+                    inspections++;
+                    RespawnMoveResult graveyardMove = new RespawnMoveResult();
+                    yield return RespawnAtLocationFastTravelRoutine(location, "nearest-town-graveyard", graveyardMove);
+                    if (graveyardMove.Moved)
+                    {
+                        // The location has finished streaming; probe real colliders
+                        // rather than trusting a guessed map-block centre.
+                        yield return null;
+                        if (TryPlaceAtTownGraveyard(location, "nearest-town-graveyard"))
+                        {
+                            if (result != null) result.Moved = true;
+                            if (onBuildingEntered != null) onBuildingEntered("town-graveyard");
+                            Debug.Log("[MPRespawn] Vampire respawned at town graveyard: " +
+                                location.Name + " region=" + location.RegionName);
+                            yield break;
+                        }
+                    }
+                    // If the graveyard cannot be reached safely, try the same
+                    // town's tavern below instead of accepting an unsafe point.
+                }
+
+                // Cheap MAPS.BSA header check for either acceptable building type.
+                // ReligionTemple/Cult and Tavern site classifications still get
+                // verified even when their building-list headers are incomplete.
+                bool listed = false;
+                if (location.Exterior.Buildings != null)
+                {
+                    foreach (var building in location.Exterior.Buildings)
+                    {
+                        if (building.BuildingType == DFLocation.BuildingTypes.Tavern ||
+                            (!vampire && building.BuildingType == DFLocation.BuildingTypes.Temple))
+                        {
+                            listed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!listed && !(site.locationType == DFRegion.LocationTypes.Tavern ||
+                    (!vampire && (site.locationType == DFRegion.LocationTypes.ReligionTemple ||
+                                  site.locationType == DFRegion.LocationTypes.ReligionCult))))
+                    continue;
+                inspections++;
+                bool verified = false;
+                try
+                {
+                    DFBlock[] blocks = RMBLayout.GetLocationBuildingData(location);
+                    int width = location.Exterior.ExteriorData.Width;
+                    for (int i = 0; i < blocks.Length; i++)
+                    {
+                        BuildingSummary[] buildings = RMBLayout.GetBuildingData(blocks[i], i % width, i / width);
+                        for (int b = 0; b < buildings.Length; b++)
+                        {
+                            if ((buildings[b].BuildingType != DFLocation.BuildingTypes.Tavern &&
+                                 (vampire || buildings[b].BuildingType != DFLocation.BuildingTypes.Temple)) ||
+                                buildings[b].FactionId == FightersGuildFactionId ||
+                                buildings[b].FactionId == (int)FactionFile.FactionIDs.Fighter_Trainers)
+                                continue;
+                            verified = true;
+                            break;
+                        }
+                        if (verified) break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[MPRespawn] Sanctuary building data failed for " + location.Name + ": " + ex.Message);
+                }
+                if (!verified) continue;
+
+                RespawnMoveResult moved = new RespawnMoveResult();
+                yield return RespawnAtLocationFastTravelRoutine(location, "nearest-sanctuary", moved);
+                if (!moved.Moved) continue;
+                // Teleport streaming may complete before the building directory exists.
+                yield return null;
+                string buildingLabel;
+                if (TryEnterPreferredTownRespawnBuilding(location, out buildingLabel))
+                {
+                    if (result != null) result.Moved = true;
+                    if (onBuildingEntered != null) onBuildingEntered(buildingLabel);
+                    Debug.Log("[MPRespawn] Nearest sanctuary entered: " + location.Name +
+                        " region=" + location.RegionName + " building=" + buildingLabel);
+                    yield break;
+                }
+                Debug.LogWarning("[MPRespawn] Verified sanctuary had no usable door: " + location.Name + ". Trying next.");
+                yield return null;
+            }
+            Debug.LogWarning("[MPRespawn] No enterable sanctuary found; using fee-free exterior fallback.");
         }
 
         private bool TryRespawnAtLocationFastTravel(DFLocation location, string reason)
@@ -879,6 +1199,138 @@ namespace DaggerfallWorkshop.Game
             }
         }
 
+        // Town graveyard blocks are exterior RMB blocks (GRVE*.RMB), not
+        // BuildingTypes and not the region's standalone Graveyard location type.
+        private bool TryFindTownGraveyardBlock(DFLocation location, out int blockX, out int blockY)
+        {
+            blockX = blockY = -1;
+            if (!IsTownOrCity(location)) return false;
+            DFLocation.ExteriorData exterior = location.Exterior.ExteriorData;
+            int width = exterior.Width;
+            int height = exterior.Height;
+            string[] blockNames = exterior.BlockNames;
+            if (width <= 0 || height <= 0 || blockNames == null) return false;
+            int count = Mathf.Min(blockNames.Length, width * height);
+            for (int i = 0; i < count; i++)
+            {
+                string name = blockNames[i];
+                if (string.IsNullOrEmpty(name) || !name.StartsWith("GRVE", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                // Accept decorative cemetery RMBs as well as ones with a crypt.
+                // Resolve the filename against the installed block archive, so a
+                // missing/replaced GRVE does not become an imaginary destination.
+                try
+                {
+                    string resolved = DaggerfallUnity.Instance.ContentReader.BlockFileReader.CheckName(name);
+                    if (string.IsNullOrEmpty(resolved) ||
+                        !resolved.StartsWith("GRVE", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[MPRespawn] Graveyard block validation failed: " + ex.Message);
+                    continue;
+                }
+                blockX = i % width;
+                blockY = i / width;
+                return true;
+            }
+            return false;
+        }
+
+        private bool TryPlaceAtTownGraveyard(DFLocation expectedLocation, string reason)
+        {
+            CacheReferences();
+            if (!IsTownOrCity(expectedLocation) || streamingWorld == null || playerTransform == null ||
+                playerEnterExit == null || playerEnterExit.IsPlayerInside)
+                return false;
+
+            // StreamingWorld.currentPlayerLocationObject is already a DaggerfallLocation.
+            DaggerfallLocation currentLocation = streamingWorld.currentPlayerLocationObject;
+            if (currentLocation == null || currentLocation.Summary.MapID != expectedLocation.MapTableData.MapId)
+                return false;
+
+            // Use the actual streamed layout when possible (including patched RMBs).
+            DFLocation liveData = currentLocation.Summary.LegacyLocation;
+            if (!liveData.Loaded) liveData = expectedLocation;
+            int blockX, blockY;
+            if (!TryFindTownGraveyardBlock(liveData, out blockX, out blockY))
+                return false;
+
+            try
+            {
+                // Same SW location origin and x/y RMB ordering used by
+                // DaggerfallLocation.LayoutLocation and StreamingWorld fast travel.
+                DFPosition tile = TerrainHelper.GetLocationTerrainTileOrigin(liveData);
+                Vector3 sw = new Vector3(tile.X * RMBLayout.RMBTileSide, 0f,
+                    tile.Y * RMBLayout.RMBTileSide);
+                float side = RMBLayout.RMBSide;
+                float baseX = sw.x + blockX * side;
+                float baseZ = sw.z + blockY * side;
+                float rayY = Mathf.Max(playerTransform.position.y, currentLocation.transform.position.y) + 180f;
+
+                CharacterController controller = playerTransform.GetComponent<CharacterController>();
+                float height = controller != null ? Mathf.Max(1f, controller.height) : 1.8f;
+                float radius = controller != null ? Mathf.Max(0.15f, controller.radius) : 0.4f;
+                // Check a handful of positions around paths/open areas, not just the
+                // block centre (which may be a tomb, wall, or grave decoration).
+                Vector2[] probes = {
+                    new Vector2(0.5f, 0.18f), new Vector2(0.18f, 0.5f),
+                    new Vector2(0.82f, 0.5f), new Vector2(0.5f, 0.82f),
+                    new Vector2(0.30f, 0.30f), new Vector2(0.70f, 0.30f),
+                    new Vector2(0.30f, 0.70f), new Vector2(0.70f, 0.70f),
+                    new Vector2(0.5f, 0.5f)
+                };
+                DFPosition pixel = MapsFile.LongitudeLatitudeToMapPixel(
+                    (int)liveData.MapTableData.Longitude, (int)liveData.MapTableData.Latitude);
+                for (int p = 0; p < probes.Length; p++)
+                {
+                    Vector3 top = new Vector3(baseX + probes[p].x * side, rayY,
+                        baseZ + probes[p].y * side);
+                    RaycastHit[] hits = Physics.RaycastAll(top, Vector3.down, 350f, ~0,
+                        QueryTriggerInteraction.Ignore);
+                    Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+                    for (int h = 0; h < hits.Length; h++)
+                    {
+                        RaycastHit hit = hits[h];
+                        if (hit.collider == null || hit.normal.y < 0.65f ||
+                            hit.collider.transform.IsChildOf(playerTransform)) continue;
+                        float feetY = hit.point.y + 0.15f;
+                        Vector3 bottom = new Vector3(top.x, feetY + radius, top.z);
+                        Vector3 capTop = new Vector3(top.x, feetY + height - radius, top.z);
+                        Collider[] overlaps = Physics.OverlapCapsule(bottom, capTop, radius * 0.88f,
+                            ~0, QueryTriggerInteraction.Ignore);
+                        bool blocked = false;
+                        foreach (Collider collider in overlaps)
+                        {
+                            if (collider != null && !collider.transform.IsChildOf(playerTransform))
+                            { blocked = true; break; }
+                        }
+                        if (blocked) continue;
+                        Vector3 destination = new Vector3(top.x, feetY + height * 0.5f, top.z);
+                        if (!TryInvokeStreamingWorldRepositionPlayer(pixel.X, pixel.Y,
+                            destination, false, reason + "-graveyard-block")) continue;
+                        // RepositionPlayer silently does nothing when terrain is missing.
+                        // Verify that we actually arrived at this block position.
+                        Vector3 actual = playerTransform.position;
+                        float dx = actual.x - destination.x, dz = actual.z - destination.z;
+                        if (dx * dx + dz * dz > 4f) continue;
+                        Debug.Log("[MPRespawn] Placed vampire at town GRVE block " +
+                            blockX + "/" + blockY + " name=" + liveData.Name +
+                            " position=" + actual + " reason=" + reason);
+                        return true;
+                    }
+                }
+                Debug.LogWarning("[MPRespawn] GRVE block found in " + liveData.Name +
+                    " but no safe outdoor placement; trying tavern instead.");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[MPRespawn] Town graveyard placement failed: " + ex.Message);
+            }
+            return false;
+        }
+
         private bool TryEnterPreferredTownRespawnBuilding(DFLocation expectedLocation, out string buildingLabel)
         {
             buildingLabel = string.Empty;
@@ -944,6 +1396,87 @@ namespace DaggerfallWorkshop.Game
             EntityEffectManager effects = GameManager.Instance != null
                 ? GameManager.Instance.PlayerEffectManager : null;
             return effects != null && effects.HasVampirism();
+        }
+
+        // Purely cosmetic variants for successful sanctuary entry. There are three
+        // temple and two inn variations per payment outcome. No level is shown,
+        // and failed entry never calls this method.
+        private string CreateSanctuaryCareMessage(bool tavern, bool paid, int fee)
+        {
+            string gold = fee.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+            // Temples have three variants per outcome; inns have two. All messages
+            // are listed verbatim in ALL_RESPAWN_MESSAGES.txt.
+            if (!tavern && paid)
+            {
+                switch (UnityEngine.Random.Range(0, 3))
+                {
+                    case 0:
+                        return "The temple priests tended to your wounds and charged you " + gold + " gold for their services.";
+                    case 1:
+                        return "You survived thanks to the temple priests' care. Their services cost you " + gold + " gold.";
+                    default:
+                        return "The temple healers brought you back from the brink of death. Their care cost you " + gold + " gold.";
+                }
+            }
+            if (!tavern)
+            {
+                switch (UnityEngine.Random.Range(0, 3))
+                {
+                    case 0:
+                        return "The temple priests took pity on you and tended to your wounds, but you still barely feel alive.";
+                    case 1:
+                        return "The priests offered you what care they could without payment. You're alive, but only just.";
+                    default:
+                        return "The temple healers treated your wounds without payment. You survived, though you can barely stand.";
+                }
+            }
+            int variant = UnityEngine.Random.Range(0, 2);
+            if (paid)
+            {
+                return variant == 0
+                    ? "The innkeeper took you in while you recovered. The room and care cost you " + gold + " gold."
+                    : "You survived with the innkeeper's help. Your recovery cost you " + gold + " gold.";
+            }
+            return variant == 0
+                ? "The innkeeper took pity on you and let you rest, but you still barely feel alive."
+                : "The innkeeper offered you shelter despite your empty purse. You're alive, but only just.";
+        }
+
+        // Vampire cemetery respawn uses the existing optional sanctuary fee.
+        // When fees are disabled, retain the original free graveyard message.
+        // The "mass grave" describes the recovery narrative, not a separate
+        // physical prop or different placement location within the cemetery.
+        private string CreateGraveyardCareMessage(bool paid, int fee)
+        {
+            if (paid)
+            {
+                string gold = fee.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+                switch (UnityEngine.Random.Range(0, 3))
+                {
+                    case 0:
+                        return "You awaken in a freshly dug grave. Your burial arrangements cost you " + gold + " gold.";
+                    case 1:
+                        return "Death could not hold you. You rise from your grave, " + gold + " gold poorer.";
+                    default:
+                        return "You awaken beside a modest tombstone. Your burial cost you " + gold + " gold.";
+                }
+            }
+
+            switch (UnityEngine.Random.Range(0, 3))
+            {
+                case 0:
+                    return "You awaken in a mass grave among the forgotten dead, barely able to move.";
+                case 1:
+                    return "Without gold for a proper burial, you were laid in a common grave. You rise with little strength.";
+                default:
+                    return "You claw your way out of a pauper's grave, weak and barely able to stand.";
+            }
+        }
+
+        private bool IsGraveyardRespawnLabel(string buildingLabel)
+        {
+            return !string.IsNullOrEmpty(buildingLabel) &&
+                buildingLabel.IndexOf("graveyard", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private bool IsTavernRespawnLabel(string buildingLabel)

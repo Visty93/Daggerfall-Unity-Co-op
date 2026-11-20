@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using DaggerfallConnect.Arena2;
 using DaggerfallConnect.Utility;
 using DaggerfallWorkshop.Game;
@@ -133,6 +133,60 @@ public class EnemyWorldPosition : NetworkBehaviour
     // frame and publishes it here.
     private const float OwnerWorldPublishInterval = 0.10f;
     private float nextOwnerWorldPublishTime = 0f;
+
+    // Fast-travel guard for ordinary, client-owned exterior foes.
+    // Keep the existing owner-relative world calculation and 819.2u frame wrapping;
+    // reject discontinuities instead of allowing the old enemy to inherit the new GPS.
+    // The limits are per accepted publish, not total distance travelled over a session.
+    // 800 DF units = 20 Unity metres; 4000 DF units = 100 Unity metres.
+    // Normal movement during a 0.1s publish period is far smaller than either.
+    private const int OwnerPlayerWorldJumpLimitDF = 800;
+    private const int OwnerEnemyWorldJumpLimitDF = 4000;
+
+    // A publisher anchor is scoped to ONE authority period and is advanced ONLY on
+    // a plausible publication. After fast travel it stays at the original location
+    // until ownership changes; transient seam/frame mismatches can settle and retry.
+    private bool ownerPublisherHasReference;
+    private int ownerPublisherPlayerX, ownerPublisherPlayerZ;
+    private int ownerPublisherEnemyX, ownerPublisherEnemyZ;
+    private float nextOwnerPublisherWarningAt;
+
+    // Defense in depth: discard discontinuous (including in-flight) owner commands
+    // on the server too. Never use the interpolated server transform for this check.
+    private NetworkConnectionToClient serverPublisherOwner;
+    private bool serverPublisherHasReference;
+    private float nextServerPublisherWarningAt;
+
+    private static long WorldDistanceSquared(int x1, int z1, int x2, int z2)
+    {
+        long dx = (long)x1 - x2;
+        long dz = (long)z1 - z2;
+        return dx * dx + dz * dz;
+    }
+
+    private static bool ExceedsWorldJump(int x1, int z1, int x2, int z2, int limit)
+    {
+        return WorldDistanceSquared(x1, z1, x2, z2) > (long)limit * limit;
+    }
+
+    private void ResetOwnerPublicationReference()
+    {
+        ownerPublisherHasReference = false;
+        nextOwnerWorldPublishTime = 0f;
+        nextOwnerPublisherWarningAt = 0f;
+    }
+
+    public override void OnStartAuthority()
+    {
+        base.OnStartAuthority();
+        ResetOwnerPublicationReference();
+    }
+
+    public override void OnStopAuthority()
+    {
+        base.OnStopAuthority();
+        ResetOwnerPublicationReference();
+    }
 
     // One exterior map-pixel terrain frame is 32768 DF units = 819.2 Unity units.
     // When baking DF coords from Unity offsets, normalize to the nearest terrain frame
@@ -285,8 +339,11 @@ public class EnemyWorldPosition : NetworkBehaviour
             GameManager.Instance.PlayerGPS == null)
             return;
 
+        // Exterior foe coordinates must not be rebased while the owner is inside
+        // a dungeon OR a building. Both transitions can change the player's local
+        // Unity frame before the exterior foe is handed to another simulator.
         if (GameManager.Instance.PlayerEnterExit != null &&
-            GameManager.Instance.PlayerEnterExit.IsPlayerInsideDungeon)
+            GameManager.Instance.PlayerEnterExit.IsPlayerInside)
             return;
 
         nextOwnerWorldPublishTime = Time.unscaledTime + OwnerWorldPublishInterval;
@@ -294,11 +351,51 @@ public class EnemyWorldPosition : NetworkBehaviour
         int baseWorldX = GameManager.Instance.PlayerGPS.WorldX;
         int baseWorldZ = GameManager.Instance.PlayerGPS.WorldZ;
 
+        // IMPORTANT: keep the pre-existing seam normalization exactly as before.
+        // In particular, +/-819.2 Unity frame changes must NOT become +/-32768 DF.
         Vector3 offset = NormalizeExteriorUnityOffset(transform.position - GameManager.Instance.PlayerObject.transform.position);
         int offsetX = Mathf.RoundToInt(offset.x * UnityToWorldUnit);
         int offsetZ = Mathf.RoundToInt(offset.z * UnityToWorldUnit);
+        int proposedX = baseWorldX + offsetX;
+        int proposedZ = baseWorldZ + offsetZ;
 
+        // Initial authority snapshot uses the server's SyncVar world coordinate as
+        // the enemy anchor. A newly owned enemy must not be freshly baked against a
+        // player who has already travelled away before the first owner publication.
+        // Do NOT trust the local 'initialized' flag here: it is not a SyncVar.
+        int previousWorldX = ownerPublisherHasReference ? ownerPublisherEnemyX : worldX;
+        int previousWorldZ = ownerPublisherHasReference ? ownerPublisherEnemyZ : worldZ;
+        bool enemyJump = ExceedsWorldJump(proposedX, proposedZ,
+            previousWorldX, previousWorldZ, OwnerEnemyWorldJumpLimitDF);
+        bool playerJump = ownerPublisherHasReference && ExceedsWorldJump(
+            baseWorldX, baseWorldZ, ownerPublisherPlayerX, ownerPublisherPlayerZ,
+            OwnerPlayerWorldJumpLimitDF);
+
+        if (enemyJump || playerJump || (!ownerPublisherHasReference &&
+            previousWorldX == 0 && previousWorldZ == 0))
+        {
+            // Do not alter the enemy's world coords or adopt the new GPS as an
+            // anchor. A one-frame seam mismatch may recover on the next sample;
+            // a genuine fast travel remains rejected until authority transfers.
+            if (Time.unscaledTime >= nextOwnerPublisherWarningAt)
+            {
+                Debug.LogWarning($"[EnemyWorldPosition][OwnerTravelGuard] Skipping owner update enemy='{name}' " +
+                    $"net={netId} player={baseWorldX}/{baseWorldZ} " +
+                    $"enemyOld={previousWorldX}/{previousWorldZ} proposed={proposedX}/{proposedZ} " +
+                    $"playerJump={playerJump} enemyJump={enemyJump}", this);
+                nextOwnerPublisherWarningAt = Time.unscaledTime + 3f;
+            }
+            return;
+        }
+
+        // Advance the local continuity anchors only for an accepted position.
+        // The server independently validates before changing its authoritative X/Z.
         CmdPublishAuthorityWorldPosition(baseWorldX, baseWorldZ, offsetX, offsetZ);
+        ownerPublisherHasReference = true;
+        ownerPublisherPlayerX = baseWorldX;
+        ownerPublisherPlayerZ = baseWorldZ;
+        ownerPublisherEnemyX = proposedX;
+        ownerPublisherEnemyZ = proposedZ;
     }
 
     [Command(requiresAuthority = true)]
@@ -307,13 +404,44 @@ public class EnemyWorldPosition : NetworkBehaviour
         if (BoundActorOwner() != 0 || isInteriorSpawn || isDungeonSpawn)
             return;
 
+        int proposedX = baseWorldX + offsetX;
+        int proposedZ = baseWorldZ + offsetZ;
+        NetworkConnectionToClient publishingOwner = netIdentity != null
+            ? netIdentity.connectionToClient : null;
+
+        // The owner can change while commands are in flight. Mirror checks Command
+        // authority, but also compare against the last accepted owner publication:
+        // do not let a fast-travelling client move a stationary foe's DF metadata.
+        bool sameOwner = serverPublisherHasReference &&
+            publishingOwner != null && publishingOwner == serverPublisherOwner;
+        bool ownerMovedTooFar = sameOwner && ExceedsWorldJump(
+            baseWorldX, baseWorldZ, playerWorldX, playerWorldZ,
+            OwnerPlayerWorldJumpLimitDF);
+        bool enemyMovedTooFar = initialized && ExceedsWorldJump(
+            proposedX, proposedZ, worldX, worldZ,
+            OwnerEnemyWorldJumpLimitDF);
+        if (ownerMovedTooFar || enemyMovedTooFar)
+        {
+            if (Time.unscaledTime >= nextServerPublisherWarningAt)
+            {
+                Debug.LogWarning($"[EnemyWorldPosition][ServerTravelGuard] Rejected owner coordinates " +
+                    $"enemy='{name}' net={netId} old={worldX}/{worldZ} " +
+                    $"proposed={proposedX}/{proposedZ} player={baseWorldX}/{baseWorldZ} " +
+                    $"ownerJump={ownerMovedTooFar} enemyJump={enemyMovedTooFar}", this);
+                nextServerPublisherWarningAt = Time.unscaledTime + 3f;
+            }
+            return;
+        }
+
+        serverPublisherOwner = publishingOwner;
+        serverPublisherHasReference = true;
         playerWorldX = baseWorldX;
         playerWorldZ = baseWorldZ;
         playerUnityPosition = Vector3.zero;
         spawnEnemyUnityPosition = transform.position;
 
-        worldX = baseWorldX + offsetX;
-        worldZ = baseWorldZ + offsetZ;
+        worldX = proposedX;
+        worldZ = proposedZ;
         mapPixel = MapsFile.WorldCoordToMapPixel(worldX, worldZ);
         worldBakedFromRequester = true;
 
@@ -435,6 +563,9 @@ public class EnemyWorldPosition : NetworkBehaviour
     public void ResumeRetainedActorNetworking()
     {
         StopAllCoroutines();
+        ResetOwnerPublicationReference();
+        serverPublisherHasReference = false;
+        serverPublisherOwner = null;
         retainedRuntimeStarted = false;
         initialized = false;
         Start();
@@ -443,6 +574,9 @@ public class EnemyWorldPosition : NetworkBehaviour
     public void ResetRetainedActorToLocal()
     {
         StopAllCoroutines();
+        ResetOwnerPublicationReference();
+        serverPublisherHasReference = false;
+        serverPublisherOwner = null;
         initialized = false;
         lastUnityPos = transform.position;
     }
@@ -873,8 +1007,29 @@ public class EnemyWorldPosition : NetworkBehaviour
         int offsetX = Mathf.RoundToInt(offset.x * UnityToWorldUnit);
         int offsetZ = Mathf.RoundToInt(offset.z * UnityToWorldUnit);
 
-        worldX = playerWorldX + offsetX;
-        worldZ = playerWorldZ + offsetZ;
+        int proposedX = playerWorldX + offsetX;
+        int proposedZ = playerWorldZ + offsetZ;
+
+        // After a remote owner travels away, the first server-side transform jump
+        // during authority handoff must not trigger a requester-based re-bake that
+        // moves this old enemy to that requester's new map position. This extra
+        // guard is scoped to enemies previously published by a remote owner;
+        // normal host-owned quest relocation keeps its existing behavior.
+        if (serverPublisherHasReference && ExceedsWorldJump(
+            proposedX, proposedZ, worldX, worldZ, OwnerEnemyWorldJumpLimitDF))
+        {
+            if (Time.unscaledTime >= nextServerPublisherWarningAt)
+            {
+                Debug.LogWarning($"[EnemyWorldPosition][ServerTravelGuard] Ignored post-handoff " +
+                    $"re-bake enemy='{name}' net={netId} kept={worldX}/{worldZ} " +
+                    $"proposed={proposedX}/{proposedZ} requester={requesterNetId}", this);
+                nextServerPublisherWarningAt = Time.unscaledTime + 3f;
+            }
+            return;
+        }
+
+        worldX = proposedX;
+        worldZ = proposedZ;
         mapPixel = MapsFile.WorldCoordToMapPixel(worldX, worldZ);
 
         Debug.Log($"[EnemyWorldPosition] Re-bake after teleport from {(worldBakedFromRequester ? "requester" : "closest")} " +

@@ -743,9 +743,10 @@ public class PlayerAssets : NetworkBehaviour
     // standing capsule bottom is -0.9 relative to the synced player root.
     // DFU PlayerHeightChanger shortens to 0.9 and moves that root DOWN by 0.45
     // on crouch; compensate visually without touching gameplay collision.
-    // A small additional visual correction for the transparent margin beneath
-    // paperdoll feet. Both poses share the same correction to keep ground contact.
-    // This affects only this local billboard; never the remote networked root.
+    // Match the small root/controller ground clearance used by normal player sprites.
+    // Additional transparency below the COMPOSED paperdoll feet is handled by
+    // the sprite pivot when the appearance texture is built (see below).
+    // This affects only the local billboard, never the remote networked root.
     const float PaperdollFootGroundCorrection = -0.06f;
     const float PaperdollStandingFootY = -0.90f + PaperdollFootGroundCorrection;
     const float PaperdollCrouchingFootY = -0.45f + PaperdollFootGroundCorrection;
@@ -1342,6 +1343,39 @@ public class PlayerAssets : NetworkBehaviour
             remotePaperdollObject.transform.rotation, targetRotation, rotationBlend);
     }
 
+    // The paperdoll texture includes a transparent margin below the character's
+    // feet. A sprite pivot at texture Y=0 anchors the EMPTY margin to the ground,
+    // leaving the visible shoes floating. Find the lowest reliably opaque row near
+    // the body's horizontal footprint, and place the pivot at that actual pixel row.
+    // This is evaluated only when an appearance changes, not every render frame.
+    // Ignore isolated alpha specks and extreme-side equipment (long weapons etc.).
+    static float GetRemotePaperdollFootPivotY(Color32[] pixels, int width, int height)
+    {
+        if (pixels == null || width <= 0 || height <= 0 ||
+            pixels.Length < width * height)
+            return 0f;
+
+        int firstX = Mathf.FloorToInt(width * 0.15f);
+        int lastX = Mathf.CeilToInt(width * 0.85f);
+        int maxRow = Mathf.Min(height - 1, Mathf.CeilToInt(height * 0.25f));
+        for (int y = 0; y <= maxRow; y++)
+        {
+            int solidPixels = 0;
+            int rowStart = y * width;
+            for (int x = firstX; x < lastX; x++)
+            {
+                // Paperdoll art is normally opaque, but low-alpha modded outlines
+                // must not determine where the character's feet touch the ground.
+                if (pixels[rowStart + x].a >= 128 && ++solidPixels >= 3)
+                    return (float)y / height;
+            }
+        }
+
+        // Unknown/custom body with no detectable foot pixels in the lower quarter:
+        // leave the old bottom-of-texture pivot rather than misaligning it.
+        return 0f;
+    }
+
     void BuildRemotePaperdoll(PaperdollVisualSnapshot snapshot)
     {
         try
@@ -1444,8 +1478,11 @@ public class PlayerAssets : NetworkBehaviour
                 snapshot.werebeast, items);
             Texture2D composed = sharedRemotePaperdollRenderer.PaperDollTexture;
             if (composed == null) return;
+            Color32[] paperdollPixels = composed.GetPixels32();
+            float footPivotY = GetRemotePaperdollFootPivotY(
+                paperdollPixels, composed.width, composed.height);
             Texture2D copy = new Texture2D(composed.width, composed.height, TextureFormat.ARGB32, false);
-            copy.SetPixels32(composed.GetPixels32());
+            copy.SetPixels32(paperdollPixels);
             copy.filterMode = DaggerfallUI.Instance != null ? DaggerfallUI.Instance.GlobalFilterMode : FilterMode.Point;
             copy.Apply();
             if (remotePaperdollObject == null)
@@ -1465,7 +1502,7 @@ public class PlayerAssets : NetworkBehaviour
             remotePaperdollTexture = copy;
             remotePaperdollSprite = Sprite.Create(copy,
                 new Rect(0, 0, copy.width, copy.height),
-                new Vector2(0.5f, 0f), copy.height / PaperdollWorldHeight);
+                new Vector2(0.5f, footPivotY), copy.height / PaperdollWorldHeight);
             remotePaperdollRenderer.sprite = remotePaperdollSprite;
             displayedPaperdollRevision = snapshot.revision;
         }

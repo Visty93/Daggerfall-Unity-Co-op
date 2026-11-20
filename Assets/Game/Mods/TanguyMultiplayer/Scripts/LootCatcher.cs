@@ -26,6 +26,8 @@ public class LootCatcher : NetworkBehaviour
     // WorldContainerSync uses the EXISTING loot edit protocol with distinct server IDs.
     // This set affects only newly registered world containers, never corpses or drops.
     static readonly HashSet<uint> sessionWorldContainerIds = new HashSet<uint>();
+    // A streamed inventory edit pins its record until the exact commit/ACK is sent.
+    static readonly HashSet<uint> deferredWorldContainerForget = new HashSet<uint>();
     // Lifetime only. Each player-owned LootCatcher represents one connection.
     static readonly Dictionary<uint, HashSet<LootCatcher>> droppedLootReaders =
         new Dictionary<uint, HashSet<LootCatcher>>();
@@ -95,6 +97,8 @@ public class LootCatcher : NetworkBehaviour
     public override void OnStopServer()
     {
         ReleaseDisconnectedEdits();
+        inboundUploads.Clear();
+        completedEdits.Clear();
         // Relay cleanup through a surviving player, not the despawning identity.
         LootCatcher survivor = null;
         foreach (NetworkIdentity identity in NetworkServer.spawned.Values)
@@ -188,31 +192,264 @@ public class LootCatcher : NetworkBehaviour
         }
     }
 
-    public uint RequestLootEdit(uint id, int version)
+    // Bounded, reliable inventory transfer. A complete serialized item list can be much
+    // larger than Mirror 57's WriteString limit. NEVER send it in a single string RPC.
+    // One 4 KiB binary fragment per ordered/reliable Command/TargetRpc/ClientRpc.
+    const int LootWireFragment = 4096;
+    const int LootWireMaxFragments = 2048; // 8 MiB safety ceiling, not a loot-item limit.
+    const int LootWireMaxAssemblies = 8; // per player, bounds incomplete transfers
+    const byte UploadBegin = 1, UploadCommit = 2, UploadDrop = 3, UploadLegacy = 4;
+    sealed class LootWireAssembly
     {
-        return ++nextEditRequest;
+        public byte[][] parts;
+        public int received;
+        public int bytes;
+        public LootWireAssembly(int count) { parts = new byte[count][]; }
+        public bool Add(int index, byte[] part)
+        {
+            if (index < 0 || index >= parts.Length || part == null || part.Length > LootWireFragment)
+                return false;
+            if (parts[index] == null)
+            {
+                parts[index] = part; received++; bytes += part.Length;
+            }
+            return received == parts.Length;
+        }
+        public string Read()
+        {
+            if (received != parts.Length) return null;
+            var bytesOut = new byte[bytes];
+            int offset = 0;
+            foreach (byte[] part in parts)
+            {
+                Buffer.BlockCopy(part, 0, bytesOut, offset, part.Length);
+                offset += part.Length;
+            }
+            return new System.Text.UTF8Encoding(false, true).GetString(bytesOut);
+        }
     }
+    readonly Dictionary<string, LootWireAssembly> inboundUploads = new Dictionary<string, LootWireAssembly>();
+    readonly Dictionary<uint, LootWireAssembly> inboundDownstream = new Dictionary<uint, LootWireAssembly>();
+    uint nextWireToken;
+    uint nextNonEditUpload;
+    static string UploadKey(uint id, uint request, byte phase)
+    {
+        return id.ToString() + ":" + request.ToString() + ":" + phase.ToString();
+    }
+    static byte[][] WireParts(string items)
+    {
+        byte[] bytes = System.Text.Encoding.UTF8.GetBytes(items ?? string.Empty);
+        int count = Math.Max(1, (bytes.Length + LootWireFragment - 1) / LootWireFragment);
+        if (count > LootWireMaxFragments)
+            throw new InvalidOperationException("Loot snapshot exceeds 8 MiB transfer safety limit.");
+        byte[][] parts = new byte[count][];
+        for (int i = 0; i < count; i++)
+        {
+            int len = Math.Min(LootWireFragment, bytes.Length - i * LootWireFragment);
+            parts[i] = new byte[len];
+            if (len > 0) Buffer.BlockCopy(bytes, i * LootWireFragment, parts[i], 0, len);
+        }
+        return parts;
+    }
+    void UploadLootText(uint id, uint request, byte phase, string items)
+    {
+        byte[][] parts = WireParts(items);
+        for (int i = 0; i < parts.Length; i++)
+            CmdLootUploadChunk(id, request, phase, i, parts.Length, parts[i]);
+    }
+    [Command]
+    void CmdLootUploadChunk(uint id, uint request, byte phase, int index, int count, byte[] chunk)
+    {
+        if (count < 1 || count > LootWireMaxFragments || index < 0 || index >= count ||
+            chunk == null || chunk.Length > LootWireFragment) return;
+        if (phase == UploadCommit)
+        {
+            LootEdit edit;
+            if (!lootEdits.TryGetValue(id, out edit) || edit.owner != this || edit.request != request)
+                return;
+        }
+        string key = UploadKey(id, request, phase);
+        LootWireAssembly a;
+        if (index == 0 || !inboundUploads.TryGetValue(key, out a) || a.parts.Length != count)
+        {
+            if (!inboundUploads.ContainsKey(key) && inboundUploads.Count >= LootWireMaxAssemblies)
+                return;
+            a = new LootWireAssembly(count);
+            inboundUploads[key] = a;
+        }
+        a.Add(index, chunk);
+    }
+    bool TakeUpload(uint id, uint request, byte phase, out string items)
+    {
+        string key = UploadKey(id, request, phase);
+        LootWireAssembly a;
+        items = null;
+        if (!inboundUploads.TryGetValue(key, out a) || a.received != a.parts.Length)
+            return false;
+        inboundUploads.Remove(key);
+        try { items = a.Read(); return items != null; }
+        catch (Exception ex) { Debug.LogError("[LootWire] Invalid upload: " + ex); return false; }
+    }
+    uint SendTargetLootText(NetworkConnection conn, string items)
+    {
+        uint token = ++nextWireToken;
+        byte[][] parts = WireParts(items);
+        for (int i = 0; i < parts.Length; i++)
+            TargetLootWireChunk(conn, token, i, parts.Length, parts[i]);
+        return token;
+    }
+    uint SendBroadcastLootText(string items)
+    {
+        uint token = ++nextWireToken;
+        byte[][] parts = WireParts(items);
+        for (int i = 0; i < parts.Length; i++)
+            RpcLootWireChunk(token, i, parts.Length, parts[i]);
+        return token;
+    }
+    [TargetRpc]
+    void TargetLootWireChunk(NetworkConnection conn, uint token, int index, int count, byte[] chunk)
+    {
+        AcceptDownstreamChunk(token, index, count, chunk);
+    }
+    [ClientRpc]
+    void RpcLootWireChunk(uint token, int index, int count, byte[] chunk)
+    {
+        AcceptDownstreamChunk(token, index, count, chunk);
+    }
+    void AcceptDownstreamChunk(uint token, int index, int count, byte[] chunk)
+    {
+        if (count < 1 || count > LootWireMaxFragments || index < 0 || index >= count ||
+            chunk == null || chunk.Length > LootWireFragment) return;
+        LootWireAssembly a;
+        if (index == 0 || !inboundDownstream.TryGetValue(token, out a) || a.parts.Length != count)
+        {
+            if (!inboundDownstream.ContainsKey(token) && inboundDownstream.Count >= LootWireMaxAssemblies)
+                return;
+            a = new LootWireAssembly(count);
+            inboundDownstream[token] = a;
+        }
+        a.Add(index, chunk);
+    }
+    bool TakeDownstreamText(uint token, out string items)
+    {
+        items = null;
+        LootWireAssembly a;
+        if (!inboundDownstream.TryGetValue(token, out a) || a.received != a.parts.Length)
+        {
+            Debug.LogError("[LootWire] Missing reliable downstream fragments token=" + token);
+            return false;
+        }
+        inboundDownstream.Remove(token);
+        try { items = a.Read(); return items != null; }
+        catch (Exception ex) { Debug.LogError("[LootWire] Invalid downstream UTF8: " + ex); return false; }
+    }
+
+    // Receipts survive a lost/delayed TargetRpc so re-sending the exact same commit
+    // yields an ACK, not a second item transfer. Removed only after client confirms.
+    sealed class LootCommitReceipt
+    {
+        public int version;
+        public string items;
+    }
+    readonly Dictionary<ulong, LootCommitReceipt> completedEdits = new Dictionary<ulong, LootCommitReceipt>();
+    static ulong EditKey(uint id, uint request) { return ((ulong)id << 32) | request; }
+    sealed class PendingClientEdit
+    {
+        public uint id, request;
+        public string items;
+        public string[] consumed;
+        public float retryAt;
+        public int attempts;
+    }
+    readonly Dictionary<ulong, PendingClientEdit> pendingClientEdits = new Dictionary<ulong, PendingClientEdit>();
+
+    // The player NetworkBehaviour, not the disposable corpse marker, owns retries.
+    // Closing an inventory or unloading a corpse therefore never traps an open UI.
+    void Update()
+    {
+        if (!isLocalPlayer || !NetworkClient.active || pendingClientEdits.Count == 0) return;
+        foreach (var pair in new List<PendingClientEdit>(pendingClientEdits.Values))
+        {
+            if (Time.realtimeSinceStartup >= pair.retryAt)
+                SendPendingCommit(pair);
+        }
+    }
+    void SendPendingCommit(PendingClientEdit edit)
+    {
+        edit.retryAt = Time.realtimeSinceStartup + 6f; // retry cadence, NOT a lock expiry.
+        ++edit.attempts;
+        try
+        {
+            UploadLootText(edit.id, edit.request, UploadCommit, edit.items);
+            CmdCommitLootEdit(edit.id, edit.request, edit.consumed);
+            if (edit.attempts > 1)
+                Debug.LogWarning("[LootWire] Retried commit id=" + edit.id + " request=" + edit.request + " attempt=" + edit.attempts);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[LootWire] Commit transport failure, retry retained: " + ex);
+            if (edit.attempts == 1)
+                DaggerfallUI.AddHUDText("Loot transfer pending. You may close the inventory; retrying safely.");
+        }
+    }
+    public uint RequestLootEdit(uint id, int version) { return ++nextEditRequest; }
 
     public void SendLootEditRequest(uint id, int version, uint request, string partySelection = "")
     {
         if (!isLocalPlayer) return;
-        // Sample on an inventory action, not during the empty corpse-created callback.
-        // The action itself has not run: these are the pre-transfer contents.
         var corpse = IsCorpseLootId(id) ? FindLocalLootById(id) : null;
-        string corpseItems = corpse != null ? SerializeLootItems(corpse) : null;
-        CmdBeginLootEdit(id, version, request, corpseItems, partySelection);
+        string corpseItems = corpse != null && version == 0 ? SerializeLootItems(corpse) : string.Empty;
+        UploadLootText(id, request, UploadBegin, corpseItems);
+        CmdBeginLootEdit(id, version, request, partySelection);
     }
 
     public void CommitLootEdit(uint id, uint request, string items, string[] partyConsumed = null)
     {
-        if (isLocalPlayer) CmdCommitLootEdit(id, request, items, partyConsumed);
+        if (!isLocalPlayer) return;
+        ulong key = EditKey(id, request);
+        PendingClientEdit pending;
+        if (!pendingClientEdits.TryGetValue(key, out pending))
+        {
+            pending = new PendingClientEdit { id = id, request = request,
+                items = items ?? string.Empty, consumed = partyConsumed };
+            pendingClientEdits[key] = pending;
+        }
+        SendPendingCommit(pending);
+    }
+
+    // Explicit cancellation is only legal BEFORE the local inventory action ran.
+    // A committed local action must be delivered, never silently rolled back.
+    public void CancelUnexecutedLootEdit(uint id, uint request)
+    {
+        if (isLocalPlayer && id != 0 && request != 0)
+            CmdCancelUnexecutedLootEdit(id, request);
+    }
+    [Command]
+    void CmdCancelUnexecutedLootEdit(uint id, uint request)
+    {
+        inboundUploads.Remove(UploadKey(id, request, UploadBegin));
+        inboundUploads.Remove(UploadKey(id, request, UploadCommit));
+        if (completedEdits.ContainsKey(EditKey(id, request))) return;
+        LootEdit edit;
+        if (!lootEdits.TryGetValue(id, out edit) || edit.owner != this || edit.request != request)
+            return;
+        // No client commit was received: this request is declared unexecuted.
+        lootEdits.Remove(id);
+        PartyQuestLootOverlay.ServerCommit(netId, id, request, null);
+        if (deferredWorldContainerForget.Contains(id)) ServerForgetWorldContainer(id);
+        Debug.Log("[LootTransaction] canceled unexecuted request=" + request + " lootId=" + id);
     }
 
     [Command]
-    void CmdBeginLootEdit(uint id, int version, uint request, string corpseItems, string partySelection)
+    void CmdBeginLootEdit(uint id, int version, uint request, string partySelection)
     {
-        // Commands are processed serially: only the first valid initial snapshot wins.
-        // Other clients must match its contents and version before they can edit it.
+        string corpseItems;
+        if (!TakeUpload(id, request, UploadBegin, out corpseItems))
+        {
+            Debug.LogError("[LootWire] Incomplete begin snapshot; request=" + request + " lootId=" + id);
+            TargetLootEditGrant(connectionToClient, id, request, false, -1, SendTargetLootText(connectionToClient, ""));
+            return;
+        }
         if (!serverLootItemsById.ContainsKey(id))
             TryInitializePausedCorpse(id, version, corpseItems);
         string items;
@@ -221,7 +458,7 @@ public class LootCatcher : NetworkBehaviour
             !serverLootVersionById.TryGetValue(id, out current))
         {
             TraceLootPause("request-rejected", id, "reason=unregistered requester=" + netId + " request=" + request + " clientVersion=" + version);
-            TargetLootEditGrant(connectionToClient, id, request, false, -1, "");
+            TargetLootEditGrant(connectionToClient, id, request, false, -1, SendTargetLootText(connectionToClient, ""));
             return;
         }
         LootEdit edit;
@@ -229,18 +466,24 @@ public class LootCatcher : NetworkBehaviour
         bool sameCorpseContents = current != 0 || !clientInitializedCorpses.Contains(id) ||
             string.Equals(corpseItems, items, StringComparison.Ordinal);
         bool accepted = available && current == version && sameCorpseContents;
+        bool overlayRejected = false;
         if (accepted)
+        {
             accepted = PartyQuestLootOverlay.ServerReserve(connectionToClient, id, request, partySelection);
+            overlayRejected = !accepted;
+        }
         if (accepted)
             lootEdits[id] = new LootEdit { owner = this, request = request, startedRealtime = Time.realtimeSinceStartup };
         TraceLootPause(accepted ? "request-granted" : "request-rejected", id,
-            "reason=" + (accepted ? "ready" : (!available ? "reserved" : (current != version ? "version-mismatch" : "corpse-content-mismatch"))) +
+            "reason=" + (accepted ? "ready" : (!available ? "reserved" : (current != version ? "version-mismatch" :
+                (!sameCorpseContents ? "corpse-content-mismatch" : (overlayRejected ? "quest-reservation-refused" : "unknown"))))) +
             " requester=" + netId + " request=" + request + " clientVersion=" + version + " serverVersion=" + current +
             (!available ? " holder=" + (edit.owner != null ? edit.owner.netId.ToString() : "gone") +
                 " holderRequest=" + edit.request + " heldSeconds=" + (Time.realtimeSinceStartup - edit.startedRealtime).ToString("F3") : ""));
         Debug.Log("[LootTransaction] request=" + request + " lootId=" + id +
             " accepted=" + accepted + " version=" + current);
-        TargetLootEditGrant(connectionToClient, id, request, accepted, current, items);
+        TargetLootEditGrant(connectionToClient, id, request, accepted, current,
+            SendTargetLootText(connectionToClient, items));
     }
 
     // Only bridges the demonstrated paused-host initialization gap. It never
@@ -268,53 +511,102 @@ public class LootCatcher : NetworkBehaviour
     }
 
     [TargetRpc]
-    void TargetLootEditGrant(NetworkConnection target, uint id, uint request, bool accepted, int version, string items)
+    void TargetLootEditGrant(NetworkConnection target, uint id, uint request, bool accepted, int version, uint payload)
     {
+        string items;
+        if (!TakeDownstreamText(payload, out items))
+        {
+            // Missing grant is NOT permission to execute an inventory action.
+            if (accepted) CmdCancelUnexecutedLootEdit(id, request);
+            return;
+        }
         TraceLootPause("grant-received", id, "request=" + request + " accepted=" + accepted + " serverVersion=" + version);
         var loot = FindLocalLootById(id);
         var sync = loot == null ? null : loot.GetComponent<LootMultiplayer>();
-        if (sync != null && sync.ReceiveEditGrant(request, accepted, version, items))
-            return;
-        // Window/scene disappeared before permission arrived. No action occurred.
-        if (accepted) CmdCommitLootEdit(id, request, items, null);
+        try
+        {
+            if (sync != null && sync.ReceiveEditGrant(request, accepted, version, items)) return;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[LootTransaction] Grant callback failed, recovering reservation: " + ex);
+            if (sync != null && sync.EditGranted)
+            {
+                // Local action may already have transferred an item. Commit its real state.
+                sync.CompleteEdit();
+                return;
+            }
+            // Failure before an approved action ran: safe to cancel.
+            if (sync != null) sync.ClearUnexecutedRequest(request);
+        }
+        // The window/scene vanished before permission arrived. NO action ran.
+        if (accepted) CmdCancelUnexecutedLootEdit(id, request);
     }
 
     [Command]
-    void CmdCommitLootEdit(uint id, uint request, string items, string[] partyConsumed)
+    void CmdCommitLootEdit(uint id, uint request, string[] partyConsumed)
     {
+        ulong key = EditKey(id, request);
+        LootCommitReceipt receipt;
+        if (completedEdits.TryGetValue(key, out receipt))
+        {
+            // Re-send exactly the recorded result even if an empty drop has since
+            // been deleted, or someone else changed the same loot container.
+            TargetLootEditCommitted(connectionToClient, id, request, receipt.version,
+                SendTargetLootText(connectionToClient, receipt.items));
+            return;
+        }
         LootEdit edit;
         if (!lootEdits.TryGetValue(id, out edit) || edit.owner != this || edit.request != request)
-            return; // A repeated/stale commit can never be applied twice.
-
+        {
+            inboundUploads.Remove(UploadKey(id, request, UploadCommit));
+            return;
+        }
+        string items;
+        if (!TakeUpload(id, request, UploadCommit, out items))
+        {
+            Debug.LogWarning("[LootWire] Incomplete commit; reservation retained for exact retry lootId=" + id + " request=" + request);
+            return;
+        }
         string previous;
         int version;
         if (!serverLootItemsById.TryGetValue(id, out previous) ||
             !serverLootVersionById.TryGetValue(id, out version))
+        {
+            Debug.LogError("[LootWire] Reserved loot record disappeared id=" + id + " request=" + request);
             return;
-
-        // Reservation guarantees no competing inventory edit changed this state.
-        items = items ?? "";
+        }
         serverLootItemsById[id] = items;
         if (items != previous) ++version;
         serverLootVersionById[id] = version;
         TraceLootPause("commit", id, "requester=" + netId + " request=" + request + " heldSeconds=" + (Time.realtimeSinceStartup - edit.startedRealtime).ToString("F3"));
         PartyQuestLootOverlay.ServerCommit(netId, id, request, partyConsumed);
         lootEdits.Remove(id);
+        completedEdits[key] = new LootCommitReceipt { version = version, items = items };
         Debug.Log("[LootTransaction] committed request=" + request + " lootId=" + id + " version=" + version);
-
-        // Target ACK first: the editor stops protecting its local action before
-        // the ordinary broadcast. Other peers only apply the resulting snapshot.
-        TargetLootEditCommitted(connectionToClient, id, request, version, items);
+        TargetLootEditCommitted(connectionToClient, id, request, version,
+            SendTargetLootText(connectionToClient, items));
         rpcReplaceLootContents(id, version, items);
-        if (!IsCorpseLootId(id)) DeleteEmptyClosedDrop(id);
+        if (deferredWorldContainerForget.Contains(id)) ServerForgetWorldContainer(id);
+        else if (!IsCorpseLootId(id)) DeleteEmptyClosedDrop(id);
     }
 
     [TargetRpc]
-    void TargetLootEditCommitted(NetworkConnection target, uint id, uint request, int version, string items)
+    void TargetLootEditCommitted(NetworkConnection target, uint id, uint request, int version, uint payload)
     {
+        string items;
+        if (!TakeDownstreamText(payload, out items)) return; // sender retains its exact pending commit
+        pendingClientEdits.Remove(EditKey(id, request));
         var loot = FindLocalLootById(id);
         var sync = loot == null ? null : loot.GetComponent<LootMultiplayer>();
         if (sync != null) sync.ReceiveEditCommit(request, version, items);
+        // Receipt is confirmed after applying; no timeout or guessing is involved.
+        CmdConfirmLootEdit(id, request);
+    }
+    [Command]
+    void CmdConfirmLootEdit(uint id, uint request)
+    {
+        completedEdits.Remove(EditKey(id, request));
     }
 
     public void ApplyLootEditSnapshot(uint id, int version, string items)
@@ -347,7 +639,14 @@ public class LootCatcher : NetworkBehaviour
 
     public static void ServerForgetWorldContainer(uint id)
     {
-        if (!NetworkServer.active || !sessionWorldContainerIds.Remove(id)) return;
+        if (!NetworkServer.active || !sessionWorldContainerIds.Contains(id)) return;
+        if (lootEdits.ContainsKey(id))
+        {
+            deferredWorldContainerForget.Add(id);
+            return;
+        }
+        deferredWorldContainerForget.Remove(id);
+        sessionWorldContainerIds.Remove(id);
         serverLootItemsById.Remove(id);
         serverLootVersionById.Remove(id);
         lootEdits.Remove(id);
@@ -357,11 +656,19 @@ public class LootCatcher : NetworkBehaviour
     {
         foreach (uint id in new List<uint>(sessionWorldContainerIds))
         {
+            // A live session can unload an area while an edit is in progress.
+            // Full shutdown is different: all peers are gone and no commit can arrive.
+            if (NetworkServer.active && lootEdits.ContainsKey(id))
+            {
+                deferredWorldContainerForget.Add(id);
+                continue;
+            }
+            lootEdits.Remove(id);
             serverLootItemsById.Remove(id);
             serverLootVersionById.Remove(id);
-            lootEdits.Remove(id);
+            sessionWorldContainerIds.Remove(id);
+            deferredWorldContainerForget.Remove(id);
         }
-        sessionWorldContainerIds.Clear();
     }
 
     // Attach the existing LootMultiplayer to an ordinary, LOCAL non-networked
@@ -906,15 +1213,18 @@ public class LootCatcher : NetworkBehaviour
             if (serverLootVersionById.TryGetValue(appearance.id, out version) && serverLootItemsById.TryGetValue(appearance.id, out items))
             {
                 PartyQuestLootOverlay.ServerReplayCorpse(connectionToClient, appearance.id & ~CorpseLootIdFlag);
-                TargetCorpse(connectionToClient, request, appearance, version, items);
+                TargetCorpse(connectionToClient, request, appearance, version,
+                    SendTargetLootText(connectionToClient, items));
                 sent++;
             }
         }
         TargetCorpsePage(connectionToClient, request, cursor);
     }
     [TargetRpc]
-    void TargetCorpse(NetworkConnection target, uint request, CorpseAppearance appearance, int version, string items)
+    void TargetCorpse(NetworkConnection target, uint request, CorpseAppearance appearance, int version, uint payload)
     {
+        string items;
+        if (!TakeDownstreamText(payload, out items)) return;
         Transform root;
         if (request != replayRequest || replayArea == null || CurrentCorpseArea(out root) != replayArea || root != replayRoot) return;
         if (retiredCorpseIds.Contains(appearance.id)) return;
@@ -1285,7 +1595,9 @@ public class LootCatcher : NetworkBehaviour
             worldZ = (double)game.PlayerGPS.WorldZ + (double)(pos.z - player.z) * 40.0;
             exteriorY -= game.PlayerEnterExit.ExteriorParent.transform.position.y;
         }
-        cmdSpawnLoot(pos.x, pos.y, pos.z, items, parentName, exterior, worldX, worldZ, exteriorY);
+        uint upload = ++nextNonEditUpload;
+        UploadLootText(0, upload, UploadDrop, items);
+        cmdSpawnLoot(upload, pos.x, pos.y, pos.z, parentName, exterior, worldX, worldZ, exteriorY);
     }
 
     static bool IsLocalOnlyPrivateQuestLootItem(DaggerfallUnityItem item)
@@ -1671,8 +1983,10 @@ public class LootCatcher : NetworkBehaviour
     }
 
     [Command]
-    void cmdSpawnLoot(float x, float y, float z, string items, string parentName, bool exterior, double worldX, double worldZ, float exteriorY)
+    void cmdSpawnLoot(uint upload, float x, float y, float z, string parentName, bool exterior, double worldX, double worldZ, float exteriorY)
     {
+        string items;
+        if (!TakeUpload(0, upload, UploadDrop, out items)) return;
         uint lootId = nextServerLootId++;
         int version = 0;
 
@@ -1684,9 +1998,16 @@ public class LootCatcher : NetworkBehaviour
         rpcSpawnLoot(lootId, version, x, y, z, items, parentName, exterior, worldX, worldZ, exteriorY);
     }
 
-    [ClientRpc]
     void rpcSpawnLoot(uint lootId, int version, float x, float y, float z, string items, string parentName, bool exterior, double worldX, double worldZ, float exteriorY)
     {
+        uint payload = SendBroadcastLootText(items);
+        RpcSpawnLootPayload(lootId, version, x, y, z, payload, parentName, exterior, worldX, worldZ, exteriorY);
+    }
+    [ClientRpc]
+    void RpcSpawnLootPayload(uint lootId, int version, float x, float y, float z, uint payload, string parentName, bool exterior, double worldX, double worldZ, float exteriorY)
+    {
+        string items;
+        if (!TakeDownstreamText(payload, out items)) return;
         try
         {
             Vector3 pos = new Vector3(x, y, z);
@@ -2275,9 +2596,16 @@ public class LootCatcher : NetworkBehaviour
         pendingCorpseVersionById[id] = version;
     }
 
-    [ClientRpc]
     void rpcRegisterCorpseLoot(uint corpseLootId, int version, string authoritativeItems)
     {
+        uint payload = SendBroadcastLootText(authoritativeItems);
+        RpcRegisterCorpseLootPayload(corpseLootId, version, payload);
+    }
+    [ClientRpc]
+    void RpcRegisterCorpseLootPayload(uint corpseLootId, int version, uint payload)
+    {
+        string authoritativeItems;
+        if (!TakeDownstreamText(payload, out authoritativeItems)) return;
         if (retiredCorpseIds.Contains(corpseLootId)) return;
         try
         {
@@ -2363,12 +2691,16 @@ public class LootCatcher : NetworkBehaviour
             return;
 
         Debug.Log("[LootCatcher] Sending content update lootId=" + lootId + " baseVersion=" + baseVersion + " items=" + newSerializedItems);
-        cmdUpdateLootContents(lootId, baseVersion, newSerializedItems ?? string.Empty);
+        uint upload = ++nextNonEditUpload;
+        UploadLootText(lootId, upload, UploadLegacy, newSerializedItems ?? string.Empty);
+        cmdUpdateLootContents(lootId, baseVersion, upload);
     }
 
     [Command]
-    void cmdUpdateLootContents(uint lootId, int baseVersion, string newSerializedItems)
+    void cmdUpdateLootContents(uint lootId, int baseVersion, uint upload)
     {
+        string newSerializedItems;
+        if (!TakeUpload(lootId, upload, UploadLegacy, out newSerializedItems)) return;
         if (retiredCorpseIds.Contains(lootId)) return;
         if (!serverLootItemsById.ContainsKey(lootId))
         {
@@ -2381,12 +2713,14 @@ public class LootCatcher : NetworkBehaviour
                 // this pending state becomes the initial authoritative corpse state.
                 serverPendingUnknownCorpseItemsById[lootId] = newSerializedItems ?? string.Empty;
                 Debug.LogWarning("[LootCatcher] Queued update for unknown corpse lootId=" + lootId + " until server corpse publish. items=" + (newSerializedItems ?? string.Empty));
-                TargetAcknowledgePendingUnknownCorpseUpdate(connectionToClient, lootId, baseVersion, newSerializedItems ?? string.Empty);
+                TargetAcknowledgePendingUnknownCorpseUpdate(connectionToClient, lootId, baseVersion,
+                    SendTargetLootText(connectionToClient, newSerializedItems ?? string.Empty));
                 return;
             }
 
             Debug.LogWarning("[LootCatcher] Server rejected content update for unknown lootId=" + lootId);
-            TargetResyncLootContents(connectionToClient, lootId, 0, string.Empty, true);
+            TargetResyncLootContents(connectionToClient, lootId, 0,
+                SendTargetLootText(connectionToClient, string.Empty), true);
             return;
         }
 
@@ -2394,12 +2728,15 @@ public class LootCatcher : NetworkBehaviour
         // an unsolicited whole-container poll from an observer or an older build.
         int version;
         serverLootVersionById.TryGetValue(lootId, out version);
-        TargetResyncLootContents(connectionToClient, lootId, version, serverLootItemsById[lootId], false);
+        TargetResyncLootContents(connectionToClient, lootId, version,
+            SendTargetLootText(connectionToClient, serverLootItemsById[lootId]), false);
     }
 
     [TargetRpc]
-    void TargetResyncLootContents(NetworkConnection target, uint lootId, int version, string items, bool disable)
+    void TargetResyncLootContents(NetworkConnection target, uint lootId, int version, uint payload, bool disable)
     {
+        string items;
+        if (!TakeDownstreamText(payload, out items)) return;
         if (disable)
             ApplyDisableLootById(lootId);
         else
@@ -2407,8 +2744,10 @@ public class LootCatcher : NetworkBehaviour
     }
 
     [TargetRpc]
-    void TargetAcknowledgePendingUnknownCorpseUpdate(NetworkConnection target, uint lootId, int version, string items)
+    void TargetAcknowledgePendingUnknownCorpseUpdate(NetworkConnection target, uint lootId, int version, uint payload)
     {
+        string items;
+        if (!TakeDownstreamText(payload, out items)) return;
         try
         {
             DaggerfallLoot loot = FindLocalLootById(lootId);
@@ -2430,10 +2769,17 @@ public class LootCatcher : NetworkBehaviour
         }
     }
 
-    [ClientRpc]
     void rpcReplaceLootContents(uint lootId, int version, string items)
     {
-        ApplyReplaceLootContents(lootId, version, items);
+        uint payload = SendBroadcastLootText(items);
+        RpcReplaceLootContentsPayload(lootId, version, payload);
+    }
+    [ClientRpc]
+    void RpcReplaceLootContentsPayload(uint lootId, int version, uint payload)
+    {
+        string items;
+        if (TakeDownstreamText(payload, out items))
+            ApplyReplaceLootContents(lootId, version, items);
     }
 
     void ApplyReplaceLootContents(uint lootId, int version, string items)

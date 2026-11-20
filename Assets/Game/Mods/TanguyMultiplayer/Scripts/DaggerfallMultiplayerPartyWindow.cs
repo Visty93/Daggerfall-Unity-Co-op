@@ -352,7 +352,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             bool canTravel = CanTravelToMember(member);
             slot.travelButton.Enabled = canTravel;
 
-            UpdatePortrait(slot, member.assets);
+            UpdatePortrait(slot, member.assets, member.player);
 
             string name = member.assets.playerName ?? "Unknown";
             string job = string.IsNullOrEmpty(member.assets.job) ? "Unknown" : member.assets.job;
@@ -364,6 +364,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             string nameLine = member.isLocalPlayer ? name + " (You)" : name;
             if (isLeader)
                 nameLine += " (Leader)";
+            if (global::MultiplayerPartyPortraitStatus.IsDowned(member.player))
+                nameLine += " [DOWNED]";
             tokens.Add(new TextFile.Token() { text = nameLine, formatting = TextFile.Formatting.TextHighlight });
             tokens.Add(TextFile.CreateTextToken(string.Format(
                 "  {0}  Lv {1}",
@@ -736,16 +738,18 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             return Mathf.Max(0, rawFatigue) / multiplier;
         }
 
-        void UpdatePortrait(PartySlot slot, global::PlayerAssets assets)
+        void UpdatePortrait(PartySlot slot, global::PlayerAssets assets, global::PlayerMultiplayer player)
         {
             string archive = assets != null ? assets.faceArchive ?? string.Empty : string.Empty;
             int faceIndex = assets != null ? Mathf.Clamp(assets.faceIndex, 0, 9) : 0;
             string key = archive + ":" + faceIndex;
+            bool isDowned = global::MultiplayerPartyPortraitStatus.IsDowned(player);
+            string displayKey = key + (isDowned ? ":downed" : ":alive");
 
-            if (string.Equals(slot.portraitKey, key, StringComparison.Ordinal))
+            if (string.Equals(slot.portraitKey, displayKey, StringComparison.Ordinal))
                 return;
 
-            slot.portraitKey = key;
+            slot.portraitKey = displayKey;
             slot.portrait.BackgroundTexture = null;
 
             if (string.IsNullOrEmpty(archive))
@@ -754,7 +758,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             Texture2D texture;
             if (portraitCache.TryGetValue(key, out texture))
             {
-                slot.portrait.BackgroundTexture = texture;
+                slot.portrait.BackgroundTexture = global::MultiplayerPartyPortraitStatus.DisplayTexture(texture, isDowned);
                 return;
             }
 
@@ -765,7 +769,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 if (texture != null)
                 {
                     portraitCache[key] = texture;
-                    slot.portrait.BackgroundTexture = texture;
+                    slot.portrait.BackgroundTexture = global::MultiplayerPartyPortraitStatus.DisplayTexture(texture, isDowned);
                 }
             }
             catch (Exception ex)

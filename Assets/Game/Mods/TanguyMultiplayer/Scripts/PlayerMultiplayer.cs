@@ -205,6 +205,100 @@ public MultiplayerLifeState LifeState = MultiplayerLifeState.Alive;
 
 [SyncVar] public float LifeStateServerTime = 0f;
 
+// Sticky permission: once no living member remains in the local group, a later
+// arrival cannot revoke an already achieved wipe. Reset on each fresh death.
+[SyncVar] public bool LocalGroupWipeUnlocked = false;
+private float nextGroupWipeCheckTime;
+public bool CanSelfRespawnAfterLocalWipe
+{
+    get { return !OptionsMultiplayer.requireLocalGroupWipe || LocalGroupWipeUnlocked; }
+}
+
+[Server]
+private void ServerEvaluateLocalGroupWipe()
+{
+    if (!OptionsMultiplayer.requireLocalGroupWipe || LocalGroupWipeUnlocked ||
+        LifeState != MultiplayerLifeState.Downed || netId == 0U ||
+        Time.time - LifeStateServerTime < 0.75f)
+        return;
+
+    ulong ownParty;
+    if (!MultiplayerPartyManager.ServerTryGetPartyId(netId, out ownParty))
+        return; // Membership still settling: never grant permission prematurely.
+
+    PositionMultiplayer here = GetComponent<PositionMultiplayer>();
+    if (here == null || !here.EnemyInterestLocationKnown)
+        return;
+
+    foreach (var pair in NetworkServer.spawned)
+    {
+        NetworkIdentity identity = pair.Value;
+        if (identity == null || identity.netId == netId) continue;
+        PlayerMultiplayer other = identity.GetComponent<PlayerMultiplayer>();
+        if (other == null || !other.isActiveAndEnabled ||
+            other.LifeState != MultiplayerLifeState.Alive || other.PlayerMPCurrentHealth <= 0)
+            continue;
+        ulong otherParty;
+        if (!MultiplayerPartyManager.ServerTryGetPartyId(other.netId, out otherParty) || otherParty != ownParty)
+            continue;
+        PositionMultiplayer there = other.GetComponent<PositionMultiplayer>();
+        if (ServerSharesWipeArea(here, there))
+            return; // A currently present and living member can still revive us.
+    }
+
+    LocalGroupWipeUnlocked = true;
+    if (Debug.isDebugBuild)
+        Debug.Log("[MPGroupWipe] Unlocked self-respawn netId=" + netId + " party=" + ownParty);
+}
+
+private static bool ServerSharesWipeArea(PositionMultiplayer here, PositionMultiplayer there)
+{
+    if (here == null || there == null || !here.EnemyInterestLocationKnown ||
+        !there.EnemyInterestLocationKnown)
+        return false;
+    var a = here.EnemyInterestState;
+    var b = there.EnemyInterestState;
+    if (a != b)
+    {
+        // Exterior location and wilderness are both the same continuous world.
+        bool aExterior = a == PositionMultiplayer.PartyLocationState.Wilderness ||
+                         a == PositionMultiplayer.PartyLocationState.ExteriorLocation;
+        bool bExterior = b == PositionMultiplayer.PartyLocationState.Wilderness ||
+                         b == PositionMultiplayer.PartyLocationState.ExteriorLocation;
+        if (!aExterior || !bExterior) return false;
+    }
+    if (a == PositionMultiplayer.PartyLocationState.DungeonInterior)
+    {
+        if (!string.IsNullOrEmpty(here.EnemyInterestDungeonId) ||
+            !string.IsNullOrEmpty(there.EnemyInterestDungeonId))
+            return !string.IsNullOrEmpty(here.EnemyInterestDungeonId) &&
+                   string.Equals(here.EnemyInterestDungeonId, there.EnemyInterestDungeonId, StringComparison.Ordinal);
+        // Non-networked/special dungeons may not publish an instance ID. Treat
+        // matching entrance anchors AND the location identity as a conservative
+        // fallback, rather than incorrectly treating every dungeon as solo.
+        return here.x == there.x && here.z == there.z &&
+               !string.IsNullOrEmpty(here.EnemyInterestLocation) &&
+               string.Equals(here.EnemyInterestRegion, there.EnemyInterestRegion, StringComparison.Ordinal) &&
+               string.Equals(here.EnemyInterestLocation, there.EnemyInterestLocation, StringComparison.Ordinal);
+    }
+    if (a == PositionMultiplayer.PartyLocationState.BuildingInterior)
+        return here.EnemyInterestBuildingKey != 0 &&
+               here.EnemyInterestBuildingKey == there.EnemyInterestBuildingKey &&
+               here.NpcBuildingRevealMapID >= 0 &&
+               here.NpcBuildingRevealMapID == there.NpcBuildingRevealMapID;
+    if (a == PositionMultiplayer.PartyLocationState.Wilderness ||
+        a == PositionMultiplayer.PartyLocationState.ExteriorLocation)
+    {
+        long dx = (long)here.x - there.x;
+        long dz = (long)here.z - there.z;
+        // PositionMultiplayer x/z are DF-world coords: 40 units = 1 Unity metre.
+        long radius = Mathf.Clamp(OptionsMultiplayer.groupWipeExteriorRadiusMeters, 10, 500) * 40L;
+        return dx * dx + dz * dz <= radius * radius;
+    }
+    return false;
+}
+
+
 public const float ReviveInteractDistance = 3.25f;
 
 // Raycast can be slightly longer than the actual interaction distance so the player gets
@@ -326,6 +420,12 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
     void Update()
     {
         MaintainServerReviveHold();
+        if (isServer && OptionsMultiplayer.requireLocalGroupWipe &&
+            Time.realtimeSinceStartup >= nextGroupWipeCheckTime)
+        {
+            nextGroupWipeCheckTime = Time.realtimeSinceStartup + 0.25f;
+            ServerEvaluateLocalGroupWipe();
+        }
         SyncLocalPlayerHealthToMP();
         SyncLocalPlayerStealthAndConcealmentToMP();
         ApplyLifeStateVisualIfChanged(false);
@@ -852,8 +952,19 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
     }
 
     [Server]
-    private void ServerSetLifeState(MultiplayerLifeState newState, string reason)
+    private void ServerSetLifeState(MultiplayerLifeState newState, string reason, bool trustedRevive = false)
     {
+        if (newState == MultiplayerLifeState.Respawning &&
+            LifeState == MultiplayerLifeState.Downed &&
+            OptionsMultiplayer.requireLocalGroupWipe && !LocalGroupWipeUnlocked && !trustedRevive)
+        {
+            Debug.LogWarning("[MPGroupWipe] Rejected premature respawn netId=" + netId);
+            return;
+        }
+        if (newState == MultiplayerLifeState.Downed && LifeState != MultiplayerLifeState.Downed)
+            LocalGroupWipeUnlocked = false;
+        if (newState == MultiplayerLifeState.Alive)
+            LocalGroupWipeUnlocked = false;
         LifeState = newState;
         LifeStateServerTime = Time.time;
 
@@ -999,7 +1110,7 @@ private static readonly Dictionary<uint, float> playerGuardSpawnCooldowns = new 
 
         serverReviveTarget = 0;
         // Temporarily leave Downed so two players cannot spam multiple revive TargetRpcs.
-        targetPlayer.ServerSetLifeState(MultiplayerLifeState.Respawning, "revive-request-from-" + netId);
+        targetPlayer.ServerSetLifeState(MultiplayerLifeState.Respawning, "revive-request-from-" + netId, true);
         targetPlayer.TargetReviveDownedPlayer(targetConnection, netId, Mathf.Clamp(OptionsMultiplayer.reviveHealthPercent, 10, 50));
 
         Debug.Log("[PlayerRevive][ServerAccept] reviver=" + netId + " target=" + targetPlayerNetId + " healthPercent=" + OptionsMultiplayer.reviveHealthPercent);
@@ -2514,7 +2625,9 @@ public void CmdCreateFoes(
                 ewp.SetSpawnContext(isInteriorFromClient, this.netId);
 
             ewp.intendedSpawnPos = enemy.transform.position;
-            ewp.isCreateFoeWaveSpawn = true;
+            // Only a successfully resolved quest foe needs quest-wave settle/resnap.
+            // Console, FoeSpawner and other generic CmdCreateFoes actors must not be tagged.
+            ewp.isCreateFoeWaveSpawn = foeResource != null;
         }
 
         // If these are quest wave foes, bind on clients too so their QM tracks kills correctly
@@ -2738,12 +2851,18 @@ private void Srv_SpawnSingleQuestFoeInternal(
         var ni = go.GetComponent<NetworkIdentity>();
         if (!ni) ni = go.AddComponent<NetworkIdentity>();
 
+        // Private/party quest resources are requester-local, whereas shared/full
+        // quests can be resolved directly on the host.
+        bool actualQuestFoe = foeRes != null ||
+            ((privateQuestBinding || partyQuestBinding) &&
+             questUID != 0UL && !string.IsNullOrEmpty(foeSymbolOriginal));
+
         // Mark as quest-spawned & attach quest tracking so quest system recognizes it
         var dfEnemy = go.GetComponent<DaggerfallEnemy>();
         if (dfEnemy)
         {
             dfEnemy.LoadID = DaggerfallUnity.NextUID;
-            if (foeRes != null || privateQuestBinding || partyQuestBinding)
+            if (actualQuestFoe)
                 dfEnemy.QuestSpawn = true;
         }
 
@@ -2819,15 +2938,15 @@ private void Srv_SpawnSingleQuestFoeInternal(
             // physics/motor can pull them through stacked interior floors.
             //
             // The reaction/hostility payload above decides whether it is passive or
-            // aggressive; this flag should only control spawn settling/resnap.
-            ewp.isCreateFoeWaveSpawn = true;
+            // aggressive. A failed quest lookup is a normal foe, not a quest marker.
+            ewp.isCreateFoeWaveSpawn = actualQuestFoe;
 
-            // Preserve the actual Foe restraint separately from the generic settle
-            // marker. Ordinary passive enemies and unrestrained quest waves must not
-            // be pinned by the host after their finite spawn settle completes.
-            ewp.isFixedQuestFoeRestrained = (privateQuestBinding || partyQuestBinding)
-                ? reaction == MobileReactions.Passive
-                : foeRes != null && foeRes.IsRestrained;
+            // Preserve the actual Foe restraint separately from the finite settle
+            // marker. Ordinary passive enemies must not remain pinned to their spawn.
+            ewp.isFixedQuestFoeRestrained = actualQuestFoe &&
+                ((privateQuestBinding || partyQuestBinding)
+                    ? reaction == MobileReactions.Passive
+                    : foeRes != null && foeRes.IsRestrained);
         }
 
         // Optional: dungeon flagging you already use
@@ -3143,6 +3262,13 @@ public void CmdCreatePrivateQuestFoesWithPositions(
                 foeResource = q.GetFoe(new Symbol(foeSymbolName));
         }
 
+        // Generic CreateFoeGameObjects, FoeSpawner and console requests share this
+        // helper, but are not quest foes. Private/party resources live on the client;
+        // their validated quest request identifies them on the server.
+        bool actualQuestFoe = foeResource != null ||
+            ((privateQuestBinding || partyQuestBinding) &&
+             questUID != 0UL && !string.IsNullOrEmpty(foeSymbolName));
+
         int total = Mathf.Clamp(spawnCount, 1, 8);
 
         for (int i = 0; i < total; i++)
@@ -3215,7 +3341,7 @@ public void CmdCreatePrivateQuestFoesWithPositions(
             if (dfEnemy)
             {
                 dfEnemy.LoadID = DaggerfallUnity.NextUID;
-                if (foeResource != null || privateQuestBinding || partyQuestBinding)
+                if (actualQuestFoe)
                     dfEnemy.QuestSpawn = true;
             }
             if (foeResource != null)
@@ -3246,7 +3372,7 @@ public void CmdCreatePrivateQuestFoesWithPositions(
                 }
 
                 ewp.intendedSpawnPos = alignedSpawnPos;
-                ewp.isCreateFoeWaveSpawn = true;
+                ewp.isCreateFoeWaveSpawn = actualQuestFoe;
             }
 
             NetworkServer.Spawn(go);
@@ -6826,7 +6952,8 @@ public void ServerSpawnSavedInteriorEnemy(
         {
             ewp.SetSpawnContext(true, this.netId);
             ewp.intendedSpawnPos = worldPosition;
-            ewp.isCreateFoeWaveSpawn = true;
+            // Saved non-quest interior enemies are not quest-wave spawn markers.
+            ewp.isCreateFoeWaveSpawn = foeRes != null || partyQuestBinding;
         }
 
         if (setupEnemy != null)

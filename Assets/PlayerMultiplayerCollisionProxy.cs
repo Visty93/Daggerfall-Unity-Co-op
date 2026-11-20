@@ -70,6 +70,10 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
     CharacterController localPlayerController;
     NetworkIdentity networkIdentity;
 
+    // Reuse the animated class visual rather than searching the hierarchy each frame.
+    Transform cachedGroundingVisualRoot;
+    SpriteMultiplayer cachedGroundingSprite;
+
     bool visualCaptured;
     float nextCollisionRefreshTime;
     float nextVisualSanitizeTime;
@@ -322,14 +326,32 @@ public class PlayerMultiplayerCollisionProxy : MonoBehaviour
         if (lockVisualLocalPosition)
         {
             Vector3 before = visualRoot.localPosition;
+            Vector3 wantedPosition = lockedVisualLocalPosition;
 
-            if (force || (before - lockedVisualLocalPosition).sqrMagnitude > 0.0001f)
+            // Keep the existing anti-drift lock, but place normal animated
+            // remote player class billboards at the height of their equivalent
+            // ordinary enemy sprite. Their disabled child controller is sized
+            // by SetupDemoEnemy; the real player root controller is fixed.
+            // Mounted, werebeast, downed and paperdoll visuals return zero lift.
+            if (cachedGroundingVisualRoot != visualRoot)
             {
-                visualRoot.localPosition = lockedVisualLocalPosition;
+                cachedGroundingVisualRoot = visualRoot;
+                cachedGroundingSprite = visualRoot.GetComponent<SpriteMultiplayer>();
+            }
 
-                if (logVisualCorrections && Mathf.Abs(before.y - lockedVisualLocalPosition.y) > 0.05f)
+            if (cachedGroundingSprite != null && proxyController != null &&
+                (networkIdentity == null || !networkIdentity.isLocalPlayer))
+            {
+                wantedPosition.y += cachedGroundingSprite.GetAnimatedSpriteGroundLift(proxyController.height);
+            }
+
+            if (force || (before - wantedPosition).sqrMagnitude > 0.0001f)
+            {
+                visualRoot.localPosition = wantedPosition;
+
+                if (logVisualCorrections && Mathf.Abs(before.y - wantedPosition.y) > 0.05f)
                 {
-                    Debug.Log($"[PlayerMultiplayerCollisionProxy] Corrected visual child Y drift on '{name}/{visualRoot.name}' from localY={before.y:F3} to {lockedVisualLocalPosition.y:F3}");
+                    Debug.Log($"[PlayerMultiplayerCollisionProxy] Corrected visual child Y drift on '{name}/{visualRoot.name}' from localY={before.y:F3} to {wantedPosition.y:F3}");
                 }
             }
         }

@@ -47,6 +47,10 @@ public sealed class DedicatedServerConfig
         public bool sendLocations = true;
         public bool sendMessages = true;
         public bool mobileNpcSync = true;
+        // Keep clients from using the developer console unless the operator opts in.
+        public bool allowClientConsoleCommands = false;
+        // Applies to every party, not a party-leader override. Must stay between 1 and 10 m.
+        public int restTogetherRadiusMeters = 10;
         public bool partyTravelInsideDungeon = true;
         // Entire world-container bridge: interiors, dungeons, generic exterior, WoD camps.
         // Does NOT affect networked enemy corpses, quests, or player-dropped loot.
@@ -63,6 +67,11 @@ public sealed class DedicatedServerConfig
         public int reviveFatiguePercent = 30;
         public int respawnFatiguePercent = 30;
         public bool respawnOutsideDungeon = false;
+        public bool requireLocalGroupWipe = false;
+        public bool nearestSanctuaryRespawn = false;
+        public bool sanctuaryHealingFeeEnabled = false;
+        public int sanctuaryGoldPerLevel = 100;
+        public int groupWipeExteriorRadiusMeters = 200;
     }
 
     public static DedicatedServerConfig Load(DfuDedicatedServerOptions options, out string path)
@@ -140,6 +149,9 @@ public sealed class DedicatedServerConfig
         RequireRange("respawn.respawnHealthPercent", respawn.respawnHealthPercent, 10, 50);
         RequireRange("respawn.reviveFatiguePercent", respawn.reviveFatiguePercent, 10, 50);
         RequireRange("respawn.respawnFatiguePercent", respawn.respawnFatiguePercent, 10, 50);
+        RequireRange("respawn.sanctuaryGoldPerLevel", respawn.sanctuaryGoldPerLevel, 10, 1000);
+        RequireRange("respawn.groupWipeExteriorRadiusMeters", respawn.groupWipeExteriorRadiusMeters, 10, 500);
+        RequireRange("multiplayer.restTogetherRadiusMeters", multiplayer.restTogetherRadiusMeters, 1, 10);
     }
 
     static void RequireRange(string name, int value, int min, int max)

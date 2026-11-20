@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using Mirror;
+using DaggerfallWorkshop;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Game.Questing;
 using DaggerfallWorkshop.Game.MagicAndEffects;
@@ -16,6 +17,7 @@ public sealed class EnemyInterestManagement : InterestManagement
         public DynamicEnemyAuthority authority;
         public EnemyWorldPosition world;
         public SetupDemoEnemy setup;
+        public DaggerfallEnemy daggerfallEnemy;
         public EntityEffectManager effects;
         public bool protectedLifecycle;
     }
@@ -85,6 +87,7 @@ public sealed class EnemyInterestManagement : InterestManagement
         if (authority == null || id.GetComponent<PlayerMultiplayer>() != null) return;
         var entry = new Entry { id = id, authority = authority,
             world = id.GetComponent<EnemyWorldPosition>(), setup = id.GetComponent<SetupDemoEnemy>(),
+            daggerfallEnemy = id.GetComponent<DaggerfallEnemy>(),
             effects = id.GetComponent<EntityEffectManager>() };
         entries.Add(id, entry);
         nodes.Add(id, pending.AddLast(entry));
@@ -103,12 +106,18 @@ public sealed class EnemyInterestManagement : InterestManagement
 
     bool Protected(Entry entry)
     {
-        // Quest binding is delivered by one-shot RPCs; preserve those objects until
-        // a separate durable quest-binding replay exists. Also preserve mod-owned lifetimes.
+        // Quest bindings are currently delivered via one-shot RPCs; an actual quest
+        // foe must stay an observer until those bindings have a late-replay path.
+        // The CreateFoe wave flag is *not* quest identity: it is also a temporary
+        // spawn settle/resnap marker, and was mistakenly set on generic foes.
+        // DaggerfallEnemy.QuestSpawn is set by the server before NetworkServer.Spawn,
+        // including private/party quest foes whose QuestResourceBehaviour is client-only.
+        // Retain the separate pre-existing protection for explicitly owner-bound and
+        // external mod actors; these are different lifetime policies.
         if (!entry.protectedLifecycle &&
             (entry.authority.PersistentOwnerPlayerNetId != 0 ||
              entry.id.GetComponent<QuestResourceBehaviour>() != null ||
-             (entry.world != null && entry.world.isCreateFoeWaveSpawn) ||
+             (entry.daggerfallEnemy != null && entry.daggerfallEnemy.QuestSpawn) ||
              (entry.setup != null && (entry.setup.ExternalSpawnOriginNetId != 0 ||
                  !string.IsNullOrEmpty(entry.setup.ExternalSpawnDisplayName)))))
             entry.protectedLifecycle = true;

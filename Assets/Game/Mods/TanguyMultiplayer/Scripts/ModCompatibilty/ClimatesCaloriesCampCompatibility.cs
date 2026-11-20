@@ -1,5 +1,5 @@
 // C&C-specific gameplay adapter. The original mod and generic API stay unchanged.
-// Uses the installed mod's cooking implementation; never borrows Camping.Tent/Fire.
+// Uses the installed mod's cooking/rest implementation; never borrows Camping.Tent/Fire.
 using System;
 using System.Reflection;
 using UnityEngine;
@@ -20,7 +20,7 @@ namespace DaggerfallCoop.Compatibility
         static ClimatesCaloriesCampCompatibility instance;
         DaggerfallMessageBox.OnButtonClickHandler nativeMenu;
         DaggerfallListPickerWindow.OnItemPickedEventHandler nativePick;
-        DaggerfallMessageBox.MessageBoxButtons cookButton, cancelButton;
+        DaggerfallMessageBox.MessageBoxButtons restButton, cookButton, cancelButton;
         bool warned;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
@@ -35,6 +35,7 @@ namespace DaggerfallCoop.Compatibility
         {
             if (instance != null && instance != this) { Destroy(gameObject); return; }
             instance = this;
+            Debug.Log("[CCCampMP] v0.20 loaded; original camp button rendering restored.");
             if (!GenericModObjectSync.RegisterActivationHandler(Profile, Activate))
                 Debug.LogWarning("[CCCampMP] A camp interaction adapter is already registered.");
         }
@@ -57,7 +58,7 @@ namespace DaggerfallCoop.Compatibility
             player = GameObject.FindGameObjectWithTag("Player");
             return player != null && player.activeInHierarchy;
         }
-        static bool CanCook(SyncedModObject camp, Collider collider, out string reason, object ownedWindow = null)
+        static bool CanUseCamp(SyncedModObject camp, Collider collider, out string reason, object ownedWindow = null)
         {
             reason = "This camp is no longer available.";
             GameObject player;
@@ -84,7 +85,7 @@ namespace DaggerfallCoop.Compatibility
             { reason = "There are enemies nearby."; return false; }
             return true;
         }
-        bool ResolveCooking()
+        bool ResolveCampActions()
         {
             if (nativeMenu != null && nativePick != null) return true;
             try
@@ -101,24 +102,27 @@ namespace DaggerfallCoop.Compatibility
                 var pick = camping.GetMethod("Cook_OnItemPicked", StaticMembers, null,
                     new[] { typeof(int), typeof(string) }, null);
                 var cook = camping.GetField("cookButton", StaticMembers);
+                var rest = camping.GetField("restButton", StaticMembers);
                 var cancel = camping.GetField("cancelButton", StaticMembers);
-                if (menu == null || pick == null || cook == null || cancel == null ||
+                if (menu == null || pick == null || cook == null || rest == null || cancel == null ||
                     cook.FieldType != typeof(DaggerfallMessageBox.MessageBoxButtons) ||
+                    rest.FieldType != typeof(DaggerfallMessageBox.MessageBoxButtons) ||
                     cancel.FieldType != typeof(DaggerfallMessageBox.MessageBoxButtons))
-                    throw new MissingMemberException("C&C cooking callbacks/buttons have changed");
+                    throw new MissingMemberException("C&C camp callbacks/buttons have changed");
                 cookButton = (DaggerfallMessageBox.MessageBoxButtons)cook.GetValue(null);
+                restButton = (DaggerfallMessageBox.MessageBoxButtons)rest.GetValue(null);
                 cancelButton = (DaggerfallMessageBox.MessageBoxButtons)cancel.GetValue(null);
                 nativeMenu = (DaggerfallMessageBox.OnButtonClickHandler)Delegate.CreateDelegate(
                     typeof(DaggerfallMessageBox.OnButtonClickHandler), menu);
                 nativePick = (DaggerfallListPickerWindow.OnItemPickedEventHandler)Delegate.CreateDelegate(
                     typeof(DaggerfallListPickerWindow.OnItemPickedEventHandler), pick);
-                Debug.Log("[CCCampMP] Native C&C cooking callbacks ready; guests have Cook/Cancel only.");
+                Debug.Log("[CCCampMP] Native C&C camp callbacks ready; guests have Rest/Cook/Cancel. Packing is owner-only.");
                 return true;
             }
             catch (Exception error)
             {
                 nativeMenu = null; nativePick = null;
-                if (!warned) { warned = true; Debug.LogWarning("[CCCampMP] Cooking unavailable: " + error.Message); }
+                if (!warned) { warned = true; Debug.LogWarning("[CCCampMP] Camp actions unavailable: " + error.Message); }
                 return false;
             }
         }
@@ -126,20 +130,28 @@ namespace DaggerfallCoop.Compatibility
         {
             if (!isActiveAndEnabled) return false;
             string reason;
-            if (!CanCook(camp, hit.collider, out reason)) { DaggerfallUI.MessageBox(reason); return true; }
-            if (!ResolveCooking())
-            { DaggerfallUI.MessageBox("Shared cooking is unavailable with this version of Climates & Calories."); return true; }
+            if (!CanUseCamp(camp, hit.collider, out reason)) { DaggerfallUI.MessageBox(reason); return true; }
+            if (!ResolveCampActions())
+            { DaggerfallUI.MessageBox("Shared camp actions are unavailable with this version of Climates & Calories."); return true; }
             var popup = new DaggerfallMessageBox(DaggerfallUI.UIManager, DaggerfallUI.UIManager.TopWindow);
-            popup.SetText(new[] { "Use your party's camp to cook?", "Only its owner can pack it or rest here." });
+            popup.SetText(new[] { "Do you wish to rest or cook?", "Only the camp's owner can pack it." });
+            popup.AddButton(restButton);
             popup.AddButton(cookButton);
             popup.AddButton(cancelButton, true);
             popup.OnButtonClick += (sender, button) =>
             {
-                // Never pass Rest, Pack or an unknown button to the native dispatcher.
-                if (button != cookButton) { nativeMenu(sender, cancelButton); return; }
+                // Only Rest and Cook can reach the native dispatcher. Never forward Pack.
+                if (button != cookButton && button != restButton) { nativeMenu(sender, cancelButton); return; }
                 string changed;
-                if (!CanCook(camp, hit.collider, out changed, sender))
+                if (!CanUseCamp(camp, hit.collider, out changed, sender))
                 { nativeMenu(sender, cancelButton); DaggerfallUI.MessageBox(changed); return; }
+                if (button == restButton)
+                {
+                    // Native Rest sets C&C's local camping state and opens its normal
+                    // rest window. It does not require or replace Camping.Tent/Fire.
+                    nativeMenu(sender, restButton);
+                    return;
+                }
                 nativeMenu(sender, cookButton);
                 var picker = DaggerfallUI.UIManager.TopWindow as DaggerfallListPickerWindow;
                 if (picker == null) return; // Native "nothing to cook" response needs no interception.
@@ -149,7 +161,7 @@ namespace DaggerfallCoop.Compatibility
                 picker.OnItemPicked += (index, name) =>
                 {
                     string unavailable;
-                    if (!CanCook(camp, hit.collider, out unavailable, picker))
+                    if (!CanUseCamp(camp, hit.collider, out unavailable, picker))
                     {
                         picker.CloseWindow(); nativeMenu(sender, cancelButton);
                         DaggerfallUI.MessageBox(unavailable); return;

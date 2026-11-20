@@ -55,6 +55,8 @@ namespace DaggerfallWorkshop.Game.UserInterface
             public TextLabel locationLabel;
 
             public string portraitKey = string.Empty;
+            public Texture2D originalPortrait;
+            public string originalPortraitKey = string.Empty;
         }
 
         readonly Dictionary<uint, PartyEntry> entries = new Dictionary<uint, PartyEntry>();
@@ -262,13 +264,15 @@ namespace DaggerfallWorkshop.Game.UserInterface
                     string.Format("{0}, Lv{1}", displayName, Mathf.Max(1, player.PlayerMPLevel)),
                     16);
 
-                entry.hpLabel.Text = string.Format(
+                bool isDowned = global::MultiplayerPartyPortraitStatus.IsDowned(player);
+                entry.hpLabel.Text = isDowned ? "DOWNED" : string.Format(
                     "HP: {0}/{1}",
                     Mathf.Max(0, player.PlayerMPCurrentHealth),
                     Mathf.Max(1, player.PlayerMPMaxHealth));
+                entry.hpLabel.TextColor = isDowned ? new Color(1f, 0.55f, 0.55f) : Color.white;
 
                 entry.locationLabel.Text = Shorten(GetCompactLocation(entry.position), 16);
-                UpdatePortrait(entry);
+                UpdatePortrait(entry, isDowned);
             }
 
             visibleEntries.Sort(CompareEntries);
@@ -300,33 +304,41 @@ namespace DaggerfallWorkshop.Game.UserInterface
             return a.key.CompareTo(b.key);
         }
 
-        void UpdatePortrait(PartyEntry entry)
+        void UpdatePortrait(PartyEntry entry, bool isDowned)
         {
             string archive = entry.assets.faceArchive ?? string.Empty;
             int faceIndex = Mathf.Clamp(entry.assets.faceIndex, 0, 9);
-            string newPortraitKey = archive + ":" + faceIndex;
+            string sourceKey = archive + ":" + faceIndex;
+            string displayKey = sourceKey + (isDowned ? ":downed" : ":alive");
 
-            if (string.Equals(entry.portraitKey, newPortraitKey, StringComparison.Ordinal))
+            if (string.Equals(entry.portraitKey, displayKey, StringComparison.Ordinal))
                 return;
 
-            entry.portraitKey = newPortraitKey;
-            entry.portrait.BackgroundTexture = null;
-
-            if (string.IsNullOrEmpty(archive))
-                return;
-
-            try
+            // Reuse the same normal portrait when the player dies or is revived.
+            // Do not repeatedly load the texture or regenerate grayscale every update.
+            if (!string.Equals(entry.originalPortraitKey, sourceKey, StringComparison.Ordinal))
             {
-                ImageData imageData = ImageReader.GetImageData(archive, faceIndex, 0, true, true);
-                if (imageData.texture != null)
-                    entry.portrait.BackgroundTexture = imageData.texture;
+                entry.originalPortraitKey = sourceKey;
+                entry.originalPortrait = null;
+                if (!string.IsNullOrEmpty(archive))
+                {
+                    try
+                    {
+                        ImageData imageData = ImageReader.GetImageData(archive, faceIndex, 0, true, true);
+                        entry.originalPortrait = imageData.texture;
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning(
+                            "[HUDMultiplayerParty] Could not load portrait " + sourceKey +
+                            " for " + (entry.assets.playerName ?? "remote player") + ": " + ex.Message);
+                    }
+                }
             }
-            catch (Exception ex)
-            {
-                Debug.LogWarning(
-                    "[HUDMultiplayerParty] Could not load portrait " + newPortraitKey +
-                    " for " + (entry.assets.playerName ?? "remote player") + ": " + ex.Message);
-            }
+
+            entry.portraitKey = displayKey;
+            entry.portrait.BackgroundTexture = global::MultiplayerPartyPortraitStatus.DisplayTexture(
+                entry.originalPortrait, isDowned);
         }
 
         string GetCompactLocation(global::PositionMultiplayer position)

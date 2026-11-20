@@ -1,4 +1,4 @@
-﻿// Project:         Daggerfall Unity
+// Project:         Daggerfall Unity
 // Copyright:       Copyright (C) 2009-2023 Daggerfall Workshop
 // Web Site:        http://www.dfworkshop.net
 // License:         MIT License (http://www.opensource.org/licenses/mit-license.php)
@@ -100,17 +100,19 @@ namespace DaggerfallWorkshop.Game
                     float respawnDelay = respawnManager != null ? respawnManager.RespawnDelaySeconds : 30f;
                     float elapsed = Time.realtimeSinceStartup - timeOfDeathRealtime;
                     float manualWait = Mathf.Clamp(OptionsMultiplayer.manualRespawnSeconds, 5, 30);
+                    bool wipeAllowed = respawnManager == null || respawnManager.IsGroupWipeRespawnAllowed;
                     string message = respawnManager != null && respawnManager.RespawnInProgress
                         ? "Respawning..."
-                        : "Automatic respawn in " + Mathf.CeilToInt(Mathf.Max(0f, respawnDelay - elapsed)) + " seconds";
-                    if (respawnManager != null && !respawnManager.RespawnInProgress && respawnManager.AllowManualRespawnInput)
+                        : !wipeAllowed ? "Waiting for the nearby party to fall or leave..." :
+                          "Automatic respawn in " + Mathf.CeilToInt(Mathf.Max(0f, respawnDelay - elapsed)) + " seconds";
+                    if (wipeAllowed && respawnManager != null && !respawnManager.RespawnInProgress && respawnManager.AllowManualRespawnInput)
                         message += elapsed < manualWait
                             ? "\nYou can respawn in " + Mathf.CeilToInt(manualWait - elapsed) + " seconds"
                             : "\nLeft-click to respawn";
                     MultiplayerRespawnStatus.Show(message, -1f);
 
                     if (respawnManager != null &&
-                        respawnManager.AllowManualRespawnInput &&
+                        respawnManager.AllowManualRespawnInput && wipeAllowed &&
                         elapsed >= Mathf.Clamp(OptionsMultiplayer.manualRespawnSeconds, 5, 30) &&
                         Input.GetMouseButtonDown(0))
                     {
@@ -118,7 +120,7 @@ namespace DaggerfallWorkshop.Game
                         return;
                     }
 
-                    if (elapsed >= respawnDelay)
+                    if (wipeAllowed && elapsed >= respawnDelay)
                     {
                         if (respawnManager != null)
                             respawnManager.RequestRespawnNow("death-timeout");

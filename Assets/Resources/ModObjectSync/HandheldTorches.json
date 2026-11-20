@@ -1,0 +1,29 @@
+{
+  "Profiles": [
+    {
+      "Id": "handheld-torches-world-lights",
+      "ModTitle": "Handheld Torches",
+      "Rules": [
+        {
+          "Id": "placed-lights",
+          "ReferenceRootName": "Handheld Torches",
+          "SourceType": "HandheldTorches",
+          "ReferenceFieldContains": ["billboardsObject"],
+          "Scope": "Auto",
+          "Visual": "Custom",
+          "FactoryId": "dfucoop.handheld-torches.billboard.v1",
+          "Motion": "Smooth",
+          "PreserveSourceParent": true,
+          "VisibilityMetres": 250,
+          "SyncActiveState": true,
+          "SyncParentActiveState": false,
+          "TrackOriginalParentLifetime": true,
+          "IncludeLights": true,
+          "IncludeAudio": true,
+          "ColliderMode": "None",
+          "PresentationSmoothingSeconds": 0.05
+        }
+      ]
+    }
+  ]
+}

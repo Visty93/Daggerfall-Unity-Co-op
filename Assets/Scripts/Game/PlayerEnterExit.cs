@@ -40,6 +40,14 @@ namespace DaggerfallWorkshop.Game
         const float multiplayerInteriorYOffset = -250f;
         bool currentInteriorUsesMultiplayerYOffset = false;
 
+        // Keep the locally visited network dungeon below the normal Dungeon
+        // parent. Restore independent roots before disabling that parent so the
+        // host can keep simulating dungeons occupied by other players.
+        Transform multiplayerDungeonContextRoot;
+        Transform multiplayerDungeonContextParent;
+        Transform multiplayerDungeonContextOriginalParent;
+        int multiplayerDungeonContextOriginalSibling = -1;
+
         // Some interior-related mods can perform delayed placement after OnTransitionInterior.
         // MP building interiors are shifted far below exterior Y, so a placement search that uses
         // exterior-height coordinates can incorrectly choose an upper floor. Briefly protect a
@@ -93,6 +101,10 @@ namespace DaggerfallWorkshop.Game
         // remains black, and normal network safety must not emergency-exit mid-request.
         bool networkDungeonConversionInProgress = false;
         bool pendingNetworkDungeonConversionFromLoad = false;
+        // Recall shares the dungeon host-request path with save loads, but must not
+        // schedule SaveLoadManager-only post-load finalization. It still requires
+        // an exact PlayerGPS/StreamingWorld destination-context commit on arrival.
+        bool pendingNetworkDungeonRecall = false;
         bool pendingNetworkDungeonUseStartMarker = false;
         string pendingNetworkDungeonRegionName = string.Empty;
         string pendingNetworkDungeonLocationName = string.Empty;
@@ -500,6 +512,7 @@ namespace DaggerfallWorkshop.Game
 
         public override void OnStopClient()
         {
+            RestoreMultiplayerDungeonParentContext("OnStopClient");
             base.OnStopClient();
             if (networkDungeonConversionInProgress)
                 FailPendingNetworkDungeonConversion("OnStopClient-during-conversion");
@@ -510,6 +523,7 @@ namespace DaggerfallWorkshop.Game
 
         public override void OnStopServer()
         {
+            RestoreMultiplayerDungeonParentContext("OnStopServer");
             base.OnStopServer();
             if (networkDungeonConversionInProgress)
                 FailPendingNetworkDungeonConversion("OnStopServer-during-conversion");
@@ -1192,7 +1206,8 @@ namespace DaggerfallWorkshop.Game
             DaggerfallDungeon sourceLocalDungeon,
             int requesterLevel,
             string initialSavedActionState,
-            string reason)
+            string reason,
+            bool fromRecall = false)
         {
             if (networkDungeonConversionInProgress)
                 return true;
@@ -1208,6 +1223,7 @@ namespace DaggerfallWorkshop.Game
 
             networkDungeonConversionInProgress = true;
             pendingNetworkDungeonConversionFromLoad = fromLoad;
+            pendingNetworkDungeonRecall = fromRecall;
             pendingNetworkDungeonUseStartMarker = useStartMarker;
             pendingNetworkDungeonRegionName = location.RegionName;
             pendingNetworkDungeonLocationName = location.Name;
@@ -1450,7 +1466,7 @@ namespace DaggerfallWorkshop.Game
             // player is definitively inside the correct live dungeon, commit its entrance
             // context exactly once. Dungeon exit, quest SiteLink lookup, and future saves all
             // depend on this real PlayerGPS/StreamingWorld identity.
-            if (pendingNetworkDungeonConversionFromLoad)
+            if (pendingNetworkDungeonConversionFromLoad || pendingNetworkDungeonRecall)
             {
                 CommitSavedDungeonWorldContext(
                     location,
@@ -1700,6 +1716,7 @@ namespace DaggerfallWorkshop.Game
         {
             networkDungeonConversionInProgress = false;
             pendingNetworkDungeonConversionFromLoad = false;
+            pendingNetworkDungeonRecall = false;
             pendingNetworkDungeonUseStartMarker = false;
             pendingNetworkDungeonRegionName = string.Empty;
             pendingNetworkDungeonLocationName = string.Empty;
@@ -2322,12 +2339,13 @@ namespace DaggerfallWorkshop.Game
                         localPosition,
                         conversionWorldX,
                         conversionWorldZ,
-                        true,
+                        start, // Save loads need post-load finalization; Recall (start=false) does not.
                         useStartMarker,
                         null,
                         savedPlayerLevel,
                         initialSavedDungeonActionState,
-                        "active-mp-dungeon-save-load"))
+                        start ? "active-mp-dungeon-save-load" : "active-mp-dungeon-recall",
+                        !start))
                     {
                         return;
                     }
@@ -3854,6 +3872,10 @@ private void HandleDungeonTransition(PlayerEnterExit.TransitionEventArgs args)
 
         public void DisableAllParents(bool cleanup = true)
         {
+            // Detach first: disabling Dungeon must never disable a persistent
+            // network dungeon which another player may still be using.
+            RestoreMultiplayerDungeonParentContext("DisableAllParents");
+
             if (!GameManager.Instance.IsReady)
                 GameManager.Instance.GetProperties();
 
@@ -3933,7 +3955,87 @@ private void HandleDungeonTransition(PlayerEnterExit.TransitionEventArgs args)
             IsPlayerInsideTavern = false;
             isPlayerInsideDungeon = true;
 
+            BindMultiplayerDungeonParentContext(dungeon);
             GameManager.UpdateShadowDistance();
+        }
+
+        private void BindMultiplayerDungeonParentContext(DaggerfallDungeon candidate)
+        {
+            // NetworkClient.active includes a listen host, but excludes dedicated
+            // servers. Only the physical local PlayerEnterExit owns this context.
+            if (!NetworkClient.active || !isPlayerInsideDungeon || candidate == null ||
+                candidate != dungeon || !candidate.IsNetworkDungeonInstance ||
+                DungeonParent == null || !DungeonParent.activeInHierarchy ||
+                GameManager.Instance == null || GameManager.Instance.PlayerEnterExit != this)
+                return;
+
+            Transform root = candidate.transform;
+            Transform parent = DungeonParent.transform;
+            if (root == parent || parent.IsChildOf(root))
+                return;
+
+            if (multiplayerDungeonContextRoot == root && root.IsChildOf(parent))
+                return;
+
+            RestoreMultiplayerDungeonParentContext("bind-current-dungeon");
+
+            // An existing network child must return to scene root on exit rather
+            // than to a descendant of the very container about to be disabled.
+            bool alreadyUnderParent = root.IsChildOf(parent);
+            multiplayerDungeonContextOriginalParent = alreadyUnderParent ? null : root.parent;
+            multiplayerDungeonContextOriginalSibling = alreadyUnderParent ? -1 : root.GetSiblingIndex();
+            multiplayerDungeonContextRoot = root;
+            multiplayerDungeonContextParent = parent;
+
+            Vector3 worldPosition = root.position;
+            if (!alreadyUnderParent)
+                root.SetParent(parent, true);
+
+            Debug.Log($"[MPDungeonParentContext] Bound local network dungeon '{candidate.name}' under '{parent.name}' before entry callbacks. worldBefore={worldPosition} worldAfter={root.position}");
+        }
+
+        private void RestoreMultiplayerDungeonParentContext(string reason)
+        {
+            Transform root = multiplayerDungeonContextRoot;
+            Transform parent = multiplayerDungeonContextParent;
+            Transform originalParent = multiplayerDungeonContextOriginalParent;
+            int originalSibling = multiplayerDungeonContextOriginalSibling;
+            bool hadContext = root != null;
+
+            // Clear ownership before changing the hierarchy, including when the
+            // dungeon has already been destroyed or reparented by another system.
+            multiplayerDungeonContextRoot = null;
+            multiplayerDungeonContextParent = null;
+            multiplayerDungeonContextOriginalParent = null;
+            multiplayerDungeonContextOriginalSibling = -1;
+
+            if (root != null && parent != null && root.IsChildOf(parent))
+            {
+                if (originalParent != null && (originalParent == root || originalParent.IsChildOf(root)))
+                    originalParent = null;
+                root.SetParent(originalParent, true);
+                if (originalSibling >= 0)
+                    root.SetSiblingIndex(originalSibling);
+                Debug.Log($"[MPDungeonParentContext] Restored network dungeon '{root.name}' before parent change. reason={reason} world={root.position}");
+            }
+
+            if (DungeonParent == null || (!hadContext && !NetworkClient.active))
+                return;
+
+            // Also protect network roots which were already under Dungeon before
+            // this context was acquired, e.g. a saved-start or recovery entry.
+            // Leave all single-player dungeon children on their original path.
+            Transform usualParent = DungeonParent.transform;
+            foreach (DaggerfallDungeon networkDungeon in DungeonParent.GetComponentsInChildren<DaggerfallDungeon>(true))
+            {
+                if (networkDungeon == null || !networkDungeon.IsNetworkDungeonInstance)
+                    continue;
+                Transform networkRoot = networkDungeon.transform;
+                if (networkRoot == usualParent || !networkRoot.IsChildOf(usualParent))
+                    continue;
+                networkRoot.SetParent(null, true);
+                Debug.Log($"[MPDungeonParentContext] Detached persistent network dungeon '{networkDungeon.name}' before parent change. reason={reason} world={networkRoot.position}");
+            }
         }
 
         /// <summary>
@@ -5515,6 +5617,9 @@ private IEnumerator FadedTransitionDungeonExterior()
         public static event OnTransitionDungeonInteriorEventHandler OnTransitionDungeonInterior;
         public virtual void RaiseOnTransitionDungeonInteriorEvent(StaticDoor staticDoor, DaggerfallDungeon daggerfallDungeon)
         {
+            // Reassert the current dungeon hierarchy before entry subscribers
+            // run, and keep it consistent throughout the local visit.
+            BindMultiplayerDungeonParentContext(daggerfallDungeon);
             TransitionEventArgs args = new TransitionEventArgs(TransitionType.ToDungeonInterior, staticDoor, null, daggerfallDungeon);
             if (OnTransitionDungeonInterior != null)
                 OnTransitionDungeonInterior(args);

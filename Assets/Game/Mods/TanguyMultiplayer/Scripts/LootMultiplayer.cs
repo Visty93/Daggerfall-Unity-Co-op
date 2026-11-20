@@ -43,8 +43,6 @@ public class LootMultiplayer : MonoBehaviour
     // Retrying the same request cannot transfer an item twice: server deduplicates.
     string pendingCommitItems;
     string[] pendingCommitConsumed;
-    float nextCommitAttempt;
-    int commitAttempts;
     string externalQuestConsumption;
     int deferredVersion = -1;
     string deferredItems;
@@ -55,6 +53,7 @@ public class LootMultiplayer : MonoBehaviour
     // quest click, or Begin/EndLocalLootEdit. Uses the existing server reservation.
     internal bool BeginExternalQuestConsumption(string symbol)
     {
+        if (EditGranted) CompleteEdit(); // A new pickup resolves a granted but unfinished edit.
         if (!ExternalLootPickupTracker.Enabled || EditPending || !isActiveAndEnabled ||
             lootId == 0 || lootCatcher == null || !lootCatcher.isLocalPlayer ||
             string.IsNullOrEmpty(symbol) || symbol == "*" || symbol == "!" ||
@@ -65,7 +64,15 @@ public class LootMultiplayer : MonoBehaviour
         editGranted = commitSent = false;
         editRequest = lootCatcher.RequestLootEdit(lootId, lootVersion);
         Debug.Log("[ExternalQuestPickup] Request consumption lootId=" + lootId + " symbol=" + symbol);
-        lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest, symbol);
+        try { lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest, symbol); }
+        catch (Exception ex)
+        {
+            Debug.LogError("[LootWire] Could not begin external quest pickup: " + ex);
+            lootCatcher.CancelUnexecutedLootEdit(lootId, editRequest);
+            editRequest = 0;
+            externalQuestConsumption = null;
+            return false;
+        }
         return true;
     }
 
@@ -103,6 +110,10 @@ public class LootMultiplayer : MonoBehaviour
     public bool BeginEdit(DaggerfallUnityItem clickedItem, Action action)
     {
         ExternalPickups.Poll(false);
+        // A canceled split/quantity popup may have left an approved edit open.
+        // Resolve it from the current real inventory when the user attempts another
+        // action, without a timeout and without re-executing either transfer.
+        if (EditGranted) CompleteEdit();
         if (EditPending || lootId == 0 || lootCatcher == null)
             return false;
         string partySelection = PartyQuestLootOverlay.Selection(loot, clickedItem);
@@ -115,8 +126,33 @@ public class LootMultiplayer : MonoBehaviour
         partyQuestLootClickedItem = clickedItem;
         editGranted = commitSent = false;
         editRequest = lootCatcher.RequestLootEdit(lootId, lootVersion);
-        lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest, partySelection);
+        try
+        {
+            lootCatcher.SendLootEditRequest(lootId, lootVersion, editRequest, partySelection);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("[LootWire] Could not begin inventory edit: " + ex);
+            lootCatcher.CancelUnexecutedLootEdit(lootId, editRequest);
+            editRequest = 0;
+            editAction = null;
+            partyQuestLootClickedItem = null;
+            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot could not synchronize. See Player.log.");
+            return false;
+        }
         return true;
+    }
+
+    // Used only after a callback fails before executing its permitted action.
+    // Do not touch requests which have already moved an item locally.
+    public void ClearUnexecutedRequest(uint request)
+    {
+        if (request != editRequest || editGranted || commitSent) return;
+        editRequest = 0;
+        editAction = null;
+        partyQuestLootClickedItem = null;
+        partyQuestLootEditToken = null;
+        externalQuestConsumption = null;
     }
 
     public bool ReceiveEditGrant(uint request, bool accepted, int version, string items)
@@ -180,12 +216,11 @@ public class LootMultiplayer : MonoBehaviour
         }
         catch (Exception ex)
         {
-            // Never unlock here: the inventory action has ALREADY moved an item.
-            // Discarding this transaction or applying an old snapshot could duplicate
-            // or lose it. Preserve a pending state and report the fatal encoding issue.
+            // Never silently cancel after a local transfer: that could duplicate
+            // the item. Report failure, but do not prevent closing the loot window.
             commitSent = true;
-            Debug.LogError("[LootTransaction] Unable to encode edited loot; preserving reservation to avoid item loss: " + ex);
-            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot serialization failed. Do not save or close this session; see Player.log.");
+            Debug.LogError("[LootTransaction] Unable to encode edited loot; reconciliation required: " + ex);
+            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot serialization failed. Close the inventory if needed; check Player.log.");
         }
     }
 
@@ -194,7 +229,8 @@ public class LootMultiplayer : MonoBehaviour
         pendingCommitItems = items ?? string.Empty;
         pendingCommitConsumed = consumed;
         commitSent = true;
-        commitAttempts = 0;
+        // LootCatcher owns the exact pending transfer until acknowledged, even
+        // if this loot marker is unloaded or this inventory window is closed.
         RetryCommit();
     }
 
@@ -202,20 +238,16 @@ public class LootMultiplayer : MonoBehaviour
     {
         if (!commitSent || editRequest == 0 || lootCatcher == null ||
             !lootCatcher.isLocalPlayer || pendingCommitItems == null) return;
-        nextCommitAttempt = Time.realtimeSinceStartup + 6f;
-        ++commitAttempts;
         try
         {
+            // The catcher queues and retries the SAME serialized proposal. Never
+            // re-execute the UI action: that would duplicate a player inventory transfer.
             lootCatcher.CommitLootEdit(lootId, editRequest, pendingCommitItems, pendingCommitConsumed);
-            if (commitAttempts > 1)
-                Debug.LogWarning("[LootTransaction] Retried unacknowledged commit. lootId=" + lootId +
-                    " request=" + editRequest + " attempt=" + commitAttempts);
         }
         catch (Exception ex)
         {
-            Debug.LogError("[LootTransaction] Commit send failed; retaining local changes for retry: " + ex);
-            if (commitAttempts == 1)
-                DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot transfer not acknowledged. Retrying safely.");
+            Debug.LogError("[LootTransaction] Could not queue commit: " + ex);
+            DaggerfallWorkshop.Game.DaggerfallUI.AddHUDText("Loot transfer pending. You may close the inventory.");
         }
     }
 
@@ -266,8 +298,9 @@ public class LootMultiplayer : MonoBehaviour
     {
         if (target == null) return;
         var sync = target.GetComponent<LootMultiplayer>();
-        if (sync == null || !sync.IsDroppedNetworkLoot()) return;
+        if (sync == null) return;
         sync.inventoryOpen = true;
+        if (!sync.IsDroppedNetworkLoot()) return;
         if (sync.closeRoutine != null)
         {
             sync.StopCoroutine(sync.closeRoutine);
@@ -281,8 +314,21 @@ public class LootMultiplayer : MonoBehaviour
     {
         if (target == null) return false;
         var sync = target.GetComponent<LootMultiplayer>();
-        if (sync == null || !sync.IsDroppedNetworkLoot()) return false;
+        if (sync == null) return false;
         sync.inventoryOpen = false;
+        // Closing the window cancels ONLY permission that has not yet been used.
+        // Never cancel or roll back an executed transfer; its commit continues via catcher.
+        if (sync.EditPending && !sync.editGranted && !sync.commitSent && sync.lootCatcher != null)
+        {
+            sync.lootCatcher.CancelUnexecutedLootEdit(sync.lootId, sync.editRequest);
+            sync.editRequest = 0;
+            sync.editAction = null;
+            sync.partyQuestLootClickedItem = null;
+            sync.externalQuestConsumption = null;
+        }
+        else if (sync.EditGranted)
+            sync.CompleteEdit();
+        if (!sync.IsDroppedNetworkLoot()) return false;
         if (sync.closeRoutine == null && sync.isActiveAndEnabled)
             sync.closeRoutine = sync.StartCoroutine(sync.CloseAfterContents());
         return true;
@@ -320,8 +366,6 @@ public class LootMultiplayer : MonoBehaviour
     IEnumerator CloseAfterContents()
     {
         yield return null;
-        while (!inventoryOpen && IsDroppedNetworkLoot() && (lootId == 0 || EditPending))
-            yield return null;
         if (!inventoryOpen) ReleaseReader();
         closeRoutine = null;
     }
@@ -383,14 +427,8 @@ public class LootMultiplayer : MonoBehaviour
 
     // Inventory changes are sent only by an acknowledged edit. Observers must
     // never echo an incoming snapshot as a new local inventory operation.
-    void Update()
-    {
-        // This is not an inventory poll. Retry only an already-approved and executed
-        // transaction if its specific server acknowledgement has not arrived.
-        if (commitSent && editRequest != 0 && pendingCommitItems != null &&
-            Time.realtimeSinceStartup >= nextCommitAttempt)
-            RetryCommit();
-    }
+    // Commit retries are owned by the persistent player LootCatcher, not by the
+    // temporary corpse/pile MonoBehaviour, and do not depend on the inventory UI.
 
     void LateUpdate()
     {
@@ -410,6 +448,15 @@ public class LootMultiplayer : MonoBehaviour
     void OnDisable()
     {
         if (externalPickups != null) externalPickups.Poll(false);
+        // If permission has not arrived, NO local item transfer was authorized.
+        // Cancel that reservation explicitly (no clock-based ownership stealing).
+        if (EditPending && !editGranted && !commitSent && lootCatcher != null)
+        {
+            lootCatcher.CancelUnexecutedLootEdit(lootId, editRequest);
+            editRequest = 0;
+        }
+        // If an action was already granted, publish its actual resulting contents.
+        // A post-action commit stays with LootCatcher even when this object disappears.
         CompleteEdit();
         editAction = null;
         partyQuestLootEditToken = null;

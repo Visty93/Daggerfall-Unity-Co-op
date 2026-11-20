@@ -306,8 +306,37 @@ public class TimeCatcher : NetworkBehaviour
         }
     }
 
+    // Rest Together publishes leader time as the rest progresses rather than waiting
+    // for the ordinary 2.25-second polling interval. For follower rest in the "any
+    // member" mode, use the existing proposal/acknowledgement path instead.
+    public static void NotifyLocalRestHourCompleted()
+    {
+        if (localInstance == null || !localInstance.isLocalPlayer ||
+            localInstance.IsLoadInProgress() || !localInstance.EnsureWorldTime()) return;
+        localInstance.RefreshRoute();
+        if (!localInstance.routeKnown) return;
+        if (localInstance.localLeader == localInstance.netId)
+            localInstance.SynchronizeNow("party-rest-hour");
+        else if (!LeaderControlsTime)
+        {
+            localInstance.CaptureSharedAdvance();
+            localInstance.SendPendingAdvance();
+        }
+    }
+
+    public static void RefreshLeaderTimeAfterRestWithoutLeader()
+    {
+        if (localInstance == null || !localInstance.isLocalPlayer ||
+            localInstance.IsLoadInProgress() || !localInstance.EnsureWorldTime()) return;
+        localInstance.RefreshRoute();
+        if (!localInstance.routeKnown || localInstance.localLeader == localInstance.netId) return;
+        localInstance.InvalidateSample();
+        localInstance.SynchronizeNow("rest-without-leader");
+    }
+
     void CaptureSharedAdvance()
     {
+        if (MultiplayerPartyManager.IsLocalRestWithoutLeader) return;
         if (LeaderControlsTime || !routeKnown || localLeader == netId || waitingForFreshSample ||
             routeNeedsSync || IsLoadInProgress() || !postLoadAuthoritativeTimeReady || !EnsureWorldTime()) return;
         ulong seconds = worldTime.Now.ToSeconds();

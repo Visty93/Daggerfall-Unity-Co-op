@@ -79,6 +79,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         protected bool ignoreAllocatedBed = false;
         protected bool abortRestForEnemySpawn = false;
         bool isCloseWindowDeferred = false;
+        // Guard deferred multiplayer-rest callbacks after this window is closed.
+        bool multiplayerRestWindowPopped = false;
         protected bool endedRest = false;
 
         protected PlayerEntity playerEntity;
@@ -244,6 +246,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
         public override void OnPush()
         {
             base.OnPush();
+            multiplayerRestWindowPopped = false;
 
             toggleClosedBinding = InputManager.Instance.GetBinding(InputManager.Actions.Rest);
 
@@ -270,6 +273,8 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         public override void OnPop()
         {
+            multiplayerRestWindowPopped = true;
+            MultiplayerPartyManager.LocalRestEnded();
             base.OnPop();
             ignoreAllocatedBed = false;
             GameManager.OnEncounter -= GameManager_OnEncounter;
@@ -411,17 +416,23 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             if (preventedRestMessage != null)
                 return true;
 
+            // Share only actual completed sleep hours (not loitering or minute ticks).
+            // The initiator receives native recovery immediately below.
+            // Other nearby party members receive the same per-hour rates via Mirror.
             // Tick vitals to end
             if (currentRestMode == RestModes.TimedRest)
             {
                 TickVitals();
+                MultiplayerPartyManager.LocalRestHourCompleted();
                 hoursRemaining--;
                 if (hoursRemaining < 1)
                     finished = true;
             }
             else if (currentRestMode == RestModes.FullRest)
             {
-                if (TickVitals())
+                bool fullyHealed = TickVitals();
+                MultiplayerPartyManager.LocalRestHourCompleted();
+                if (fullyHealed)
                     finished = true;
             }
             else if (currentRestMode == RestModes.Loiter)
@@ -449,6 +460,7 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
 
         void EndRest()
         {
+            MultiplayerPartyManager.LocalRestEnded();
             const int youWakeUpTextId = 353;
             const int enemiesNearby = 354;
             const int youAreHealedTextId = 350;
@@ -630,8 +642,20 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
             if (CanRest(alreadyWarned))
             {
                 waitTimer = Time.realtimeSinceStartup;
-                currentRestMode = RestModes.FullRest;
-                MoveToBed();
+                MultiplayerPartyManager.RequestLocalRestStart(allowed =>
+                {
+                    if (!allowed) return;
+                    // The player may have closed the rest window while awaiting a reply.
+                    if (multiplayerRestWindowPopped || playerEntity == null || !playerEntity.IsResting ||
+                        currentRestMode != RestModes.Selection)
+                    {
+                        MultiplayerPartyManager.LocalRestEnded();
+                        return;
+                    }
+                    waitTimer = Time.realtimeSinceStartup;
+                    currentRestMode = RestModes.FullRest;
+                    MoveToBed();
+                });
             }
         }
 
@@ -756,10 +780,28 @@ namespace DaggerfallWorkshop.Game.UserInterfaceWindows
                 return;
             }
 
-            hoursRemaining = time;
-            waitTimer = Time.realtimeSinceStartup;
-            currentRestMode = RestModes.TimedRest;
-            MoveToBed();
+            if (time < 1)
+            {
+                hoursRemaining = time;
+                waitTimer = Time.realtimeSinceStartup;
+                currentRestMode = RestModes.TimedRest;
+                MoveToBed();
+                return;
+            }
+            MultiplayerPartyManager.RequestLocalRestStart(allowed =>
+            {
+                if (!allowed) return;
+                if (multiplayerRestWindowPopped || playerEntity == null || !playerEntity.IsResting ||
+                    currentRestMode != RestModes.Selection)
+                {
+                    MultiplayerPartyManager.LocalRestEnded();
+                    return;
+                }
+                hoursRemaining = time;
+                waitTimer = Time.realtimeSinceStartup;
+                currentRestMode = RestModes.TimedRest;
+                MoveToBed();
+            });
         }
 
         private void LoiterPrompt_OnGotUserInput(DaggerfallInputMessageBox sender, string input)

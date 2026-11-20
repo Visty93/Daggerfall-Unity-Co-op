@@ -143,6 +143,40 @@ public class SpriteMultiplayer : MonoBehaviour
         return !string.IsNullOrEmpty(job);
     }
 
+    /// <summary>
+    /// Return a frame-aware visual Y correction for the NORMAL animated remote
+    /// player billboard, using the active mobile quad size and animation offset.
+    /// The collision proxy applies it in LateUpdate. No gameplay transforms move.
+    /// </summary>
+    public float GetAnimatedSpriteGroundLift(float playerRootControllerHeight)
+    {
+        if (playerRootControllerHeight <= 0f || !isActiveAndEnabled ||
+            !HasUsableProfile() || sprite == null || !sprite.IsSetup ||
+            paperdollVisualActive || downedVisualActive ||
+            horseMounted || IsLycanthropeVisualActive)
+            return 0f;
+
+        // Calculate from the CURRENT rendered mobile quad, not the class's
+        // idle/base controller height. The latter is often taller than the
+        // active mage animation and over-lifted remote players by ~0.16m.
+        // DaggerfallMobileUnit uses a +/-0.5 unit-high quad scaled by its
+        // localScale.y. Non-idle animation also changes its localPosition.y.
+        // Aim the bottom of that quad at ground level, given the remote player
+        // root's controller bottom usually sits ~0.06 units above the terrain.
+        // The correction is applied to the visual parent only, never to
+        // network/player physics or the DaggerfallMobileUnit's animation.
+        const float RootControllerGroundClearance = 0.06f;
+        float currentQuadHeight = Mathf.Abs(sprite.transform.localScale.y);
+        if (currentQuadHeight < 0.01f)
+            return 0f;
+
+        float quadBottomRelativeToVisual =
+            sprite.transform.localPosition.y - currentQuadHeight * 0.5f;
+        float targetBottomRelativeToVisual =
+            -playerRootControllerHeight * 0.5f - RootControllerGroundClearance;
+        return targetBottomRelativeToVisual - quadBottomRelativeToVisual;
+    }
+
     public void RefreshProfile(string newJob, int newGender)
     {
         if (string.IsNullOrEmpty(newJob))

@@ -10,6 +10,8 @@
 //
 
 using UnityEngine;
+using System;
+using Mirror;
 using DaggerfallConnect;
 using DaggerfallConnect.Arena2;
 using DaggerfallWorkshop.Game.Entity;
@@ -128,8 +130,36 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
             // Is player in same interior as anchor?
             if (IsSameInterior())
             {
-                // Just need to move player
-                serializablePlayer.RestorePosition(anchorPosition);
+                if (IsMultiplayerDungeonRecall())
+                {
+                    // A dungeon may be recreated in a different XYZ grid slot since the
+                    // Recall anchor was set. Restore the saved LOCAL point in the live
+                    // dungeon, never the historical scene-space position.
+                    DaggerfallDungeon liveDungeon = playerEnterExit.Dungeon;
+                    Vector3 localPosition = GetDungeonRecallLocalPosition(anchorPosition);
+                    bool savedSmaller = anchorPosition.smallerDungeonsState == QuestSmallerDungeonsState.Enabled;
+                    bool layoutSettingChanged = savedSmaller != DaggerfallUnity.Settings.SmallerDungeons;
+                    if (layoutSettingChanged && !DaggerfallDungeon.IsMainStoryDungeon(liveDungeon.Summary.ID) &&
+                        liveDungeon.StartMarker != null)
+                    {
+                        // Preserve vanilla's safety fallback when the local dungeon layout
+                        // may have changed since the marker was placed.
+                        playerEnterExit.transform.position = liveDungeon.StartMarker.transform.position;
+                        DaggerfallUI.AddHUDText(TextManager.Instance.GetLocalizedText("smallerDungeonsChanged"));
+                    }
+                    else
+                    {
+                        playerEnterExit.transform.position = liveDungeon.transform.position + localPosition;
+                    }
+                    RestoreDungeonRecallOrientation(anchorPosition);
+                    GameManager.Instance.PlayerEnterExit.PlayerTeleportedIntoDungeon = true;
+                    Debug.Log($"[RecallMP] Same live dungeon. grid={liveDungeon.transform.position} local={localPosition} final={playerEnterExit.transform.position}");
+                }
+                else
+                {
+                    // Preserve original singleplayer and building Recall behaviour.
+                    serializablePlayer.RestorePosition(anchorPosition);
+                }
                 GameManager.Instance.PlayerEntity.AnchorPosition = null;
             }
             else
@@ -158,8 +188,11 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
                 if (anchorPosition.insideBuilding)
                     playerEnterExit.BuildingDiscoveryData = anchorPosition.buildingDiscoveryData;
 
-                // When moving anywhere other than same interior trigger a fade so transition appears smoother
-                DaggerfallUI.Instance.FadeBehaviour.FadeHUDFromBlack();
+                // Network dungeon conversion remains black until its authoritative
+                // dungeon has arrived and the final local-position snap has completed.
+                // For every other path preserve the original fade behaviour.
+                if (!IsMultiplayerDungeonRecall() || !playerEnterExit.IsNetworkDungeonConversionInProgress)
+                    DaggerfallUI.Instance.FadeBehaviour.FadeHUDFromBlack();
             }
         }
 
@@ -186,6 +219,41 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
             return true;
         }
 
+        // Only dungeon Recall in an active network session needs grid-aware handling.
+        // Neither SP Recall nor building Recall passes through the new code paths.
+        bool IsMultiplayerDungeonRecall()
+        {
+            return anchorPosition != null && anchorPosition.insideDungeon &&
+                (NetworkClient.active || NetworkServer.active);
+        }
+
+        // Same local-coordinate fallback as PlayerEnterExit.GetSavedDungeonLocalPosition().
+        // New anchors include a root-relative point; older MP anchors may have only
+        // an original dungeon grid origin, and old SP anchors use the Y=0 scene origin.
+        Vector3 GetDungeonRecallLocalPosition(PlayerPositionData_v1 savedAnchor)
+        {
+            if (savedAnchor.hasSavedDungeonLocalPosition)
+                return savedAnchor.savedDungeonLocalPosition;
+
+            if (savedAnchor.savedInsideNetworkDungeon)
+                return savedAnchor.position - savedAnchor.GetSavedDungeonOrigin();
+
+            return savedAnchor.position;
+        }
+
+        // Conversion already placed the player at the correct live dungeon position.
+        // Apply only the original Recall camera direction and crouch state here.
+        void RestoreDungeonRecallOrientation(PlayerPositionData_v1 savedAnchor)
+        {
+            PlayerMouseLook mouseLook = GameManager.Instance.PlayerMouseLook;
+            if (mouseLook != null)
+                mouseLook.SetFacing(savedAnchor.yaw, savedAnchor.pitch);
+
+            PlayerMotor motor = GameManager.Instance.PlayerMotor;
+            if (motor != null)
+                motor.IsCrouching = savedAnchor.isCrouching;
+        }
+
         // Checks if player is in same building or dungeon interior as anchor
         bool IsSameInterior()
         {
@@ -208,7 +276,37 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
             }
             else if (playerEnterExit.IsPlayerInsideDungeon && anchorPosition.insideDungeon)
             {
-                // Compare map pixel of dungeon (only one dungeon per map pixel allowed)
+                if (IsMultiplayerDungeonRecall())
+                {
+                    // The original map-pixel-only test is not sufficient for the
+                    // multiplayer grid. Verify the actual live network dungeon identity.
+                    DaggerfallDungeon liveDungeon = playerEnterExit.Dungeon;
+                    if (liveDungeon == null || !liveDungeon.isSet || !liveDungeon.IsNetworkDungeonInstance)
+                        return false;
+
+                    if (anchorPosition.savedDungeonMapId != 0 &&
+                        anchorPosition.savedDungeonMapId != liveDungeon.Summary.ID)
+                        return false;
+
+                    if (!string.IsNullOrEmpty(anchorPosition.savedDungeonRegionName) &&
+                        !string.Equals(anchorPosition.savedDungeonRegionName, liveDungeon.Summary.RegionName, StringComparison.OrdinalIgnoreCase))
+                        return false;
+                    if (!string.IsNullOrEmpty(anchorPosition.savedDungeonLocationName) &&
+                        !string.Equals(anchorPosition.savedDungeonLocationName, liveDungeon.Summary.LocationName, StringComparison.OrdinalIgnoreCase))
+                        return false;
+
+                    // New anchors include full dungeon identity. PlayerGPS may retain
+                    // stale exterior coordinates through asynchronous network entry,
+                    // so do not require a map-pixel match once identity is established.
+                    if (!string.IsNullOrEmpty(anchorPosition.savedDungeonRegionName) &&
+                        !string.IsNullOrEmpty(anchorPosition.savedDungeonLocationName))
+                    {
+                        GameManager.Instance.PlayerEnterExit.PlayerTeleportedIntoDungeon = true;
+                        return true;
+                    }
+                }
+
+                // Legacy anchors (and SP) retain the original map-pixel comparison.
                 DaggerfallConnect.Utility.DFPosition anchorMapPixel = DaggerfallConnect.Arena2.MapsFile.WorldCoordToMapPixel(anchorPosition.worldPosX, anchorPosition.worldPosZ);
                 DaggerfallConnect.Utility.DFPosition playerMapPixel = GameManager.Instance.PlayerGPS.CurrentMapPixel;
                 if (anchorMapPixel.X == playerMapPixel.X && anchorMapPixel.Y == playerMapPixel.Y)
@@ -238,9 +336,35 @@ namespace DaggerfallWorkshop.Game.MagicAndEffects.MagicEffects
             // Get anchor position from player entity
             anchorPosition = GameManager.Instance.PlayerEntity.AnchorPosition;
 
-            // Restore final position and unwire event
-            serializablePlayer.RestorePosition(anchorPosition);
-            PlayerEnterExit.OnRespawnerComplete -= PlayerEnterExit_OnRespawnerComplete;
+            // Only the current network dungeon is authoritative for the destination
+            // slot. TryCompleteNetworkDungeonConversion() has already placed the player
+            // at dungeon.transform.position + savedDungeonLocalPosition, including X/Y/Z.
+            // The vanilla RestorePosition() call here would UNDO that move by restoring
+            // the old raw absolute position (the cause of the 0/-500/-800 mistakes).
+            if (IsMultiplayerDungeonRecall())
+            {
+                PlayerEnterExit.OnRespawnerComplete -= PlayerEnterExit_OnRespawnerComplete;
+                DaggerfallDungeon liveDungeon = playerEnterExit.Dungeon;
+                if (!playerEnterExit.IsPlayerInsideDungeon || liveDungeon == null ||
+                    !liveDungeon.isSet || !liveDungeon.IsNetworkDungeonInstance)
+                {
+                    // Dungeon construction/request failed. Leave the safe exterior
+                    // fallback alone instead of teleporting the player into empty space.
+                    // Preserve the Recall anchor so it can be attempted again.
+                    Debug.LogWarning("[RecallMP] Destination network dungeon was not ready at respawn completion. Keeping saved Recall anchor and safe fallback position.");
+                    End();
+                    return;
+                }
+
+                RestoreDungeonRecallOrientation(anchorPosition);
+                Debug.Log($"[RecallMP] Arrived in live dungeon. grid={liveDungeon.transform.position} local={GetDungeonRecallLocalPosition(anchorPosition)} final={playerEnterExit.transform.position}");
+            }
+            else
+            {
+                // Original SP and building teleport handling remains unchanged.
+                serializablePlayer.RestorePosition(anchorPosition);
+                PlayerEnterExit.OnRespawnerComplete -= PlayerEnterExit_OnRespawnerComplete;
+            }
 
             // Set "teleported into dungeon" flag when anchor is inside a dungeon
             GameManager.Instance.PlayerEnterExit.PlayerTeleportedIntoDungeon = anchorPosition.insideDungeon;

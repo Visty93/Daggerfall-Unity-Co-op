@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -7,7 +7,7 @@ namespace Wenzil.Console
     /// <summary>
     /// Use RegisterCommand() to register your own commands. Registered commands persist between scenes but don't persist between multiple application executions.
     /// </summary>
-    public static class ConsoleCommandsDatabase 
+    public static class ConsoleCommandsDatabase
     {
         private static Dictionary<string, ConsoleCommand> database = new Dictionary<string, ConsoleCommand>(StringComparer.OrdinalIgnoreCase);
 
@@ -16,7 +16,7 @@ namespace Wenzil.Console
         /// </summary>
         public static IEnumerable<ConsoleCommand> commands { get { return database.OrderBy(kv => kv.Key).Select(kv => kv.Value); } }
 
-        public static void RegisterCommand(string command, ConsoleCommandCallback callback, string description = "", string usage = "") 
+        public static void RegisterCommand(string command, ConsoleCommandCallback callback, string description = "", string usage = "")
         {
             RegisterCommand(command, description, usage, callback);
         }
@@ -28,6 +28,8 @@ namespace Wenzil.Console
 
         public static string ExecuteCommand(string command, params string[] args)
         {
+            if (global::OptionsMultiplayer.ClientConsoleCommandsBlocked)
+                return "Console commands are disabled by the host.";
             try
             {
                 ConsoleCommand retrievedCommand = GetCommand(command);

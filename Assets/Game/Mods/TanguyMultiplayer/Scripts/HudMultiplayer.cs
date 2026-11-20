@@ -45,6 +45,7 @@ public class HudMultiplayer : MonoBehaviour
     GameObject hostQuestDefaultsLauncher;
     GameObject hostQuestDefaultsPanel;
     GameObject hostQuestDefaultsModeButton;
+    GameObject hostClientConsoleCommandsButton;
     // Extensible Loot settings submenu. The only setting currently available
     // is world-container synchronization. Do not add standalone UI components.
     GameObject lootLauncher;
@@ -53,11 +54,32 @@ public class HudMultiplayer : MonoBehaviour
     const string HostQuestDefaultMigrationPref = "DFUCoop.QuestSync.HostDefaultVisibleV1";
     Text respawnAccessLabel;
     UnityEngine.UI.Button respawnDefaultsButton;
+    GameObject advancedRespawnSettingsPanel;
+    GameObject advancedWipeToggleButton;
+    GameObject advancedSanctuaryToggleButton;
+    GameObject advancedFeeToggleButton;
+    UnityEngine.UI.Slider advancedGoldSlider;
+    UnityEngine.UI.Slider advancedRadiusSlider;
+    Text advancedGoldLabel;
+    Text advancedRadiusLabel;
     bool wasPauseMenuOpen;
     bool lastConnectedLayoutState;
     float lastOptionsCanvasHeight = -1f;
 
     GameObject hostModMatchingButton;
+
+    // Runtime-only menu hierarchy. Keep the original prefab and legacy callbacks
+    // intact; no scene/prefab edits and no changes to network options are needed.
+    GameObject hostSettingsPanel;
+    GameObject hostGeneralSettingsPanel;
+    GameObject hostServerRulesPanel;
+    Text defaultQuestExplanation;
+    Text modMatchingExplanation;
+    GameObject[] generalOptionButtons;
+    UnityEngine.UI.Slider restTogetherRangeSlider;
+    Text restTogetherRangeLabel;
+    GameObject defaultLeaderTimeButton;
+    GameObject respawnLauncher;
 
     void Start()
     {
@@ -67,6 +89,7 @@ public class HudMultiplayer : MonoBehaviour
         // only while disconnected, before initializing the new host-only control.
         MigrateOldHiddenHostQuestDefault();
         OptionsMultiplayer.EnsureLocalQuestSyncSettings();
+        OptionsMultiplayer.EnsureLocalConsoleSettings();
         ResolveConnectionManager();
         EnsurePartyButton();
         EnsureConnectionModeButton();
@@ -76,6 +99,7 @@ public class HudMultiplayer : MonoBehaviour
         BuildHostQuestDefaultsSetting();
         BuildLootSettings();
         BuildHostModMatching();
+        BuildReorganizedSettingsNavigation();
         RefreshLegacyOptionsAvailability();
         FitOptionsPanelToCanvas();
         StartCoroutine(Check());
@@ -91,6 +115,7 @@ public class HudMultiplayer : MonoBehaviour
             OptionsMultiplayer.EnsureLocalRespawnSettings();
             MigrateOldHiddenHostQuestDefault();
             OptionsMultiplayer.EnsureLocalQuestSyncSettings();
+            OptionsMultiplayer.EnsureLocalConsoleSettings();
             ResolveConnectionManager();
             EnsurePartyButton();
             EnsureConnectionModeButton();
@@ -110,10 +135,16 @@ public class HudMultiplayer : MonoBehaviour
             RefreshLegacyOptionsAvailability();
             RefreshPaperdollDisplaySetting();
             RefreshHostQuestDefaultsSetting();
+            if (hostGeneralSettingsPanel != null && hostGeneralSettingsPanel.activeSelf)
+                RefreshGeneralHostSettings();
             RefreshLootSettings();
             RefreshHostModMatching();
+            if (pauseMenuOpen)
+                FitVisibleSettingsPage();
             if (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf)
                 RefreshRespawnSettings();
+            if (advancedRespawnSettingsPanel != null && advancedRespawnSettingsPanel.activeSelf)
+                RefreshAdvancedRespawnSettings();
             bool sessionActive = NetworkServer.active || NetworkClient.active ||
                 NetworkClient.isConnected || PlayerMultiplayer.state != 0;
             float optionsCanvasHeight = canvas != null && canvas.GetComponent<RectTransform>() != null
@@ -158,6 +189,297 @@ public class HudMultiplayer : MonoBehaviour
 
             yield return new WaitForSecondsRealtime(0.20f);
         }
+    }
+
+    // Page style follows the other runtime menus; everything is constructed from
+    // existing UI assets, so the uploaded prefab needs no editing or replacement.
+    RectTransform CreateOptionsPage(string name, string heading, float width, float height)
+    {
+        RectTransform panel = SettingsRect(name, canvas.transform,
+            new Vector2(width, height), Vector2.zero);
+        panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
+        panel.gameObject.AddComponent<UnityEngine.UI.Image>().color =
+            new Color(0.08f, 0.08f, 0.08f, 0.98f);
+        SettingsText(panel, heading, new Vector2(width - 55, 37),
+            new Vector2(0, -13), 23);
+        return panel;
+    }
+
+    void ScaleOptionsPage(GameObject page, float width, float height)
+    {
+        if (page == null || canvas == null) return;
+        page.transform.SetAsLastSibling();
+        RectTransform canvasRect = canvas.GetComponent<RectTransform>();
+        if (canvasRect == null) return;
+        // Use one visual scale for all settings pages instead of a different scale
+        // based on each page's size. That caused the text and buttons to jump in
+        // size every time users opened another category. At narrow resolutions,
+        // use the largest page's footprint to keep every panel on-screen.
+        float canvasScale = Mathf.Max(0.01f, canvas.scaleFactor);
+        float availableWidth = Mathf.Min(canvasRect.rect.width, Screen.width / canvasScale);
+        float availableHeight = Mathf.Min(canvasRect.rect.height, Screen.height / canvasScale);
+        const float commonWidth = 620f;
+        const float commonHeight = 690f;
+        float uniformScale = Mathf.Min(1f, Mathf.Min(
+            Mathf.Max(0.1f, availableWidth - 28f) / commonWidth,
+            Mathf.Max(0.1f, availableHeight - 40f) / commonHeight));
+        page.transform.localScale = Vector3.one * uniformScale;
+    }
+
+    void FitVisibleSettingsPage()
+    {
+        // Recompute when users resize the Game view or change resolution while
+        // already inside a submenu. Do not change the layout of the old HUD.
+        if (hostSettingsPanel != null && hostSettingsPanel.activeSelf)
+            ScaleOptionsPage(hostSettingsPanel, 510f, 475f);
+        else if (hostGeneralSettingsPanel != null && hostGeneralSettingsPanel.activeSelf)
+            ScaleOptionsPage(hostGeneralSettingsPanel, 560f, 690f);
+        else if (hostServerRulesPanel != null && hostServerRulesPanel.activeSelf)
+            ScaleOptionsPage(hostServerRulesPanel, 550f, 425f);
+        else if (hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf)
+            ScaleOptionsPage(hostQuestDefaultsPanel, 550f, 500f);
+        else if (paperdollSettingsPanel != null && paperdollSettingsPanel.activeSelf)
+            ScaleOptionsPage(paperdollSettingsPanel, 510f, 435f);
+        else if (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf)
+            ScaleOptionsPage(respawnSettingsPanel, 590f, 535f);
+        else if (advancedRespawnSettingsPanel != null && advancedRespawnSettingsPanel.activeSelf)
+            ScaleOptionsPage(advancedRespawnSettingsPanel, 590f, 465f);
+        else if (lootPanel != null && lootPanel.activeSelf)
+            ScaleOptionsPage(lootPanel, 480f, 230f);
+    }
+
+    void BuildReorganizedSettingsNavigation()
+    {
+        if (canvas == null || existingOptionsPanel == null || options == null)
+            return;
+
+        // The original six "Case" entries are retained for prefab binding and
+        // existing toggle methods, but their cramped rows are no longer visible.
+        if (checks != null)
+        {
+            for (int i = 0; i < checks.Length; ++i)
+            {
+                if (checks[i] == null) continue;
+                Transform row = checks[i].transform;
+                while (row != null && row.parent != existingOptionsPanel.transform)
+                    row = row.parent;
+                if (row != null) row.gameObject.SetActive(false);
+            }
+        }
+        // They are now reached through the Host settings categories instead.
+        if (respawnLauncher != null) respawnLauncher.SetActive(false);
+        if (lootLauncher != null) lootLauncher.SetActive(false);
+        // The mod-matching toggle is physically moved into Server rules below.
+
+        RectTransform hub = CreateOptionsPage("Host settings navigation", "Host settings", 510, 475);
+        hostSettingsPanel = hub.gameObject;
+        SettingsText(hub, "Server settings and starting rules for new parties.",
+            new Vector2(450, 30), new Vector2(0, -57), 15);
+        CreateAppearanceOptionButton(hub, "General host settings", "General settings...", -100f,
+            OpenGeneralHostSettings);
+        CreateAppearanceOptionButton(hub, "Party default settings", "Party defaults...", -166f,
+            OpenHostQuestDefaultsSetting);
+        CreateAppearanceOptionButton(hub, "Respawn and travel category", "Respawn / travel...", -232f,
+            OpenRespawnSettings);
+        CreateAppearanceOptionButton(hub, "Loot category", "Loot settings...", -298f,
+            OpenLootSettings);
+        CreateAppearanceOptionButton(hub, "Server rules category", "Server rules...", -364f,
+            OpenServerRules);
+        GameObject back = CreateAppearanceOptionButton(hub, "Back to multiplayer options",
+            "Back", -418f, CloseHostSettings);
+        back.GetComponent<RectTransform>().sizeDelta = new Vector2(135, 36);
+        hostSettingsPanel.SetActive(false);
+
+        RectTransform general = CreateOptionsPage("General server settings", "General settings", 560, 690);
+        hostGeneralSettingsPanel = general.gameObject;
+        SettingsText(general, "These options are chosen by the host before starting a session.",
+            new Vector2(515, 40), new Vector2(0, -51), 15);
+        // Highest-level scaling was already obsolete, but the original
+        // world-map discovery switch (sendLocation) is still active.
+        // It is separate from party-scoped town building discoveries.
+        OptionsMultiplayer.useHighestLevel = false;
+        generalOptionButtons = new GameObject[4];
+        string[] names = { "Show player names", "Share world-map locations",
+            "Player arrival messages", "Synchronize townspeople" };
+        string[] descriptions = {
+            "Show character names above other players.",
+            "When a player visits a named location, reveal it on party members'\n" +
+            "world maps. Town building discoveries are a separate feature.",
+            "Show a message when another player appears in your game.",
+            "Make moving townspeople appear and move the same way for everyone." };
+        for (int i = 0; i < generalOptionButtons.Length; ++i)
+        {
+            int index = i;
+            float y = -96f - i * 103f;
+            generalOptionButtons[i] = CreateAppearanceOptionButton(general,
+                "General setting " + i, names[i] + ": On", y, () => ToggleGeneralHostSetting(index));
+            generalOptionButtons[i].GetComponent<RectTransform>().sizeDelta = new Vector2(430, 39);
+            SettingsText(general, descriptions[i], new Vector2(520, 45),
+                new Vector2(0, y - 43f), 14);
+        }
+        restTogetherRangeLabel = SettingsText(general,
+            "Rest Together distance: 10 m", new Vector2(285, 32), new Vector2(-115, -523f), 16);
+        restTogetherRangeSlider = CreateAdvancedRespawnSlider(general,
+            "Rest Together distance (server-wide)", 1, 10, -523f,
+            value => ChangeHostRestTogetherRange(value));
+        SettingsText(general,
+            "Applies to every party, outdoors and inside buildings/dungeons.\n" +
+            "Same location or dungeon is required. Set before hosting.",
+            new Vector2(525, 53), new Vector2(0, -571f), 14);
+        GameObject generalBack = CreateAppearanceOptionButton(general,
+            "Back to host settings", "Back", -637f, CloseGeneralHostSettings);
+        generalBack.GetComponent<RectTransform>().sizeDelta = new Vector2(135, 32);
+        hostGeneralSettingsPanel.SetActive(false);
+
+        RectTransform server = CreateOptionsPage("Server rules settings", "Server rules", 550, 425);
+        hostServerRulesPanel = server.gameObject;
+        SettingsText(server,
+            "Control client console access and choose whether joining players\n" +
+            "need the same enabled mods as the host.",
+            new Vector2(510, 64), new Vector2(0, -51), 15);
+        hostClientConsoleCommandsButton = CreateAppearanceOptionButton(server,
+            "Client developer console policy", "Client console commands: Disabled", -127f,
+            ToggleHostClientConsoleCommands);
+        SettingsText(server,
+            "Disabled stops clients from using console commands.\n" +
+            "The host can always use them.",
+            new Vector2(505, 47), new Vector2(0, -179f), 14);
+        if (hostModMatchingButton != null)
+        {
+            hostModMatchingButton.transform.SetParent(server, false);
+            var rect = hostModMatchingButton.GetComponent<RectTransform>();
+            if (rect != null)
+            {
+                rect.anchorMin = rect.anchorMax = new Vector2(0.5f, 1f);
+                rect.pivot = new Vector2(0.5f, 1f);
+                rect.anchoredPosition = new Vector2(0, -238f);
+                rect.sizeDelta = new Vector2(345, 43);
+                rect.localScale = Vector3.one;
+            }
+            hostModMatchingButton.SetActive(true);
+        }
+        modMatchingExplanation = SettingsText(server, string.Empty,
+            new Vector2(510, 85), new Vector2(0, -285f), 14);
+        GameObject serverBack = CreateAppearanceOptionButton(server,
+            "Back to host settings", "Back", -373f, CloseServerRules);
+        serverBack.GetComponent<RectTransform>().sizeDelta = new Vector2(135, 34);
+        hostServerRulesPanel.SetActive(false);
+
+        // Keep the host-settings launcher and player-local appearance launcher at
+        // top level, with the prefab's existing Back button below them.
+        if (paperdollDisplayButton != null) paperdollDisplayButton.transform.SetSiblingIndex(0);
+        if (hostQuestDefaultsLauncher != null) hostQuestDefaultsLauncher.transform.SetSiblingIndex(1);
+        RefreshGeneralHostSettings();
+        RefreshHostQuestDefaultsSetting();
+        RefreshHostModMatching();
+        FitOptionsPanelToCanvas();
+    }
+
+    void OpenHostSettings()
+    {
+        if (hostSettingsPanel == null) return;
+        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(false);
+        if (hostQuestDefaultsPanel != null) hostQuestDefaultsPanel.SetActive(false);
+        if (hostGeneralSettingsPanel != null) hostGeneralSettingsPanel.SetActive(false);
+        if (hostServerRulesPanel != null) hostServerRulesPanel.SetActive(false);
+        if (respawnSettingsPanel != null) respawnSettingsPanel.SetActive(false);
+        if (lootPanel != null) lootPanel.SetActive(false);
+        hostSettingsPanel.SetActive(true);
+        ScaleOptionsPage(hostSettingsPanel, 510, 475);
+    }
+
+    void CloseHostSettings()
+    {
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
+        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(true);
+        FitOptionsPanelToCanvas();
+    }
+
+    void OpenGeneralHostSettings()
+    {
+        if (hostGeneralSettingsPanel == null) return;
+        RefreshGeneralHostSettings();
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
+        hostGeneralSettingsPanel.SetActive(true);
+        ScaleOptionsPage(hostGeneralSettingsPanel, 560, 690);
+    }
+
+    void CloseGeneralHostSettings()
+    {
+        if (hostGeneralSettingsPanel != null) hostGeneralSettingsPanel.SetActive(false);
+        OpenHostSettings();
+    }
+
+    void OpenServerRules()
+    {
+        if (hostServerRulesPanel == null) return;
+        RefreshHostQuestDefaultsSetting();
+        RefreshHostModMatching();
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
+        hostServerRulesPanel.SetActive(true);
+        ScaleOptionsPage(hostServerRulesPanel, 550, 425);
+    }
+
+    void CloseServerRules()
+    {
+        if (hostServerRulesPanel != null) hostServerRulesPanel.SetActive(false);
+        OpenHostSettings();
+    }
+
+    void CloseRespawnSettings()
+    {
+        if (respawnSettingsPanel != null) respawnSettingsPanel.SetActive(false);
+        OpenHostSettings();
+    }
+
+    void ToggleGeneralHostSetting(int index)
+    {
+        if (NetworkServer.active || NetworkClient.active || NetworkClient.isConnected ||
+            PlayerMultiplayer.state != 0) return;
+        switch (index)
+        {
+            case 0: toggleName(); break;
+            case 1: toggleSendLocation(); break;
+            case 2: toggleSendMessage(); break;
+            case 3: toggleMobileNpcSync(); break;
+        }
+        RefreshGeneralHostSettings();
+    }
+
+    void RefreshGeneralHostSettings()
+    {
+        if (generalOptionButtons == null) return;
+        bool editable = !NetworkServer.active && !NetworkClient.active &&
+            !NetworkClient.isConnected && PlayerMultiplayer.state == 0;
+        string[] labels = {
+            "Show player names: " + (OptionsMultiplayer.displayName ? "On" : "Off"),
+            "Share world-map locations: " + (OptionsMultiplayer.sendLocation ? "On" : "Off"),
+            "Player arrival messages: " + (OptionsMultiplayer.sendMessage ? "On" : "Off"),
+            "Synchronize townspeople: " + (OptionsMultiplayer.mobileNpcSync ? "On" : "Off")
+        };
+        for (int i = 0; i < generalOptionButtons.Length; ++i)
+        {
+            if (generalOptionButtons[i] == null) continue;
+            SetButtonText(generalOptionButtons[i], labels[i]);
+            var button = generalOptionButtons[i].GetComponent<UnityEngine.UI.Button>();
+            if (button != null) button.interactable = editable;
+        }
+        if (restTogetherRangeSlider != null)
+        {
+            restTogetherRangeSlider.SetValueWithoutNotify(OptionsMultiplayer.restTogetherRadiusMeters);
+            restTogetherRangeSlider.interactable = editable;
+        }
+        if (restTogetherRangeLabel != null)
+            restTogetherRangeLabel.text = "Rest Together distance: " + OptionsMultiplayer.restTogetherRadiusMeters + " m";
+    }
+
+    void ChangeHostRestTogetherRange(int value)
+    {
+        // This all-party host policy is configured before starting a game.
+        if (NetworkServer.active || NetworkClient.active || NetworkClient.isConnected ||
+            PlayerMultiplayer.state != 0) return;
+        OptionsMultiplayer.SetHostRestTogetherRadiusMeters(value);
+        RefreshGeneralHostSettings();
     }
 
     CanvasGroup[] legacyOptionRows;
@@ -239,6 +561,7 @@ public class HudMultiplayer : MonoBehaviour
         if (parent == null) return;
         existingOptionsPanel = parent.gameObject;
         var launch = Instantiate(options, parent);
+        respawnLauncher = launch;
         launch.name = "Respawn and travel settings";
         launch.GetComponent<UnityEngine.UI.Button>().onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
         launch.GetComponent<UnityEngine.UI.Button>().onClick.AddListener(OpenRespawnSettings);
@@ -308,7 +631,7 @@ public class HudMultiplayer : MonoBehaviour
         backRect.sizeDelta = new Vector2(120, 38);
         var button = back.GetComponent<UnityEngine.UI.Button>();
         button.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
-        button.onClick.AddListener(() => { respawnSettingsPanel.SetActive(false); existingOptionsPanel.SetActive(true); });
+        button.onClick.AddListener(CloseRespawnSettings);
         SetButtonText(back, "Back");
         back.SetActive(true);
         var defaults = Instantiate(back, panel);
@@ -327,6 +650,7 @@ public class HudMultiplayer : MonoBehaviour
         });
         SetButtonText(defaults, "Restore defaults");
         respawnSettingsPanel.SetActive(false);
+        BuildAdvancedRespawnSettings();
     }
 
     // Submenu deliberately lives in HudMultiplayer, beside the existing
@@ -373,17 +697,29 @@ public class HudMultiplayer : MonoBehaviour
     void RefreshHostModMatching()
     {
         if (hostModMatchingButton == null) return;
-        bool visible = CanConfigureHostMods();
-        if (hostModMatchingButton.activeSelf != visible)
-        {
-            hostModMatchingButton.SetActive(visible);
-            FitOptionsPanelToCanvas();
-        }
+        bool editable = CanConfigureHostMods();
         var auth = HostModAuthenticator();
         var button = hostModMatchingButton.GetComponent<UnityEngine.UI.Button>();
-        if (button != null) button.interactable = visible && auth != null;
-        SetButtonText(hostModMatchingButton, "Host mods: " +
-            (auth != null ? auth.ListenHostModeLabel : "Relaxed"));
+        if (button != null) button.interactable = editable && auth != null;
+        SetButtonText(hostModMatchingButton, !editable && NetworkClient.active && !NetworkServer.active
+            ? "Mod matching: Host-controlled"
+            : "Mod matching: " + (auth != null ? auth.ListenHostModeLabel : "Relaxed"));
+        if (modMatchingExplanation != null)
+        {
+            string mode = auth != null ? auth.ListenHostModeLabel : "Relaxed";
+            bool remoteClient = NetworkClient.active && !NetworkServer.active;
+            modMatchingExplanation.text = remoteClient
+                ? "The host decides whether players need matching mods.\n" +
+                  "Changing this setting affects new connections only."
+                : mode == "Exact"
+                ? "Exact: Joining players need the same enabled mods and versions.\n" +
+                  "Changing this setting affects new connections only."
+                : mode == "Approved"
+                ? "This server uses a separately configured mod policy.\n" +
+                  "Changing this setting affects new connections only."
+                : "Relaxed: Players do not need an identical list of mods to join.\n" +
+                  "Changing this setting affects new connections only.";
+        }
     }
 
     void BuildLootSettings()
@@ -460,23 +796,16 @@ public class HudMultiplayer : MonoBehaviour
         if (lootPanel == null || existingOptionsPanel == null) return;
         RefreshLootSettings();
         existingOptionsPanel.SetActive(false);
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
         lootPanel.SetActive(true);
         lootPanel.transform.SetAsLastSibling();
-        RectTransform canvasRect = canvas != null ? canvas.GetComponent<RectTransform>() : null;
-        if (canvasRect != null)
-        {
-            // Keep this much smaller than the existing full-size settings menus.
-            float scale = Mathf.Min(0.8f,
-                Mathf.Min(canvasRect.rect.width / 510f, canvasRect.rect.height / 265f));
-            lootPanel.transform.localScale = Vector3.one * scale;
-        }
+        ScaleOptionsPage(lootPanel, 480f, 230f);
     }
 
     void CloseLootSettings()
     {
         if (lootPanel != null) lootPanel.SetActive(false);
-        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(true);
-        FitOptionsPanelToCanvas();
+        OpenHostSettings();
     }
 
     void ToggleWorldContainerSync()
@@ -523,7 +852,7 @@ public class HudMultiplayer : MonoBehaviour
             return;
         Transform parent = existingOptionsPanel.transform;
         hostQuestDefaultsLauncher = Instantiate(options, parent);
-        hostQuestDefaultsLauncher.name = "Host quest default settings";
+        hostQuestDefaultsLauncher.name = "Host settings launcher";
         hostQuestDefaultsLauncher.transform.SetSiblingIndex(Mathf.Max(0, parent.childCount - 2));
         var launcherRect = hostQuestDefaultsLauncher.GetComponent<RectTransform>();
         if (launcherRect != null) launcherRect.sizeDelta = new Vector2(220, 40);
@@ -531,55 +860,110 @@ public class HudMultiplayer : MonoBehaviour
         if (launch != null)
         {
             launch.onClick = new UnityEngine.UI.Button.ButtonClickedEvent();
-            launch.onClick.AddListener(OpenHostQuestDefaultsSetting);
+            launch.onClick.AddListener(OpenHostSettings);
         }
-        SetButtonText(hostQuestDefaultsLauncher, "Quest sync when hosting...");
+        SetButtonText(hostQuestDefaultsLauncher, "Host settings...");
 
-        RectTransform panel = SettingsRect("Host party defaults panel", canvas.transform,
-            new Vector2(540, 318), Vector2.zero);
-        panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
-        panel.gameObject.AddComponent<UnityEngine.UI.Image>().color =
-            new Color(0.08f, 0.08f, 0.08f, 0.98f);
+        RectTransform panel = CreateOptionsPage("Party defaults panel", "Party defaults", 550, 500);
         hostQuestDefaultsPanel = panel.gameObject;
-        SettingsText(panel, "Quest sync for new parties", new Vector2(480, 34),
-            new Vector2(0, -16), 23);
-        SettingsText(panel, "Used for new parties when you host a multiplayer game.",
-            new Vector2(490, 26), new Vector2(0, -62), 16);
         SettingsText(panel,
-            "Existing parties keep their settings. Party leaders can\n" +
-            "change their own party's mode in the Party window.",
-            new Vector2(490, 54), new Vector2(0, -95), 16);
+            "These are the starting rules for NEW parties only.\n" +
+            "Party leaders can change them later under Party > Manage.\n" +
+            "Travel Together starts OFF. Leaders can enable it in Party > Manage.",
+            new Vector2(500, 73), new Vector2(0, -54), 15);
+        defaultLeaderTimeButton = CreateAppearanceOptionButton(panel,
+            "Default time control for new parties", "Time: Leader only", -138f,
+            ToggleDefaultPartyTime);
+        SettingsText(panel,
+            "Leader only: Party time follows the leader's clock.\n" +
+            "A follower's rest advances time only when the leader is nearby.\n" +
+            "Any member: Rest advances time even when the leader is away.",
+            new Vector2(500, 81), new Vector2(0, -189), 14);
         hostQuestDefaultsModeButton = CreateAppearanceOptionButton(panel,
-            "Default quest sync selector", "Default quest sync: Full", -171f,
+            "Default quest sync for new parties", "Quest sharing: Automatic", -286f,
             CycleHostQuestDefault);
+        defaultQuestExplanation = SettingsText(panel,
+            "Automatic: New quests are shared with the party and progress together.",
+            new Vector2(500, 108), new Vector2(0, -337), 14);
         GameObject back = CreateAppearanceOptionButton(panel,
-            "Back from host party defaults", "Back", -244f,
-            CloseHostQuestDefaultsSetting);
-        var backRect = back != null ? back.GetComponent<RectTransform>() : null;
-        if (backRect != null) backRect.sizeDelta = new Vector2(150, 40);
+            "Back to host settings", "Back", -452f, CloseHostQuestDefaultsSetting);
+        back.GetComponent<RectTransform>().sizeDelta = new Vector2(145, 36);
         hostQuestDefaultsPanel.SetActive(false);
+        RefreshHostQuestDefaultsSetting();
+    }
+
+    void ToggleDefaultPartyTime()
+    {
+        // Original pre-connection restriction is preserved. This is a DEFAULT,
+        // not an override of any existing party's current time policy.
+        if (NetworkServer.active || NetworkClient.active || NetworkClient.isConnected ||
+            PlayerMultiplayer.state != 0) return;
+        toggleTimeHost();
         RefreshHostQuestDefaultsSetting();
     }
 
     void RefreshHostQuestDefaultsSetting()
     {
-        bool show = CanConfigureHostQuestDefaults();
-        if (hostQuestDefaultsLauncher != null && hostQuestDefaultsLauncher.activeSelf != show)
-            hostQuestDefaultsLauncher.SetActive(show);
-        if (!show && hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf)
+        if (hostQuestDefaultsLauncher != null)
+            hostQuestDefaultsLauncher.SetActive(true);
+        if (defaultLeaderTimeButton != null)
         {
-            hostQuestDefaultsPanel.SetActive(false);
-            if (existingOptionsPanel != null) existingOptionsPanel.SetActive(false);
+            SetButtonText(defaultLeaderTimeButton, "Time: " +
+                (OptionsMultiplayer.timeHost ? "Leader only" : "Any member"));
+            var btn = defaultLeaderTimeButton.GetComponent<UnityEngine.UI.Button>();
+            if (btn != null) btn.interactable = !NetworkServer.active &&
+                !NetworkClient.active && !NetworkClient.isConnected && PlayerMultiplayer.state == 0;
         }
         if (hostQuestDefaultsModeButton != null)
         {
-            string text = "Full";
+            string mode = "Automatic";
+            string detail = "Automatic: New quests are shared with the party\n" +
+                "and everyone progresses through shared quests together.";
             switch (OptionsMultiplayer.DefaultQuestSyncMode)
             {
-                case OptionsMultiplayer.QuestSyncMode.SharedOnly: text = "Share-only"; break;
-                case OptionsMultiplayer.QuestSyncMode.Off: text = "Off"; break;
+                case OptionsMultiplayer.QuestSyncMode.SharedOnly:
+                    mode = "Manual";
+                    detail = "Manual: New quests stay private until someone uses\n" +
+                        "Share Quest in their journal. Shared quests progress together.";
+                    break;
+                case OptionsMultiplayer.QuestSyncMode.Off:
+                    mode = "Off";
+                    detail = "Off: Quests remain private. Automatic sharing and\n" +
+                        "the Share Quest button are disabled.";
+                    break;
             }
-            SetButtonText(hostQuestDefaultsModeButton, "Default quest sync: " + text);
+            SetButtonText(hostQuestDefaultsModeButton, "Quest sharing: " + mode);
+            if (defaultQuestExplanation != null)
+                defaultQuestExplanation.text = detail;
+            var btn = hostQuestDefaultsModeButton.GetComponent<UnityEngine.UI.Button>();
+            if (btn != null) btn.interactable = CanConfigureHostQuestDefaults();
+        }
+        if (hostClientConsoleCommandsButton != null)
+        {
+            SetButtonText(hostClientConsoleCommandsButton,
+                "Client console commands: " +
+                (OptionsMultiplayer.allowClientConsoleCommands ? "Allowed" : "Disabled"));
+            var btn = hostClientConsoleCommandsButton.GetComponent<UnityEngine.UI.Button>();
+            if (btn != null) btn.interactable = CanConfigureHostQuestDefaults();
+        }
+    }
+
+    void ToggleHostClientConsoleCommands()
+    {
+        if (!CanConfigureHostQuestDefaults()) return;
+        OptionsMultiplayer.SetHostClientConsoleCommandsAllowed(
+            !OptionsMultiplayer.allowClientConsoleCommands);
+        RefreshHostQuestDefaultsSetting();
+
+        if (!NetworkServer.active) return;
+        // Broadcast on each client-owned player identity so the RPC is delivered
+        // even when the host player itself is outside that client's interest range.
+        string policy = OptionsMultiplayer.Export();
+        foreach (var conn in NetworkServer.connections.Values)
+        {
+            if (conn == null || conn.identity == null) continue;
+            PlayerMultiplayer player = conn.identity.GetComponent<PlayerMultiplayer>();
+            if (player != null) player.rpcImportOptions(policy);
         }
     }
 
@@ -602,26 +986,19 @@ public class HudMultiplayer : MonoBehaviour
 
     void OpenHostQuestDefaultsSetting()
     {
-        if (!CanConfigureHostQuestDefaults() || hostQuestDefaultsPanel == null ||
-            existingOptionsPanel == null) return;
+        if (hostQuestDefaultsPanel == null || existingOptionsPanel == null) return;
         RefreshHostQuestDefaultsSetting();
         existingOptionsPanel.SetActive(false);
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
         hostQuestDefaultsPanel.SetActive(true);
         hostQuestDefaultsPanel.transform.SetAsLastSibling();
-        RectTransform canvasRect = canvas != null ? canvas.GetComponent<RectTransform>() : null;
-        if (canvasRect != null)
-        {
-            float scale = Mathf.Min(1f,
-                Mathf.Min(canvasRect.rect.width / 570f, canvasRect.rect.height / 348f));
-            hostQuestDefaultsPanel.transform.localScale = Vector3.one * scale;
-        }
+        ScaleOptionsPage(hostQuestDefaultsPanel, 550, 500);
     }
 
     void CloseHostQuestDefaultsSetting()
     {
         if (hostQuestDefaultsPanel != null) hostQuestDefaultsPanel.SetActive(false);
-        if (existingOptionsPanel != null) existingOptionsPanel.SetActive(true);
-        FitOptionsPanelToCanvas();
+        OpenHostSettings();
     }
 
     // Available offline, for listen-hosts, and for every connected client.
@@ -720,13 +1097,7 @@ public class HudMultiplayer : MonoBehaviour
         existingOptionsPanel.SetActive(false);
         paperdollSettingsPanel.SetActive(true);
         paperdollSettingsPanel.transform.SetAsLastSibling();
-        RectTransform canvasRect = canvas != null ? canvas.GetComponent<RectTransform>() : null;
-        if (canvasRect != null)
-        {
-            float scale = Mathf.Min(1f,
-                Mathf.Min(canvasRect.rect.width / 540f, canvasRect.rect.height / 475f));
-            paperdollSettingsPanel.transform.localScale = Vector3.one * scale;
-        }
+        ScaleOptionsPage(paperdollSettingsPanel, 510, 435);
     }
 
     void ClosePaperdollSettings()
@@ -741,12 +1112,20 @@ public class HudMultiplayer : MonoBehaviour
         // A paused game's top window can change when ESC closes or a DFU modal
         // message appears. Only reset our own submenus. Never open the legacy
         // Options panel here: it starts inactive and is opened by its own button.
-        bool wasInSubmenu = (paperdollSettingsPanel != null && paperdollSettingsPanel.activeSelf) ||
+        bool wasInSubmenu = (hostSettingsPanel != null && hostSettingsPanel.activeSelf) ||
+            (hostGeneralSettingsPanel != null && hostGeneralSettingsPanel.activeSelf) ||
+            (hostServerRulesPanel != null && hostServerRulesPanel.activeSelf) ||
+            (paperdollSettingsPanel != null && paperdollSettingsPanel.activeSelf) ||
             (respawnSettingsPanel != null && respawnSettingsPanel.activeSelf) ||
+            (advancedRespawnSettingsPanel != null && advancedRespawnSettingsPanel.activeSelf) ||
             (hostQuestDefaultsPanel != null && hostQuestDefaultsPanel.activeSelf) ||
             (lootPanel != null && lootPanel.activeSelf);
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
+        if (hostGeneralSettingsPanel != null) hostGeneralSettingsPanel.SetActive(false);
+        if (hostServerRulesPanel != null) hostServerRulesPanel.SetActive(false);
         if (paperdollSettingsPanel != null) paperdollSettingsPanel.SetActive(false);
         if (respawnSettingsPanel != null) respawnSettingsPanel.SetActive(false);
+        if (advancedRespawnSettingsPanel != null) advancedRespawnSettingsPanel.SetActive(false);
         if (hostQuestDefaultsPanel != null) hostQuestDefaultsPanel.SetActive(false);
         if (lootPanel != null) lootPanel.SetActive(false);
         if (wasInSubmenu && existingOptionsPanel != null)
@@ -827,12 +1206,12 @@ public class HudMultiplayer : MonoBehaviour
         if (respawnSettingsPanel == null || existingOptionsPanel == null) return;
         OptionsMultiplayer.EnsureLocalRespawnSettings();
         RefreshRespawnSettings();
+        if (advancedRespawnSettingsPanel != null) advancedRespawnSettingsPanel.SetActive(false);
         existingOptionsPanel.SetActive(false);
+        if (hostSettingsPanel != null) hostSettingsPanel.SetActive(false);
         respawnSettingsPanel.SetActive(true);
         respawnSettingsPanel.transform.SetAsLastSibling();
-        var canvasRect = canvas.GetComponent<RectTransform>();
-        float scale = Mathf.Min(1f, Mathf.Min(canvasRect.rect.width / 620f, canvasRect.rect.height / 565f));
-        respawnSettingsPanel.transform.localScale = Vector3.one * scale;
+        ScaleOptionsPage(respawnSettingsPanel, 590f, 535f);
     }
 
     void RefreshRespawnSettings()
@@ -889,9 +1268,148 @@ public class HudMultiplayer : MonoBehaviour
     {
         OptionsMultiplayer.SaveLocalRespawnSettings();
         RefreshRespawnSettings();
+        RefreshAdvancedRespawnSettings();
         var local = PlayerMultiplayer.GetLocalPlayer();
         if (NetworkServer.active && local != null)
             local.rpcImportOptions(OptionsMultiplayer.Export());
+    }
+
+    // Advanced rules are a separate page to avoid overcrowding the original six
+    // respawn/revive sliders and the two unrelated travel toggles.
+    void BuildAdvancedRespawnSettings()
+    {
+        if (respawnSettingsPanel == null || canvas == null || options == null) return;
+        GameObject launcher = CreateAppearanceOptionButton(respawnSettingsPanel.transform,
+            "Advanced respawn launcher", "Advanced...", -13f, OpenAdvancedRespawnSettings);
+        var launchRect = launcher.GetComponent<RectTransform>();
+        launchRect.anchoredPosition = new Vector2(187f, -10f);
+        launchRect.sizeDelta = new Vector2(157f, 35f);
+
+        RectTransform panel = SettingsRect("Advanced respawn settings", canvas.transform,
+            new Vector2(590f, 465f), Vector2.zero);
+        panel.anchorMin = panel.anchorMax = panel.pivot = new Vector2(0.5f, 0.5f);
+        panel.gameObject.AddComponent<UnityEngine.UI.Image>().color =
+            new Color(0.08f, 0.08f, 0.08f, 0.98f);
+        advancedRespawnSettingsPanel = panel.gameObject;
+        SettingsText(panel, "Advanced respawn", new Vector2(520, 35), new Vector2(0, -12), 22);
+        advancedWipeToggleButton = CreateAppearanceOptionButton(panel,
+            "Require local party wipe", "Local group wipe: Off", -65f, () =>
+            {
+                if (!CanEditRespawnSettings()) return;
+                OptionsMultiplayer.requireLocalGroupWipe = !OptionsMultiplayer.requireLocalGroupWipe;
+                PublishRespawnSettings();
+            });
+        advancedSanctuaryToggleButton = CreateAppearanceOptionButton(panel,
+            "Find nearest settlement", "Nearest settlement: Off", -116f, () =>
+            {
+                if (!CanEditRespawnSettings()) return;
+                OptionsMultiplayer.nearestSanctuaryRespawn = !OptionsMultiplayer.nearestSanctuaryRespawn;
+                PublishRespawnSettings();
+            });
+        advancedFeeToggleButton = CreateAppearanceOptionButton(panel,
+            "Level based healing fee", "Healing fee: Off", -167f, () =>
+            {
+                if (!CanEditRespawnSettings()) return;
+                OptionsMultiplayer.sanctuaryHealingFeeEnabled = !OptionsMultiplayer.sanctuaryHealingFeeEnabled;
+                PublishRespawnSettings();
+            });
+        advancedGoldLabel = SettingsText(panel, "Gold / level: 100", new Vector2(230, 35),
+            new Vector2(-95, -233), 17);
+        advancedGoldSlider = CreateAdvancedRespawnSlider(panel, "Gold per level", 10, 1000,
+            -230f, value =>
+            {
+                if (!CanEditRespawnSettings()) return;
+                OptionsMultiplayer.sanctuaryGoldPerLevel = value;
+                PublishRespawnSettings();
+            });
+        advancedRadiusLabel = SettingsText(panel, "Exterior wipe radius: 200 m", new Vector2(260, 35),
+            new Vector2(-78, -286), 17);
+        advancedRadiusSlider = CreateAdvancedRespawnSlider(panel, "Exterior wipe distance", 10, 500,
+            -284f, value =>
+            {
+                if (!CanEditRespawnSettings()) return;
+                OptionsMultiplayer.groupWipeExteriorRadiusMeters = value;
+                PublishRespawnSettings();
+            });
+        SettingsText(panel, "Local wipe uses settlement respawn. Fees apply at temples, inns\nand graveyards. Unpaid recovery restores 10% health.",
+            new Vector2(550, 52), new Vector2(0, -339), 14);
+        GameObject back = CreateAppearanceOptionButton(panel,
+            "Back to ordinary respawn settings", "Back", -404f, OpenRespawnSettings);
+        back.GetComponent<RectTransform>().sizeDelta = new Vector2(145, 34);
+        advancedRespawnSettingsPanel.SetActive(false);
+        RefreshAdvancedRespawnSettings();
+    }
+
+    UnityEngine.UI.Slider CreateAdvancedRespawnSlider(Transform panel, string name,
+        int min, int max, float y, UnityEngine.Events.UnityAction<int> onChanged)
+    {
+        var sliderRect = SettingsRect(name, panel, new Vector2(195, 25), new Vector2(170, y));
+        var bg = sliderRect.gameObject.AddComponent<UnityEngine.UI.Image>();
+        bg.color = new Color(0.23f, 0.23f, 0.23f);
+        var slider = sliderRect.gameObject.AddComponent<UnityEngine.UI.Slider>();
+        var handle = SettingsRect("Handle", sliderRect, new Vector2(14, 25), Vector2.zero);
+        handle.anchorMin = new Vector2(0, 0);
+        handle.anchorMax = new Vector2(0, 1);
+        handle.pivot = new Vector2(0.5f, 0.5f);
+        handle.sizeDelta = new Vector2(14, 0);
+        var handleImage = handle.gameObject.AddComponent<UnityEngine.UI.Image>();
+        handleImage.color = new Color(0.8f, 0.7f, 0.4f);
+        slider.handleRect = handle;
+        slider.targetGraphic = handleImage;
+        slider.minValue = min;
+        slider.maxValue = max;
+        slider.wholeNumbers = true;
+        slider.onValueChanged.AddListener(value => onChanged((int)value));
+        return slider;
+    }
+
+    void OpenAdvancedRespawnSettings()
+    {
+        if (advancedRespawnSettingsPanel == null) return;
+        OptionsMultiplayer.EnsureLocalRespawnSettings();
+        RefreshAdvancedRespawnSettings();
+        if (respawnSettingsPanel != null) respawnSettingsPanel.SetActive(false);
+        advancedRespawnSettingsPanel.SetActive(true);
+        advancedRespawnSettingsPanel.transform.SetAsLastSibling();
+        ScaleOptionsPage(advancedRespawnSettingsPanel, 590f, 465f);
+    }
+
+    void RefreshAdvancedRespawnSettings()
+    {
+        if (advancedRespawnSettingsPanel == null) return;
+        bool editable = CanEditRespawnSettings();
+        if (advancedWipeToggleButton != null)
+        {
+            SetButtonText(advancedWipeToggleButton,
+                "Local group wipe: " + (OptionsMultiplayer.requireLocalGroupWipe ? "On" : "Off"));
+            advancedWipeToggleButton.GetComponent<UnityEngine.UI.Button>().interactable = editable;
+        }
+        if (advancedSanctuaryToggleButton != null)
+        {
+            SetButtonText(advancedSanctuaryToggleButton,
+                "Nearest settlement: " + (OptionsMultiplayer.nearestSanctuaryRespawn ? "On" : "Off"));
+            advancedSanctuaryToggleButton.GetComponent<UnityEngine.UI.Button>().interactable = editable;
+        }
+        if (advancedFeeToggleButton != null)
+        {
+            SetButtonText(advancedFeeToggleButton,
+                "Healing fee: " + (OptionsMultiplayer.sanctuaryHealingFeeEnabled ? "On" : "Off"));
+            advancedFeeToggleButton.GetComponent<UnityEngine.UI.Button>().interactable = editable;
+        }
+        if (advancedGoldSlider != null)
+        {
+            advancedGoldSlider.SetValueWithoutNotify(OptionsMultiplayer.sanctuaryGoldPerLevel);
+            advancedGoldSlider.interactable = editable;
+        }
+        if (advancedRadiusSlider != null)
+        {
+            advancedRadiusSlider.SetValueWithoutNotify(OptionsMultiplayer.groupWipeExteriorRadiusMeters);
+            advancedRadiusSlider.interactable = editable;
+        }
+        if (advancedGoldLabel != null)
+            advancedGoldLabel.text = "Gold / level: " + OptionsMultiplayer.sanctuaryGoldPerLevel;
+        if (advancedRadiusLabel != null)
+            advancedRadiusLabel.text = "Exterior wipe radius: " + OptionsMultiplayer.groupWipeExteriorRadiusMeters + " m";
     }
 
     void ResolveConnectionManager()
@@ -1095,11 +1613,13 @@ public class HudMultiplayer : MonoBehaviour
         checks[1].SetActive(OptionsMultiplayer.displayName);
     }
 
+    // Kept only because the original prefab still references this callback.
+    // Highest-player-level scaling is obsolete and must remain disabled.
     public void toggleHighestLevel()
     {
-        if (NetworkServer.active || NetworkClient.active) return;
-        OptionsMultiplayer.useHighestLevel = !OptionsMultiplayer.useHighestLevel;
-        checks[2].SetActive(OptionsMultiplayer.useHighestLevel);
+        OptionsMultiplayer.useHighestLevel = false;
+        if (checks != null && checks.Length > 2 && checks[2] != null)
+            checks[2].SetActive(false);
     }
 
     public void toggleSendLocation()
@@ -1134,7 +1654,7 @@ public class HudMultiplayer : MonoBehaviour
         RefreshLegacyOptionsAvailability();
         checks[0].SetActive(OptionsMultiplayer.timeHost);
         checks[1].SetActive(OptionsMultiplayer.displayName);
-        checks[2].SetActive(OptionsMultiplayer.useHighestLevel);
+        checks[2].SetActive(false);
         checks[3].SetActive(OptionsMultiplayer.sendLocation);
         checks[4].SetActive(OptionsMultiplayer.sendMessage);
 
@@ -1164,6 +1684,7 @@ public class HudMultiplayer : MonoBehaviour
     {
         OptionsMultiplayer.EnsureLocalRespawnSettings();
         OptionsMultiplayer.EnsureLocalQuestSyncSettings();
+        OptionsMultiplayer.EnsureLocalConsoleSettings();
         ResolveConnectionManager();
 
         if (connectionManager != null)

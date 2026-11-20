@@ -19,6 +19,27 @@ public class OptionsMultiplayer : MonoBehaviour
 	public static bool sendLocation = true;
 	public static bool sendMessage = true;
 	public static bool mobileNpcSync = true;
+    // Host policy, default OFF: remote clients cannot execute developer commands.
+    public static bool allowClientConsoleCommands = false;
+    const string AllowClientConsoleCommandsPref = "DFUCoop.Host.AllowClientConsoleCommands";
+    static bool localConsoleSettingLoaded;
+    static bool usingRemoteConsoleSetting;
+    static bool remoteConsolePolicyReceived;
+    static Mirror.NetworkConnection remoteConsolePolicyConnection;
+
+    // Deny while connecting and until THIS connection receives the host policy.
+    // Do not mistake an imported setting from a previous server for permission.
+    public static bool ClientConsoleCommandsBlocked
+    {
+        get
+        {
+            if (Mirror.NetworkServer.active || !Mirror.NetworkClient.active)
+                return false;
+            return !remoteConsolePolicyReceived ||
+                !object.ReferenceEquals(remoteConsolePolicyConnection, Mirror.NetworkClient.connection) ||
+                !allowClientConsoleCommands;
+        }
+    }
     public static int reviveHoldSeconds = 5;
     public static int manualRespawnSeconds = 10;
     public static int reviveHealthPercent = 30;
@@ -27,6 +48,17 @@ public class OptionsMultiplayer : MonoBehaviour
     public static int respawnFatiguePercent = 30;
     public static bool respawnOutsideDungeon = false;
     public static bool partyTravelInsideDungeon = true;
+    // New host-wide respawn rules; disabled unless the host explicitly enables them.
+    public static bool requireLocalGroupWipe = false;
+    public static bool nearestSanctuaryRespawn = false;
+    public static bool sanctuaryHealingFeeEnabled = false;
+    public static int sanctuaryGoldPerLevel = 100;
+    public static int groupWipeExteriorRadiusMeters = 200;
+    // Server-wide Rest Together proximity for every party. Same maximum in all spaces.
+    // Saved by listen hosts; dedicated servers load from their JSON configuration.
+    public static int restTogetherRadiusMeters = 10;
+    const string RestTogetherRadiusPref = "DFUCoop.Host.RestTogetherRadiusMeters";
+
     static QuestSyncMode defaultQuestSyncMode = QuestSyncMode.Full;
     public static QuestSyncMode DefaultQuestSyncMode { get { return defaultQuestSyncMode; } }
     public static QuestSyncMode questSyncMode
@@ -55,8 +87,38 @@ public class OptionsMultiplayer : MonoBehaviour
         usingRemoteRespawnSettings = false;
         localQuestSyncSettingsLoaded = false;
         usingRemoteQuestSyncSettings = false;
+        localConsoleSettingLoaded = false;
+        usingRemoteConsoleSetting = false;
+        remoteConsolePolicyReceived = false;
+        remoteConsolePolicyConnection = null;
+        LoadLocalConsoleSettings();
         LoadLocalRespawnSettings();
         LoadLocalQuestSyncSettings();
+    }
+
+    static void LoadLocalConsoleSettings()
+    {
+        allowClientConsoleCommands = PlayerPrefs.GetInt(AllowClientConsoleCommandsPref, 0) != 0;
+        localConsoleSettingLoaded = true;
+        usingRemoteConsoleSetting = false;
+        remoteConsolePolicyReceived = false;
+        remoteConsolePolicyConnection = null;
+    }
+
+    public static void EnsureLocalConsoleSettings()
+    {
+        if (Mirror.NetworkClient.active && !Mirror.NetworkServer.active) return;
+        if (!localConsoleSettingLoaded || usingRemoteConsoleSetting)
+            LoadLocalConsoleSettings();
+    }
+
+    public static void SetHostClientConsoleCommandsAllowed(bool allow)
+    {
+        if (Mirror.NetworkClient.active && !Mirror.NetworkServer.active) return;
+        EnsureLocalConsoleSettings();
+        allowClientConsoleCommands = allow;
+        PlayerPrefs.SetInt(AllowClientConsoleCommandsPref, allow ? 1 : 0);
+        PlayerPrefs.Save();
     }
 
     static void LoadLocalRespawnSettings()
@@ -70,6 +132,12 @@ public class OptionsMultiplayer : MonoBehaviour
         respawnFatiguePercent = PlayerPrefs.GetInt(RespawnPrefsPrefix + "RespawnFatiguePercent", 30);
         respawnOutsideDungeon = PlayerPrefs.GetInt(RespawnPrefsPrefix + "RespawnOutsideDungeon", 0) != 0;
         partyTravelInsideDungeon = PlayerPrefs.GetInt(RespawnPrefsPrefix + "PartyTravelInsideDungeon", 1) != 0;
+        requireLocalGroupWipe = PlayerPrefs.GetInt(RespawnPrefsPrefix + "RequireLocalGroupWipe", 0) != 0;
+        nearestSanctuaryRespawn = PlayerPrefs.GetInt(RespawnPrefsPrefix + "NearestSanctuaryRespawn", 0) != 0;
+        sanctuaryHealingFeeEnabled = PlayerPrefs.GetInt(RespawnPrefsPrefix + "SanctuaryHealingFee", 0) != 0;
+        sanctuaryGoldPerLevel = PlayerPrefs.GetInt(RespawnPrefsPrefix + "SanctuaryGoldPerLevel", 100);
+        groupWipeExteriorRadiusMeters = PlayerPrefs.GetInt(RespawnPrefsPrefix + "GroupWipeExteriorRadiusMeters", 200);
+        restTogetherRadiusMeters = Mathf.Clamp(PlayerPrefs.GetInt(RestTogetherRadiusPref, 10), 1, 10);
         ClampRespawnSettings();
         localRespawnSettingsLoaded = true;
         usingRemoteRespawnSettings = false;
@@ -97,9 +165,23 @@ public class OptionsMultiplayer : MonoBehaviour
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "RespawnFatiguePercent", respawnFatiguePercent);
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "RespawnOutsideDungeon", respawnOutsideDungeon ? 1 : 0);
         PlayerPrefs.SetInt(RespawnPrefsPrefix + "PartyTravelInsideDungeon", partyTravelInsideDungeon ? 1 : 0);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "RequireLocalGroupWipe", requireLocalGroupWipe ? 1 : 0);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "NearestSanctuaryRespawn", nearestSanctuaryRespawn ? 1 : 0);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "SanctuaryHealingFee", sanctuaryHealingFeeEnabled ? 1 : 0);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "SanctuaryGoldPerLevel", sanctuaryGoldPerLevel);
+        PlayerPrefs.SetInt(RespawnPrefsPrefix + "GroupWipeExteriorRadiusMeters", groupWipeExteriorRadiusMeters);
         PlayerPrefs.Save();
         localRespawnSettingsLoaded = true;
         usingRemoteRespawnSettings = false;
+    }
+
+    // General host setting, deliberately separate from Restore Respawn Defaults.
+    public static void SetHostRestTogetherRadiusMeters(int metres)
+    {
+        if (Mirror.NetworkClient.active && !Mirror.NetworkServer.active) return;
+        restTogetherRadiusMeters = Mathf.Clamp(metres, 1, 10);
+        PlayerPrefs.SetInt(RestTogetherRadiusPref, restTogetherRadiusMeters);
+        PlayerPrefs.Save();
     }
 
     public static void RestoreRespawnDefaults()
@@ -114,6 +196,11 @@ public class OptionsMultiplayer : MonoBehaviour
         respawnFatiguePercent = 30;
         respawnOutsideDungeon = false;
         partyTravelInsideDungeon = true;
+        requireLocalGroupWipe = false;
+        nearestSanctuaryRespawn = false;
+        sanctuaryHealingFeeEnabled = false;
+        sanctuaryGoldPerLevel = 100;
+        groupWipeExteriorRadiusMeters = 200;
     }
 
     static void LoadLocalQuestSyncSettings()
@@ -160,10 +247,11 @@ public class OptionsMultiplayer : MonoBehaviour
         defaultQuestSyncMode = config.partyDefaults.questSync == "off" ? QuestSyncMode.Off :
             config.partyDefaults.questSync == "share-only" ? QuestSyncMode.SharedOnly : QuestSyncMode.Full;
         displayName = config.multiplayer.displayNames;
-        useHighestLevel = config.multiplayer.useHighestLevel;
+        useHighestLevel = false; // Legacy field retained for config compatibility.
         sendLocation = config.multiplayer.sendLocations;
         sendMessage = config.multiplayer.sendMessages;
         SetMobileNpcSync(config.multiplayer.mobileNpcSync);
+        allowClientConsoleCommands = config.multiplayer.allowClientConsoleCommands;
         partyTravelInsideDungeon = config.multiplayer.partyTravelInsideDungeon;
         reviveHoldSeconds = config.respawn.reviveHoldSeconds;
         manualRespawnSeconds = config.respawn.manualRespawnSeconds;
@@ -172,8 +260,16 @@ public class OptionsMultiplayer : MonoBehaviour
         reviveFatiguePercent = config.respawn.reviveFatiguePercent;
         respawnFatiguePercent = config.respawn.respawnFatiguePercent;
         respawnOutsideDungeon = config.respawn.respawnOutsideDungeon;
+        requireLocalGroupWipe = config.respawn.requireLocalGroupWipe;
+        nearestSanctuaryRespawn = config.respawn.nearestSanctuaryRespawn;
+        sanctuaryHealingFeeEnabled = config.respawn.sanctuaryHealingFeeEnabled;
+        sanctuaryGoldPerLevel = config.respawn.sanctuaryGoldPerLevel;
+        groupWipeExteriorRadiusMeters = config.respawn.groupWipeExteriorRadiusMeters;
+        restTogetherRadiusMeters = config.multiplayer.restTogetherRadiusMeters;
         // Export() must not replace this policy with the last client's PlayerPrefs.
         localRespawnSettingsLoaded = localQuestSyncSettingsLoaded = true;
+        localConsoleSettingLoaded = true;
+        usingRemoteConsoleSetting = false;
         usingRemoteRespawnSettings = usingRemoteQuestSyncSettings = false;
     }
 
@@ -185,6 +281,8 @@ public class OptionsMultiplayer : MonoBehaviour
         respawnHealthPercent = Mathf.Clamp(respawnHealthPercent, 10, 50);
         reviveFatiguePercent = Mathf.Clamp(reviveFatiguePercent, 10, 50);
         respawnFatiguePercent = Mathf.Clamp(respawnFatiguePercent, 10, 50);
+        sanctuaryGoldPerLevel = Mathf.Clamp(sanctuaryGoldPerLevel, 10, 1000);
+        groupWipeExteriorRadiusMeters = Mathf.Clamp(groupWipeExteriorRadiusMeters, 10, 500);
     }
 
     static int ReadInt(string[] fields, int index, int fallback, int min, int max)
@@ -204,7 +302,7 @@ public class OptionsMultiplayer : MonoBehaviour
         usingRemoteQuestSyncSettings = true;
 		timeHost = list[0] == "True";
 		displayName = list[1] == "True";
-		useHighestLevel = list[2] == "True";
+		useHighestLevel = false; // Legacy import slot kept for wire compatibility.
 		sendLocation = list[3] == "True";
 		sendMessage = list[4] == "True";
 
@@ -225,6 +323,19 @@ public class OptionsMultiplayer : MonoBehaviour
         // to Full so the historical automatic quest-sync behaviour is preserved.
         int importedQuestSyncMode = ReadInt(list, 14, (int)QuestSyncMode.Full, (int)QuestSyncMode.Full, (int)QuestSyncMode.Off);
         questSyncMode = (QuestSyncMode)importedQuestSyncMode;
+        // Append-only network option fields: older servers retain original rules.
+        requireLocalGroupWipe = list.Length > 15 && list[15] == "True";
+        nearestSanctuaryRespawn = list.Length > 16 && list[16] == "True";
+        sanctuaryHealingFeeEnabled = list.Length > 17 && list[17] == "True";
+        sanctuaryGoldPerLevel = ReadInt(list, 18, 100, 10, 1000);
+        groupWipeExteriorRadiusMeters = ReadInt(list, 19, 200, 10, 500);
+        // Field 20: host policy for remote clients. Missing field = disabled.
+        allowClientConsoleCommands = list.Length > 20 && list[20] == "True";
+        // Field 21: all-party Rest Together range, 1..10 metres (older builds default to 10).
+        restTogetherRadiusMeters = ReadInt(list, 21, 10, 1, 10);
+        usingRemoteConsoleSetting = true;
+        remoteConsolePolicyConnection = Mirror.NetworkClient.connection;
+        remoteConsolePolicyReceived = true;
 	}
 	
     public static void SetMobileNpcSync(bool enabled)
@@ -241,8 +352,9 @@ public class OptionsMultiplayer : MonoBehaviour
 	{
         EnsureLocalRespawnSettings();
         EnsureLocalQuestSyncSettings();
+        EnsureLocalConsoleSettings();
         ClampRespawnSettings();
-        return timeHost + "#" + displayName + "#" + useHighestLevel + '#' + sendLocation + '#' + sendMessage + '#' + mobileNpcSync + '#' + reviveHoldSeconds + '#' + manualRespawnSeconds + '#' + reviveHealthPercent + '#' + respawnHealthPercent + '#' + respawnOutsideDungeon + '#' + partyTravelInsideDungeon + '#' + reviveFatiguePercent + '#' + respawnFatiguePercent + '#' + (int)DefaultQuestSyncMode;
+        return timeHost + "#" + displayName + "#" + useHighestLevel + '#' + sendLocation + '#' + sendMessage + '#' + mobileNpcSync + '#' + reviveHoldSeconds + '#' + manualRespawnSeconds + '#' + reviveHealthPercent + '#' + respawnHealthPercent + '#' + respawnOutsideDungeon + '#' + partyTravelInsideDungeon + '#' + reviveFatiguePercent + '#' + respawnFatiguePercent + '#' + (int)DefaultQuestSyncMode + '#' + requireLocalGroupWipe + '#' + nearestSanctuaryRespawn + '#' + sanctuaryHealingFeeEnabled + '#' + sanctuaryGoldPerLevel + '#' + groupWipeExteriorRadiusMeters + '#' + allowClientConsoleCommands + '#' + Mathf.Clamp(restTogetherRadiusMeters, 1, 10);
 	}
 }
 
